@@ -1,0 +1,27 @@
+# Basic dependencies
+python-dotenv==1.0.0
+pyyaml==6.0.1
+
+# LLM API
+openai==1.13.3
+
+# Vector databases
+chromadb==0.4.24
+faiss-cpu==1.7.4
+
+# Deep learning frameworks
+torch==2.1.2
+transformers==4.37.2
+
+# Ranking models
+lightgbm==4.1.0
+
+# Web interface
+gradio==4.13.0
+
+# Evaluation tools (using scikit-learn instead of pytrec-eval)
+scikit-learn==1.3.2
+
+# Data processing
+pandas==2.1.4
+numpy==1.26.3

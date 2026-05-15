@@ -1,0 +1,42 @@
+# 个性化AI搜索系统 - 配置文件
+
+# 意图识别模块配置
+intent:
+  # API客户端配置
+  api_client:
+    type: "deepseek"         # 可选: openai, deepseek
+    api_key: "${DEEPSEEK_API_KEY}"  # 环境变量方式
+    model: "deepseek-chat"   # DeepSeek模型名称
+    max_tokens: 512          # 最大生成token数
+    temperature: 0.1         # 生成温度（0-1，越低越确定，建议低温度保证一致性）
+  
+  # Prompt模板配置
+  prompt_template: "query_rewrite_basic"  # 使用的模板名称
+
+# 搜索检索模块配置
+retrieval:
+  vector_db: "chromadb"      # 可选: chromadb, faiss
+  top_k: 10                  # 返回结果数量
+  chunk_size: 256            # 文档切片大小
+  chunk_overlap: 20          # 切片重叠大小
+
+# LLM生成模块配置
+generation:
+  api_client:
+    type: "openai"
+    model: "gpt-3.5-turbo"
+    max_tokens: 1024
+    temperature: 0.7
+
+# 评估模块配置
+evaluation:
+  metrics:
+    - "mrr@10"
+    - "ndcg@10"
+    - "personalized_hit_rate@5"
+  test_set_size: 200         # 测试集大小
+
+# 日志配置
+logging:
+  level: "INFO"              # 日志级别: DEBUG, INFO, WARNING, ERROR
+  log_file: "logs/app.log"   # 日志文件路径

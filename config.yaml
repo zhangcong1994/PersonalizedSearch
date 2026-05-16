@@ -1,8 +1,22 @@
-# 个性化AI搜索系统 - 配置文件
+data:
+  download:
+    aol4ps_url: "https://github.com/AnnKwok/AOL4PS/raw/main/"
+    save_dir: "./data/raw/aol4ps/"
+    timeout: 300
+    max_retries: 3
+  raw_path: "./data/raw/"
+  processed_path: "./data/processed/"
 
-# 意图识别模块配置
-intent:
-  # API客户端配置
+indexing:
+  chunk_size: 256
+  chunk_overlap: 20
+  embedding_model: "all-MiniLM-L6-v2"
+  vector_db:
+    type: "chromadb"
+    path: "./data/vector_db/"
+    top_k: 10
+
+intent:  # API客户端配置
   api_client:
     type: "deepseek"         # 可选: openai, deepseek
     api_key: "${DEEPSEEK_API_KEY}"  # 环境变量方式
@@ -24,19 +38,19 @@ retrieval:
 generation:
   api_client:
     type: "openai"
+    api_key: "${OPENAI_API_KEY}"
     model: "gpt-3.5-turbo"
-    max_tokens: 1024
+    max_tokens: 512
     temperature: 0.7
 
-# 评估模块配置
-evaluation:
-  metrics:
-    - "mrr@10"
-    - "ndcg@10"
-    - "personalized_hit_rate@5"
-  test_set_size: 200         # 测试集大小
+retrieval:
+  top_k: 10
+  rerank_top_k: 5
 
-# 日志配置
+generation:
+  max_tokens: 1024
+  temperature: 0.7
+
 logging:
-  level: "INFO"              # 日志级别: DEBUG, INFO, WARNING, ERROR
-  log_file: "logs/app.log"   # 日志文件路径
+  level: "INFO"
+  format: "%(asctime)s - %(levelname)s - %(message)s"

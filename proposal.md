@@ -3,7 +3,11 @@
 ## 1. 项目概述
 
 ### 1.1 项目定位
-本项目旨在构建一个**融合用户画像的个性化AI搜索系统**，完整覆盖 **意图理解（查询重写）→ 个性化搜索排序 → LLM生成推荐理由** 三大核心模块。项目采用敏捷迭代方式，从最简可行版本演进至具备多轮对话、偏好对齐与自动评估的前沿系统。
+本项目采用**渐进式迭代策略**构建AI检索生成系统：
+- **V0阶段**：优先跑通常规RAG完整流程（文档分片→向量化→向量检索→LLM生成），使用维基百科数据集学习核心技术栈
+- **V1+阶段**：在此基础上扩展个性化搜索、多轮对话等高级功能
+
+完整覆盖 **意图理解（查询重写）→ 搜索排序 → LLM生成推荐理由** 三大核心模块，从最简可行版本演进至具备多轮对话、偏好对齐与自动评估的前沿系统。
 
 ### 1.2 核心用户场景
 用户在网页搜索场景中进行自然语言查询，系统结合其历史搜索偏好返回个性化结果，并生成可解释的推荐理由。
@@ -17,16 +21,22 @@
 
 ## 2. 数据集选择
 
-### 2.1 主数据集：AOL4PS（个性化搜索排序模块）
+### 2.1 主数据集：维基百科（RAG基础流程）
 
 | 属性 | 说明 |
 | --- | --- |
-| **来源** | AOL查询日志（3个月真实用户数据） |
-| **规模** | 大规模个性化搜索数据集 |
-| **核心字段** | AnonID（匿名用户ID）、Query（查询内容）、QueryTime（查询时间）、DocIndex（文档索引）、CandiList（候选文档列表）、ClickPos（点击位置） |
-| **数据划分** | DataType字段：0-历史数据，1-训练数据，2-验证数据，3-测试数据 |
-| **获取方式** | GitHub: [AnnKwok/AOL4PS](https://github.com/AnnKwok/AOL4PS) |
-| **适用模块** | 召回排序模块（多路召回、LambdaMART重排序） |
+| **来源** | Wikipedia dump 或 Hugging Face 预构建数据集 |
+| **推荐数据集** | `wikipedia` (Hugging Face Datasets) - 英文维基百科 |
+| **替代选择** | `Cohere/wikipedia-22-12-en-embeddings` (已预嵌入) |
+| **规模** | 约600万篇文章，可按需采样（如取前10万篇） |
+| **存储大小** | 原始dump约20GB，采样子集约1-2GB |
+| **核心字段** | `id`、`url`、`title`、`text`（完整文章内容） |
+| **获取方式** | Hugging Face Datasets: `load_dataset("wikipedia", "20220301.en")` |
+| **适用模块** | 文档分片、向量化、向量检索（V0阶段核心） |
+
+**数据集使用策略**：
+- **V0阶段**：使用维基百科跑通RAG完整流程，重点练习文档切片、嵌入生成、向量检索
+- **V1+阶段**：可引入AOL4PS等用户行为数据集扩展个性化功能
 
 ### 2.2 意图识别/查询重写数据集
 
@@ -97,18 +107,18 @@
 
 ## 5. 版本迭代路线图
 
-### V0 – 基础流程体验版 (目标：1周)
+### V0 – 基础RAG流程版 (目标：1周)
 
-**核心目标**：快速跑通"意图理解→搜索排序→LLM生成"的最简链路，无个性化。
+**核心目标**：快速跑通"文档分片→向量化→向量检索→LLM生成"的完整RAG链路，重点学习核心技术栈。
 
 | 任务 | 描述 |
 | --- | --- |
 | 环境搭建 | 安装依赖，初始化 LangChain/LlamaIndex 项目骨架 |
-| 文档索引 | 将AOL4PS文档切片（chunk size=256, overlap=20），生成嵌入存入向量数据库 |
-| 意图理解（极简） | 使用规则或LLM进行查询改写 |
-| 基础检索 | 实现向量相似度检索，返回Top-10文档 |
-| LLM生成 | 调用API或本地模型，设计Prompt模板生成推荐理由 |
-| Gradio界面 | 输入框输出框，展示搜索结果和AI回复 |
+| 数据获取 | 从Hugging Face加载维基百科数据集，采样适量文档（如1万-10万篇） |
+| 文档索引 | 将维基百科文档切片（chunk size=256, overlap=20），生成嵌入存入向量数据库 |
+| 基础检索 | 实现向量相似度检索，返回Top-10文档片段 |
+| LLM生成 | 调用API或本地模型，设计Prompt模板基于检索结果生成回答 |
+| Gradio界面 | 输入框输出框，展示检索片段和AI回复 |
 
 ### V1 – 个性化与系统化评估版 (目标：2-3周，核心版本)
 
@@ -184,15 +194,27 @@
 ```
 personalized-ai-search/
 ├── data/                    # 数据集与预处理脚本
-│   ├── aol4ps/              # AOL4PS数据集
-│   ├── query_rewrite/       # 查询重写数据集
-│   │   ├── topiocqa/        # TopiOCQA数据集
-│   │   └── restoration/     # Restoration-200K数据集
-│   └── llm_finetune/        # LLM微调数据集
+│   ├── raw/                 # 原始数据集
+│   │   ├── wikipedia/       # 维基百科数据集（V0阶段）
+│   │   ├── aol4ps/          # AOL4PS数据集（V1+阶段预留）
+│   │   ├── query_rewrite/   # 查询重写数据集
+│   │   │   ├── topiocqa/    # TopiOCQA数据集
+│   │   │   └── restoration/ # Restoration-200K数据集
+│   │   └── llm_finetune/    # LLM微调数据集
+│   └── processed/           # 预处理后的数据
+│       ├── documents/       # 处理后的文档
+│       ├── queries/         # 处理后的查询
+│       └── user_profiles/   # 用户画像数据
 ├── src/
+│   ├── data/                # 数据处理模块
+│   │   ├── downloader.py    # 数据集下载脚本
+│   │   ├── processor.py     # 数据预处理（清洗、标准化）
+│   │   ├── analyzer.py      # 数据探索性分析（EDA）
+│   │   └── io.py            # 数据读写工具
 │   ├── indexing/            # 文档切片、向量库构建
-│   │   ├── chunker.py
-│   │   └── vector_db.py
+│   │   ├── chunker.py       # 文档切片器
+│   │   ├── embedder.py      # 嵌入模型封装
+│   │   └── vector_db.py     # 向量数据库操作
 │   ├── intent/              # 意图识别与查询重写模块
 │   │   ├── __init__.py
 │   │   ├── base.py          # 基础抽象类定义
@@ -229,9 +251,118 @@ personalized-ai-search/
 
 ---
 
-### 6.1 意图识别/查询重写模块 - 类设计
+### 6.1 数据处理模块 - 类设计
 
-#### 6.1.1 基础抽象类 (`base.py`)
+#### 6.1.1 数据集下载器 (`downloader.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `WikipediaDownloader` | `__init__(save_dir)` | save_dir: str | - | 初始化下载器，指定保存目录 |
+| `WikipediaDownloader` | `download(num_samples=None)` | num_samples: Optional[int] | Dataset | 从Hugging Face加载维基百科数据集，可采样 |
+| `WikipediaDownloader` | `save_to_disk(dataset, output_path)` | dataset: Dataset, output_path: str | bool | 保存数据集到磁盘 |
+| `WikipediaDownloader` | `load_from_disk(input_path)` | input_path: str | Dataset | 从磁盘加载数据集 |
+
+**配置示例**（config.yaml）：
+```yaml
+data:
+  download:
+    wikipedia:
+      name: "wikipedia"
+      version: "20220301.en"
+      save_dir: "./data/raw/wikipedia/"
+      num_samples: 100000  # 采样10万篇，可调整
+```
+
+#### 6.1.2 数据预处理 (`processor.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `DataProcessor` | `__init__(config)` | config: dict | - | 初始化处理器 |
+| `DataProcessor` | `load_raw_data(file_path)` | file_path: str | pd.DataFrame | 加载原始数据 |
+| `DataProcessor` | `clean_text(text)` | text: str | str | 清洗文本（去HTML、特殊字符） |
+| `DataProcessor` | `normalize_text(text)` | text: str | str | 文本标准化（大小写、数字处理） |
+| `DataProcessor` | `filter_short_documents(min_length)` | min_length: int | pd.DataFrame | 过滤过短文档 |
+| `DataProcessor` | `remove_duplicates()` | - | pd.DataFrame | 去重 |
+| `DataProcessor` | `save_processed_data(data, output_path)` | data: pd.DataFrame, output_path: str | bool | 保存处理后数据 |
+
+#### 6.1.3 数据探索性分析 (`analyzer.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `DataAnalyzer` | `__init__(data)` | data: pd.DataFrame | - | 初始化分析器 |
+| `DataAnalyzer` | `get_basic_stats()` | - | dict | 基本统计（文档数、用户数、查询数） |
+| `DataAnalyzer` | `analyze_document_length()` | - | dict | 文档长度分布 |
+| `DataAnalyzer` | `analyze_query_distribution()` | - | dict | 查询频率分布 |
+| `DataAnalyzer` | `analyze_user_behavior()` | - | dict | 用户行为分析（点击次数、会话长度） |
+| `DataAnalyzer` | `generate_report(output_path)` | output_path: str | - | 生成分析报告 |
+
+#### 6.1.4 数据读写工具 (`io.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `DataIO` | `read_csv(file_path)` | file_path: str | pd.DataFrame | 读取CSV文件 |
+| `DataIO` | `write_csv(data, file_path)` | data: pd.DataFrame, file_path: str | bool | 写入CSV文件 |
+| `DataIO` | `read_json(file_path)` | file_path: str | dict/list | 读取JSON文件 |
+| `DataIO` | `write_json(data, file_path)` | data: dict/list, file_path: str | bool | 写入JSON文件 |
+| `DataIO` | `read_parquet(file_path)` | file_path: str | pd.DataFrame | 读取Parquet文件 |
+| `DataIO` | `write_parquet(data, file_path)` | data: pd.DataFrame, file_path: str | bool | 写入Parquet文件 |
+
+---
+
+### 6.2 索引模块 - 类设计
+
+#### 6.2.1 文档切片器 (`chunker.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `DocumentChunker` | `__init__(chunk_size=256, overlap=20)` | chunk_size: int, overlap: int | - | 初始化切片器 |
+| `DocumentChunker` | `chunk_document(text)` | text: str | List[str] | 切分单篇文档 |
+| `DocumentChunker` | `chunk_documents(documents)` | documents: List[str] | List[List[str]] | 批量切分文档 |
+| `DocumentChunker` | `get_chunk_stats(chunks)` | chunks: List[str] | dict | 统计切片长度分布 |
+
+#### 6.2.2 嵌入模型封装 (`embedder.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `Embedder` | `__init__(model_name="all-MiniLM-L6-v2")` | model_name: str | - | 初始化嵌入模型 |
+| `Embedder` | `encode(texts)` | texts: List[str] | np.ndarray | 生成文本嵌入 |
+| `Embedder` | `encode_single(text)` | text: str | np.ndarray | 生成单文本嵌入 |
+| `Embedder` | `get_embedding_dimension()` | - | int | 获取嵌入维度 |
+| `Embedder` | `save_model(path)` | path: str | - | 保存模型 |
+| `Embedder` | `load_model(path)` | path: str | - | 加载模型 |
+
+**支持的嵌入模型**：
+- sentence-transformers: `all-MiniLM-L6-v2`, `all-mpnet-base-v2`, `all-distilroberta-v1`
+- 预留扩展: OpenAI embeddings, BGE models
+
+#### 6.2.3 向量数据库操作 (`vector_db.py`)
+
+| 类名 | 方法 | 输入参数 | 输出 | 功能说明 |
+| --- | --- | --- | --- | --- |
+| `VectorDB` | `__init__(db_path, embedding_dim)` | db_path: str, embedding_dim: int | - | 初始化向量数据库 |
+| `VectorDB` | `add_documents(chunks, embeddings, metadata)` | chunks: List[str], embeddings: np.ndarray, metadata: List[dict] | bool | 添加文档 |
+| `VectorDB` | `search(query_embedding, top_k=10)` | query_embedding: np.ndarray, top_k: int | List[dict] | 向量检索 |
+| `VectorDB` | `delete_document(doc_id)` | doc_id: str | bool | 删除文档 |
+| `VectorDB` | `update_document(doc_id, chunk, embedding)` | doc_id: str, chunk: str, embedding: np.ndarray | bool | 更新文档 |
+| `VectorDB` | `persist()` | - | bool | 持久化到磁盘 |
+
+**配置示例**（config.yaml）：
+```yaml
+indexing:
+  chunk_size: 256
+  chunk_overlap: 20
+  embedding_model: "all-MiniLM-L6-v2"
+  vector_db:
+    type: "chromadb"  # 可选: chromadb, faiss
+    path: "./data/vector_db/"
+    top_k: 10
+```
+
+---
+
+### 6.3 意图识别/查询重写模块 - 类设计
+
+#### 6.3.1 基础抽象类 (`base.py`)
 
 | 类名 | 方法 | 功能说明 |
 | --- | --- | --- |
@@ -239,7 +370,7 @@ personalized-ai-search/
 | `BaseQueryRewriter` | `rewrite(query: str, context: Optional[List[str]] = None) -> str` | 抽象方法，子类实现查询重写 |
 | `BasePromptTemplate` | `format(**kwargs) -> str` | 抽象方法，子类实现Prompt格式化 |
 
-#### 6.1.2 API客户端 (`api_client.py`)
+#### 6.3.2 API客户端 (`api_client.py`)
 
 | 类名 | 方法 | 输入参数 | 输出 |
 | --- | --- | --- | --- |
@@ -258,7 +389,7 @@ intent:
     temperature: 0.7
 ```
 
-#### 6.1.3 Prompt模板管理 (`prompt_manager.py`)
+#### 6.3.3 Prompt模板管理 (`prompt_manager.py`)
 
 | 类名 | 方法 | 功能说明 |
 | --- | --- | --- |
@@ -274,7 +405,7 @@ intent:
 | `query_rewrite_context` | 带上下文查询重写 | "基于对话历史：{context}，将当前查询重写为独立搜索词：{query}" |
 | `query_rewrite_personalized` | 个性化查询重写 | "用户偏好：{user_profile}\n查询：{query}\n请重写为更精准的搜索词" |
 
-#### 6.1.4 查询重写器 (`query_rewriter.py`)
+#### 6.3.4 查询重写器 (`query_rewriter.py`)
 
 | 类名 | 方法 | 输入参数 | 输出 |
 | --- | --- | --- | --- |
@@ -294,7 +425,7 @@ user_profile = "用户喜欢科幻和悬疑类型的电影"
 rewritten_query = "推荐科幻和悬疑类型的好看电影"
 ```
 
-#### 6.1.5 配置管理 (`config.py`)
+#### 6.3.5 配置管理 (`config.py`)
 
 | 类名 | 方法 | 功能说明 |
 | --- | --- | --- |
@@ -308,7 +439,8 @@ rewritten_query = "推荐科幻和悬疑类型的好看电影"
 
 | 评估阶段 | 指标/方法 | 目的 | 
 | --- | --- | --- |
-| **离线评估** | MRR@10, NDCG@10, PHR@k | 量化检索性能 |
+| **V0评估** | LLM评审（相关性、流畅性、事实性）、人工体验 | 验证RAG基础流程可用性 |
+| **V1+离线评估** | MRR@10, NDCG@10, PHR@k | 量化检索性能 |
 | **基线对比** | 纯语义 vs 热门 vs 个性化 | 验证个性化收益 |
 | **LLM评审** | 相关性、个性化、流畅性、事实性 | 生成质量评估 |
 | **模拟在线** | 👍/👎按钮、点击日志 | 用户反馈收集 |

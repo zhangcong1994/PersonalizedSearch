@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR
+from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR, EMBEDDING_MODEL, resolve_model_local_path
 
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QUERIES_FILE = T2RANKING_DIR / "queries.dev.tsv"
@@ -98,12 +98,17 @@ def build_bm25(texts: list[str]):
 
 
 def load_dense_retriever(vector_db_dir: str, collection_name: str, device: str = "cpu",
-                         search_type: str = "similarity"):
+                         search_type: str = "similarity", model_id: str = None):
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
-    model_name = str(local_path.resolve()) if local_path.is_dir() else "BAAI/bge-small-zh-v1.5"
+    if model_id is None:
+        model_id = EMBEDDING_MODEL
+
+    local_path = resolve_model_local_path(model_id)
+    model_name = str(local_path.resolve()) if local_path is not None else model_id
+
+    logger.info(f"Dense retriever using embedding model: {model_name}")
 
     embeddings = HuggingFaceEmbeddings(
         model_name=model_name,
@@ -378,6 +383,7 @@ def run_and_save(
     skip_bm25: bool = False,
     skip_dense: bool = False,
     rewrite_map: dict[str, str] = None,
+    model_id: str = None,
 ):
     queries = load_queries(QUERIES_FILE)
     qrels = load_qrels(QRELS_FILE)
@@ -432,6 +438,7 @@ def run_and_save(
             vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
         dense_retriever, dense_count = load_dense_retriever(
             vector_db_dir, collection_name, device, search_type=dense_search_type,
+            model_id=model_id,
         )
         logger.info(f"Dense retriever load: {time.time() - t0:.1f}s")
 
@@ -556,6 +563,11 @@ def main():
     parser.add_argument("--dense-strategy", default="similarity",
                         choices=["similarity", "mmr", "similarity_score_threshold"],
                         help="Dense retrieval strategy")
+    parser.add_argument(
+        "--embedding-model", default=None,
+        help="Embedding model HF id or short key (default: config.yaml indexing.embedding_model = bge-small-zh-v1.5). "
+             "Accepted: BAAI/bge-small-zh-v1.5, BAAI/bge-large-zh-v1.5, moka-ai/m3e-base, BAAI/bge-m3",
+    )
 
     parser.add_argument("--save", default=None, help="Save retrieval results to JSONL file")
     parser.add_argument("--load", default=None, help="Load cached results from JSONL (skip retrieval)")
@@ -608,6 +620,7 @@ def main():
         skip_bm25=args.dense_only,
         skip_dense=args.bm25_only,
         rewrite_map=rewrite_map,
+        model_id=args.embedding_model,
     )
     return 0
 

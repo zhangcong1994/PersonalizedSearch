@@ -492,7 +492,7 @@ def _prefetch_build_loop(
     batch_no = batches_completed
     current_line = start_line
 
-    # ── cold start: load + embed + store batch 1 ──
+    # ── cold start: embed batch 1 (don't store yet) ──
     passages, next_line = load_passages(current_line, args.batch_size)
     if not passages:
         logger.info("No passages to process.")
@@ -500,20 +500,11 @@ def _prefetch_build_loop(
         return total_stored, total_skipped, batch_no, current_line, overall_start
 
     batch_no += 1
-    current = _make_batch(batch_no, current_line, passages, next_line)
-    current = _embed(current)
-    store_time, _ = _store(current)
+    prev = _make_batch(batch_no, current_line, passages, next_line)
+    prev = _embed(prev)
     current_line = next_line
-    total_stored += current["stored_count"]
-    total_skipped += current["skipped_count"]
-    _save_state_and_log(state, current, store_time, total_stored, total_skipped,
-                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines,
-                        state_file, build_log_file)
 
-    # ── pipeline loop: prefetch N+1 while storing N ──
-    future = None
-    prev = current
-
+    # ── pipeline loop: store batch N while embedding batch N+1 ──
     for batch_idx in range(1, max_batches):
         passages, next_line = load_passages(current_line, args.batch_size)
         if not passages:

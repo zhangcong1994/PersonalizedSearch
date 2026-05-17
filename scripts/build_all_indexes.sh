@@ -1,53 +1,74 @@
 #!/bin/bash
 # ================================================================
-#  一次性构建 4 个嵌入模型的全量向量索引
+#  并行构建 4 个嵌入模型的全量向量索引
+#  每个模型自动断点续跑（无 --rebuild），互不干扰。
+#
 #  用法:
-#    bash scripts/build_all_indexes.sh           # 前台运行
-#    nohup bash scripts/build_all_indexes.sh > build_all.log 2>&1 &  # 后台运行
+#    bash scripts/build_all_indexes.sh
+#    nohup bash scripts/build_all_indexes.sh > logs/build_all.log 2>&1 &
+#
+#  GPU 显存需求: 4模型同时约 9-10GB。如果 < 12GB 显存会 OOM。
+#  降级方案: 把最后一行 bge-m3 后面的 & 去掉，串行跑大模型。
 # ================================================================
-set -euo pipefail
+set -u
 
 MODELS=(
-    "BAAI/bge-small-zh-v1.5"
-    "BAAI/bge-large-zh-v1.5"
-    "moka-ai/m3e-base"
-    "BAAI/bge-m3"
+    "BAAI/bge-small-zh-v1.5"      # ~0.2 GB VRAM — almost done, finishes quickly
+    "moka-ai/m3e-base"           # ~0.4 GB VRAM
+    "BAAI/bge-large-zh-v1.5"     # ~2.4 GB VRAM
+    "BAAI/bge-m3"                # ~4.3 GB VRAM — heaviest, runs last
 )
 
-TOTAL=${#MODELS[@]}
+LOGDIR="logs/build_indexes"
+mkdir -p "$LOGDIR"
+
 START_TIME=$(date +%s)
+PIDS=()
+
+echo "[$(date '+%H:%M:%S')] GPU memory:"
+nvidia-smi --query-gpu=index,name,memory.free,memory.total --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi not available)"
 
 for i in "${!MODELS[@]}"; do
     model="${MODELS[$i]}"
-    idx=$((i + 1))
+    short=$(echo "$model" | cut -d/ -f2)
+    logfile="$LOGDIR/${short}.log"
 
-    echo ""
-    echo "========================================================"
-    echo "  [$idx/$TOTAL] Building: $model"
-    echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "========================================================"
+    echo "[$(date '+%H:%M:%S')] [$((i+1))/${#MODELS[@]}] Launching: $model  →  $logfile"
 
     python scripts/build_t2ranking_index.py \
         --model "$model" \
         --device cuda \
         --prefetch \
-        --rebuild
+        > "$logfile" 2>&1 &
 
-    echo ""
-    echo "  [$idx/$TOTAL] Done: $model  ($(date '+%Y-%m-%d %H:%M:%S'))"
+    PIDS+=($!)
+
+    # Stagger: 15s gap so small model finishes before large ones start encoding
+    sleep 15
 done
 
-END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
 echo ""
-echo "========================================================"
-echo "  All $TOTAL indexes built in $((ELAPSED / 60)) min $((ELAPSED % 60)) sec"
-echo "========================================================"
+echo "[$(date '+%H:%M:%S')] All ${#MODELS[@]} launched. PIDs: ${PIDS[*]}"
+echo "  Monitor: tail -f $LOGDIR/*.log"
+echo "  GPU:     watch -n 5 nvidia-smi"
+echo ""
 
-# Print summary
-echo ""
-echo "  Index directories:"
-for model in "${MODELS[@]}"; do
+FAILED=0
+for i in "${!MODELS[@]}"; do
+    pid="${PIDS[$i]}"
+    model="${MODELS[$i]}"
     short=$(echo "$model" | cut -d/ -f2)
-    echo "    data/vector_db/t2ranking/$short/"
+    wait "$pid" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[$(date '+%H:%M:%S')] FAILED: $model (exit $rc) → $LOGDIR/${short}.log"
+        FAILED=$((FAILED + 1))
+    else
+        echo "[$(date '+%H:%M:%S')] DONE:   $model"
+    fi
 done
+
+ELAPSED=$(($(date +%s) - START_TIME))
+echo ""
+echo "================================================"
+echo "  $FAILED failed / ${#MODELS[@]} total  |  $((ELAPSED / 60)) min $((ELAPSED % 60)) sec"
+echo "================================================"

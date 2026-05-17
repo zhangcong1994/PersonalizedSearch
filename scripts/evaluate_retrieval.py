@@ -374,7 +374,6 @@ def print_comparison(metrics_map: dict[str, dict], metric_names: list[str] = Non
 def run_and_save(
     sample_size: int,
     top_k: int,
-    max_passages: int,
     device: str,
     vector_db_dir: str,
     collection_name: str,
@@ -398,7 +397,7 @@ def run_and_save(
     if rewrite_map:
         valid_queries = [(qid, rewrite_map.get(qid, text)) for qid, text in valid_queries]
 
-    pids, texts = load_passages(COLLECTION_FILE, max_passages=max_passages)
+    pids, texts = load_passages(COLLECTION_FILE)
     pool_pids = set(pids)
 
     pool_queries = []
@@ -493,7 +492,7 @@ def run_and_save(
 
     meta = {
         "sample_size": sample_size,
-        "max_passages": max_passages,
+        "total_passages": len(pids),
         "pool_queries": len(pool_queries),
         "top_k": top_k,
         "dense_search_type": dense_search_type,
@@ -550,7 +549,6 @@ def load_and_print(load_path: str, top_k: int = None):
 def main():
     parser = argparse.ArgumentParser(description="T2Ranking retrieval evaluation: BM25 vs Dense")
     parser.add_argument("--sample", type=int, default=500, help="Number of queries to evaluate")
-    parser.add_argument("--passages", type=int, default=150000, help="Number of passages to load")
     parser.add_argument("--top-k", type=int, default=10, help="Top-K for retrieval")
     parser.add_argument("--device", default="cpu", help="Device for embedding model")
     parser.add_argument(
@@ -602,7 +600,7 @@ def main():
             strategy_tag = "rewrite_" + strategy_tag
         save_path = str(
             Path("results") /
-            f"retrieval_{strategy_tag}_s{args.sample}_p{args.passages}_{args.dense_strategy}.jsonl"
+            f"retrieval_{strategy_tag}_s{args.sample}_{args.dense_strategy}.jsonl"
         )
 
     if args.save and Path(args.save).exists():
@@ -611,7 +609,6 @@ def main():
     run_and_save(
         sample_size=args.sample,
         top_k=args.top_k,
-        max_passages=args.passages,
         device=args.device,
         vector_db_dir=args.vector_db,
         collection_name=args.collection_name,

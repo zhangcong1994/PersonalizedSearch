@@ -245,7 +245,9 @@ def main():
     batches_completed = state.get("batches_completed", 0)
     total_stored = state.get("total_stored", 0)
     total_skipped = state.get("total_skipped", 0)
-    total_lines = state.get("total_lines", _count_total_lines())
+    total_lines = state.get("total_lines")
+    if total_lines is None:
+        total_lines = _count_total_lines()
 
     # ── print plan ──
     remaining = max(0, total_lines - start_line)

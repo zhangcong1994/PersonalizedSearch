@@ -71,6 +71,35 @@ experiments:
       - "⚠️ 150k 池子仅覆盖约 65% 查询的相关段落，完整索引建好后数字会有变化"
       - "后续全量索引 + 更大抽样可获得更可靠的结论"
 
+  - id: exp-001-e1
+    date: 2026-05-18
+    name: "E1: 嵌入模型对比 — bge-small-zh-v1.5 全量索引"
+    plan_file: experiments/exp-001-retrieval-baseline.yaml
+    phase: E1-M1 (embedding model comparison)
+    config:
+      dataset: T2Ranking dev
+      passage_pool: 全量 ~2,303,643 passages
+      embedding_model: BAAI/bge-small-zh-v1.5
+      embedding_dim: 512
+      queries_sampled: 2000
+      queries_evaluated: "待补充（有相关段落落入池中的数量）"
+      top_k: 10
+      dense_strategy: similarity
+      device: cuda (RTX 4090)
+    results:
+      Dense (similarity):
+        Recall@1: 0.0772
+        Recall@3: 0.2081
+        Recall@5: 0.3113
+        Recall@10: 0.4548
+        MRR: 0.5097
+    notes:
+      - "全量 230 万 passage 索引，抽样 2000 条查询"
+      - "相比旧 150k 浅池，Recall@10 从 0.31 升至 0.45，证明更大的 passage 池覆盖了更多相关文档"
+      - "MRR 从 0.64 降至 0.51——全量池中正确文档排位被稀释，这是正常的池规模效应"
+    status: running
+    next: "等待 E1-M2 (bge-large-zh-v1.5) 索引完成并跑同 2000 条"
+
 decisions:
   - date: 2026-05-16
     topic: 评估数据集选择

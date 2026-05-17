@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-VECTOR_DB_DIR = PROJECT_ROOT / "data" / "vector_db"
+VECTOR_DB_DIR = PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
 

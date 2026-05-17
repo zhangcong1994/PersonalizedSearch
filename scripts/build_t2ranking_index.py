@@ -29,7 +29,7 @@ COLLECTION_FILE = DATA_DIR / "collection.tsv"
 STATE_FILE = DATA_DIR / "state.json"
 INDEX_INFO_FILE = DATA_DIR / "index_info.json"
 BUILD_LOG_FILE = DATA_DIR / "build_log.jsonl"
-VECTORDB_DIR = PROJECT_ROOT / "data" / "vector_db"
+VECTORDB_DIR = PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
 DEFAULT_BATCH_SIZE = 1000

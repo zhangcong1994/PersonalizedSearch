@@ -2,7 +2,6 @@ import os
 import sys
 import argparse
 import logging
-from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -18,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from src.utils.config import PROJECT_ROOT, MODEL_CACHE_DIR, VECTOR_DB_DIR
 
 TEST_QUERIES = [
     "蜂巢取快递验证码摁错怎么办",
@@ -33,7 +32,7 @@ TEST_QUERIES = [
 def get_embedding_model(model_name: str = "BAAI/bge-small-zh-v1.5", device: str = "cpu"):
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    local_path = PROJECT_ROOT / "models" / "bge-small-zh-v1.5"
+    local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
     if local_path.is_dir():
         model_name = str(local_path.resolve())
 
@@ -109,7 +108,7 @@ def main():
     parser.add_argument("--no-docs", action="store_true", help="Hide retrieved docs")
     parser.add_argument("--device", default="cpu", help="Device for embedding model")
     parser.add_argument(
-        "--vector-db", default="data/vector_db", help="Vector DB directory"
+        "--vector-db", default=str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5"), help="Vector DB directory"
     )
     parser.add_argument(
         "--collection", default="t2ranking_passages", help="Collection name"
@@ -124,7 +123,7 @@ def main():
     embeddings = get_embedding_model(device=args.device)
     vs, count = get_vectorstore(
         embeddings,
-        persist_dir=str(PROJECT_ROOT / args.vector_db),
+        persist_dir=args.vector_db,
         collection_name=args.collection,
     )
 

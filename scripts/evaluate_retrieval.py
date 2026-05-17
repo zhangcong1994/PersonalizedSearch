@@ -16,10 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-QUERIES_FILE = PROJECT_ROOT / "data" / "raw" / "t2ranking" / "queries.dev.tsv"
-QRELS_FILE = PROJECT_ROOT / "data" / "raw" / "t2ranking" / "qrels.retrieval.dev.tsv"
-COLLECTION_FILE = PROJECT_ROOT / "data" / "raw" / "t2ranking" / "collection.tsv"
+from src.utils.config import PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR
+
+T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
+QUERIES_FILE = T2RANKING_DIR / "queries.dev.tsv"
+QRELS_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
+COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
 
 HTML_RE = re.compile(r"<[^>]*>")
 TRUNCATE_LEN = 2000
@@ -99,7 +101,7 @@ def load_dense_retriever(vector_db_dir: str, collection_name: str, device: str =
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    local_path = PROJECT_ROOT / "models" / "bge-small-zh-v1.5"
+    local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
     model_name = str(local_path.resolve()) if local_path.is_dir() else "BAAI/bge-small-zh-v1.5"
 
     embeddings = HuggingFaceEmbeddings(
@@ -227,7 +229,7 @@ def evaluate(
     print("=" * 60)
     t0 = time.time()
     if vector_db_dir is None:
-        vector_db_dir = str(PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5")
+        vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
     dense_retriever, dense_count = load_dense_retriever(
         vector_db_dir, collection_name, device
     )

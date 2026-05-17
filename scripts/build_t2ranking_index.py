@@ -23,19 +23,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── constants ────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "raw" / "t2ranking"
+from src.utils.config import PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR, EMBEDDING_MODEL
+
+DATA_DIR = RAW_DATA_DIR / "t2ranking"
 COLLECTION_FILE = DATA_DIR / "collection.tsv"
 STATE_FILE = DATA_DIR / "state.json"
 INDEX_INFO_FILE = DATA_DIR / "index_info.json"
 BUILD_LOG_FILE = DATA_DIR / "build_log.jsonl"
-VECTORDB_DIR = PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
+VECTORDB_DIR = VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODEL
 
 # HTML tag cleanup pattern
 HTML_RE = re.compile(r"<[^>]*>")
@@ -123,7 +124,7 @@ def get_embedding_model(
 ):
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    local_path = PROJECT_ROOT / "models" / "bge-small-zh-v1.5"
+    local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
     if local_path.is_dir():
         model_name = str(local_path.resolve())
         logger.info(f"Using local embedding model: {model_name}")

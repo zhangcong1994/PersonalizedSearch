@@ -1,18 +1,10 @@
-data:
-  download:
-    aol4ps_url: "https://github.com/AnnKwok/AOL4PS/raw/main/"
-    save_dir: "./data/raw/aol4ps/"
-    timeout: 300
-    max_retries: 3
-  raw_path: "./data/raw/"
-  processed_path: "./data/processed/"
+paths:
+  data_dir: "data"
+  raw_data_dir: "data/raw"
+  vector_db_dir: "data/vector_db"
 
-wikipedia:
-  xml_path: "./data/raw/wikipedia/zhwiki-latest-pages-articles.xml"
-  jsonl_path: "./data/processed/wikipedia_articles.jsonl"
-  parse:
-    num_articles: 30000
-    min_text_length: 200
+models:
+  local_cache_dir: "models"
 
 indexing:
   chunk_size: 500
@@ -41,8 +33,25 @@ generation:
     type: "deepseek"
     api_key: "${DEEPSEEK_API_KEY}"
     model: "deepseek-chat"
+    base_url: "https://api.deepseek.com/v1"
     max_tokens: 1024
     temperature: 0.3
+
+data:
+  download:
+    aol4ps_url: "https://github.com/AnnKwok/AOL4PS/raw/main/"
+    save_dir: "./data/raw/aol4ps/"
+    timeout: 300
+    max_retries: 3
+  raw_path: "./data/raw/"
+  processed_path: "./data/processed/"
+
+wikipedia:
+  xml_path: "./data/raw/wikipedia/zhwiki-latest-pages-articles.xml"
+  jsonl_path: "./data/processed/wikipedia_articles.jsonl"
+  parse:
+    num_articles: 30000
+    min_text_length: 200
 
 logging:
   level: "INFO"

@@ -1,6 +1,5 @@
 import os
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -17,9 +16,8 @@ import numpy as np
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from src.utils.config import VECTOR_DB_DIR, MODEL_CACHE_DIR
 
-VECTOR_DB_DIR = PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
 
@@ -74,7 +72,7 @@ class RAGPipeline:
             from langchain_chroma import Chroma
             from src.generation.generator import Generator
 
-            local_path = PROJECT_ROOT / "models" / "bge-small-zh-v1.5"
+            local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
             if not local_path.is_dir():
                 raise RuntimeError(
                     f"Model not found at {local_path}. Run download_bge_model.py first."
@@ -88,7 +86,7 @@ class RAGPipeline:
             self.vectorstore = Chroma(
                 collection_name=COLLECTION_NAME,
                 embedding_function=self.embeddings,
-                persist_directory=str(VECTOR_DB_DIR),
+                persist_directory=str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5"),
             )
 
             self._count = self.vectorstore._collection.count()

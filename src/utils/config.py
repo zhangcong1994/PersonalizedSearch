@@ -1,3 +1,4 @@
+import logging
 import os
 import yaml
 from pathlib import Path
@@ -67,11 +68,36 @@ def model_short_name(model_id: str) -> str:
 
 def _resolve_hf_snapshot(cache_dir: Path) -> Path | None:
     snapshots_dir = cache_dir / "snapshots"
-    if snapshots_dir.is_dir():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return snapshots[-1]
-    return None
+    if not snapshots_dir.is_dir():
+        return None
+    snapshots = sorted(snapshots_dir.iterdir())
+    if not snapshots:
+        return None
+
+    config_snap = None
+    for snap in snapshots:
+        if (snap / "config.json").is_file():
+            config_snap = snap
+            break
+    if config_snap is None:
+        return snapshots[-1]
+
+    has_bin = any(f.suffix == ".bin" for f in config_snap.iterdir())
+    has_safetensors = any(f.suffix == ".safetensors" for f in config_snap.iterdir())
+    if has_bin and not has_safetensors:
+        for snap in snapshots:
+            if snap == config_snap:
+                continue
+            for f in snap.iterdir():
+                if f.suffix == ".safetensors":
+                    dest = config_snap / f.name
+                    if not dest.exists():
+                        import shutil
+                        shutil.copy2(f, dest)
+                        logger = logging.getLogger(__name__)
+                        logger.info(f"Merged safetensors: {f.name} → {config_snap.name}/")
+
+    return config_snap
 
 
 def resolve_model_local_path(model_id: str) -> Path | None:

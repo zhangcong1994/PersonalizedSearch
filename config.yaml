@@ -5,6 +5,23 @@ paths:
 
 models:
   local_cache_dir: "models"
+  registry:
+    bge-small-zh-v1.5:
+      hf_id: "BAAI/bge-small-zh-v1.5"
+      dim: 512
+      local_dir: "bge-small-zh-v1.5"
+    bge-large-zh-v1.5:
+      hf_id: "BAAI/bge-large-zh-v1.5"
+      dim: 1024
+      local_dir: "models--BAAI--bge-large-zh-v1.5"
+    m3e-base:
+      hf_id: "moka-ai/m3e-base"
+      dim: 768
+      local_dir: "models--moka-ai--m3e-base"
+    bge-m3:
+      hf_id: "BAAI/bge-m3"
+      dim: 1024
+      local_dir: "models--BAAI--bge-m3"
 
 indexing:
   chunk_size: 500

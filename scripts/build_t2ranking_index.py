@@ -23,14 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── constants ────────────────────────────────────────────
-from src.utils.config import PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR, EMBEDDING_MODEL
+from src.utils.config import (
+    PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR as _BASE_VECTOR_DB_DIR,
+    MODEL_CACHE_DIR, EMBEDDING_MODEL, EMBEDDING_MODEL_CHOICES,
+    resolve_model_local_path, model_short_name,
+)
 
 DATA_DIR = RAW_DATA_DIR / "t2ranking"
 COLLECTION_FILE = DATA_DIR / "collection.tsv"
-STATE_FILE = DATA_DIR / "state.json"
-INDEX_INFO_FILE = DATA_DIR / "index_info.json"
-BUILD_LOG_FILE = DATA_DIR / "build_log.jsonl"
-VECTORDB_DIR = VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
 DEFAULT_BATCH_SIZE = 5000
@@ -124,8 +124,8 @@ def get_embedding_model(
 ):
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    local_path = MODEL_CACHE_DIR / "bge-small-zh-v1.5"
-    if local_path.is_dir():
+    local_path = resolve_model_local_path(model_name)
+    if local_path is not None:
         model_name = str(local_path.resolve())
         logger.info(f"Using local embedding model: {model_name}")
     else:
@@ -162,26 +162,27 @@ def get_vectorstore(embeddings, persist_dir: str, collection_name: str):
 
 # ── state management ─────────────────────────────────────
 
-def load_state() -> Dict:
-    if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+def load_state(state_path: Path) -> Dict:
+    if state_path.exists():
+        with open(state_path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_state(state: Dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+def save_state(state: Dict, state_path: Path):
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def save_build_log(entry: Dict):
-    BUILD_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(BUILD_LOG_FILE, "a", encoding="utf-8") as f:
+def save_build_log(entry: Dict, build_log_path: Path):
+    build_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(build_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def save_index_info(total_stored: int, embedding_dim: int, model_name: str):
+def save_index_info(total_stored: int, embedding_dim: int, model_name: str,
+                    vector_db_dir: Path, index_info_path: Path):
     info = {
         "collection_name": COLLECTION_NAME,
         "description": "T2Ranking evaluation index for passage retrieval",
@@ -193,12 +194,12 @@ def save_index_info(total_stored: int, embedding_dim: int, model_name: str):
         "chunking": "none (passages kept intact, long passages truncated at 2000 chars)",
         "html_cleaned": True,
         "min_text_length": 10,
-        "vectors_dir": str(VECTORDB_DIR / COLLECTION_NAME),
+        "vectors_dir": str(vector_db_dir / COLLECTION_NAME),
     }
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(INDEX_INFO_FILE, "w", encoding="utf-8") as f:
+    index_info_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(index_info_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
-    logger.info(f"Index info saved to: {INDEX_INFO_FILE}")
+    logger.info(f"Index info saved to: {index_info_path}")
 
 
 # ── main build loop ──────────────────────────────────────
@@ -206,7 +207,8 @@ def save_index_info(total_stored: int, embedding_dim: int, model_name: str):
 def main():
     parser = argparse.ArgumentParser(description="Build T2Ranking evaluation vector index incrementally")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Passages per batch (default: 1000)")
-    parser.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL, help="Embedding model name")
+    parser.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL, choices=EMBEDDING_MODEL_CHOICES,
+                        help="Embedding model name")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="Device for embedding")
     parser.add_argument("--rebuild", action="store_true", help="Delete existing index and start fresh")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint (default: auto-detect)")
@@ -215,23 +217,29 @@ def main():
     parser.add_argument("--prefetch", action="store_true", help="Pipeline: GPU embed batch N+1 while CPU stores batch N")
     args = parser.parse_args()
 
+    vector_db_dir = _BASE_VECTOR_DB_DIR / "t2ranking" / model_short_name(args.model)
+
+    state_file = DATA_DIR / f"state_{model_short_name(args.model)}.json"
+    index_info_file = DATA_DIR / f"index_info_{model_short_name(args.model)}.json"
+    build_log_file = DATA_DIR / f"build_log_{model_short_name(args.model)}.jsonl"
+
     # ── resolve state ──
     if args.rebuild:
         state = {}
         logger.info("Rebuild mode: clearing state and existing index")
         import shutil
-        index_dir = VECTORDB_DIR / COLLECTION_NAME
+        index_dir = vector_db_dir / COLLECTION_NAME
         if index_dir.exists():
             shutil.rmtree(index_dir)
             logger.info(f"Deleted existing index: {index_dir}")
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-        if BUILD_LOG_FILE.exists():
-            BUILD_LOG_FILE.unlink()
-        if INDEX_INFO_FILE.exists():
-            INDEX_INFO_FILE.unlink()
+        if state_file.exists():
+            state_file.unlink()
+        if build_log_file.exists():
+            build_log_file.unlink()
+        if index_info_file.exists():
+            index_info_file.unlink()
     else:
-        state = load_state()
+        state = load_state(state_file)
 
     start_line = state.get("last_processed_line", 0)
     batches_completed = state.get("batches_completed", 0)
@@ -250,8 +258,8 @@ def main():
     print("  T2Ranking 向量索引增量构建")
     print("=" * 60)
     print(f"  Collection file:  {COLLECTION_FILE}")
-    print(f"  State file:        {STATE_FILE}")
-    print(f"  Vector DB dir:     {VECTORDB_DIR}")
+    print(f"  State file:        {state_file}")
+    print(f"  Vector DB dir:     {vector_db_dir}")
     print(f"  Collection name:   {COLLECTION_NAME}")
     print(f"  Embedding model:   {args.model}")
     print(f"  Device:            {args.device}")
@@ -282,8 +290,8 @@ def main():
         embedding_dim = 512
     logger.info(f"Embedding dimension: {embedding_dim}")
 
-    logger.info(f"Initializing vector store at: {VECTORDB_DIR}")
-    vectorstore = get_vectorstore(embeddings, str(VECTORDB_DIR), COLLECTION_NAME)
+    logger.info(f"Initializing vector store at: {vector_db_dir}")
+    vectorstore = get_vectorstore(embeddings, str(vector_db_dir), COLLECTION_NAME)
 
     # 调大 HNSW 内部 batch，避免索引变大后插入退化
     try:
@@ -307,6 +315,7 @@ def main():
         total_stored, total_skipped, batch_no, start_line, overall_start = _prefetch_build_loop(
             embeddings, vectorstore, args, state,
             start_line, batches_completed, total_stored, total_skipped, total_lines, max_batches, embedding_dim,
+            state_file, build_log_file,
         )
     else:
         overall_start = time.time()
@@ -357,7 +366,7 @@ def main():
                 "embedding_model": args.model,
                 "embedding_dim": embedding_dim,
             }
-            save_state(state)
+            save_state(state, state_file)
 
             log_entry = {
                 "batch": batch_no,
@@ -369,7 +378,7 @@ def main():
                 "batch_time_s": round(batch_time, 1),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            save_build_log(log_entry)
+            save_build_log(log_entry, build_log_file)
 
             avg_speed = stored_count / embed_time if embed_time > 0 else 0
             elapsed_total = time.time() - overall_start
@@ -388,8 +397,8 @@ def main():
 
     # ── final ──
     overall_time = time.time() - overall_start
-    save_index_info(total_stored, embedding_dim, args.model)
-    final_state = load_state()
+    save_index_info(total_stored, embedding_dim, args.model, vector_db_dir, index_info_file)
+    final_state = load_state(state_file)
 
     print()
     print("=" * 60)
@@ -402,10 +411,10 @@ def main():
           f"({start_line/max(total_lines,1)*100:.1f}%)")
     print(f"  Total time:              {overall_time/60:.1f} min")
     print(f"  Collection:              {COLLECTION_NAME}")
-    print(f"  Vector DB:               {VECTORDB_DIR}")
-    print(f"  State file:              {STATE_FILE}")
-    print(f"  Index info:              {INDEX_INFO_FILE}")
-    print(f"  Build log:               {BUILD_LOG_FILE}")
+    print(f"  Vector DB:               {vector_db_dir}")
+    print(f"  State file:              {state_file}")
+    print(f"  Index info:              {index_info_file}")
+    print(f"  Build log:               {build_log_file}")
 
     if start_line >= total_lines:
         print("\n  [DONE] All passages indexed. Ready for retrieval evaluation.")
@@ -430,6 +439,7 @@ def _count_total_lines() -> int:
 def _prefetch_build_loop(
     embeddings, vectorstore, args, state,
     start_line, batches_completed, total_stored, total_skipped, total_lines, max_batches, embedding_dim,
+    state_file, build_log_file,
 ):
     from concurrent.futures import ThreadPoolExecutor
     from langchain_core.documents import Document
@@ -497,7 +507,8 @@ def _prefetch_build_loop(
     total_stored += current["stored_count"]
     total_skipped += current["skipped_count"]
     _save_state_and_log(state, current, store_time, total_stored, total_skipped,
-                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines,
+                        state_file, build_log_file)
 
     # ── pipeline loop: prefetch N+1 while storing N ──
     future = None
@@ -518,7 +529,8 @@ def _prefetch_build_loop(
         total_stored += prev["stored_count"]
         total_skipped += prev["skipped_count"]
         _save_state_and_log(state, prev, store_time, total_stored, total_skipped,
-                            batch_no - 1, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+                            batch_no - 1, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines,
+                            state_file, build_log_file)
 
         prev = future.result()
         current_line = prev["current_line"]
@@ -529,14 +541,16 @@ def _prefetch_build_loop(
         total_stored += prev["stored_count"]
         total_skipped += prev["skipped_count"]
         _save_state_and_log(state, prev, store_time, total_stored, total_skipped,
-                            batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+                            batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines,
+                            state_file, build_log_file)
 
     pool.shutdown(wait=False)
     return total_stored, total_skipped, batch_no, current_line, overall_start
 
 
 def _save_state_and_log(state, batch_data, store_time, total_stored, total_skipped,
-                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines):
+                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines,
+                        state_file, build_log_file):
     embed_time = store_time * 0.1
     batch_time = store_time
 
@@ -559,7 +573,7 @@ def _save_state_and_log(state, batch_data, store_time, total_stored, total_skipp
         "embedding_model": args.model,
         "embedding_dim": embedding_dim,
     })
-    save_state(state)
+    save_state(state, state_file)
 
     log_entry = {
         "batch": batch_no,
@@ -572,7 +586,7 @@ def _save_state_and_log(state, batch_data, store_time, total_stored, total_skipp
         "pipeline": True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    save_build_log(log_entry)
+    save_build_log(log_entry, build_log_file)
 
     progress_pct = (current_line / total_lines * 100) if total_lines > 0 else 0
     effective_batches = batch_no - batches_completed

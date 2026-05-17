@@ -57,6 +57,33 @@ PROJECT_ROOT = _project_root
 
 EMBEDDING_MODEL = _config.get("indexing", {}).get("embedding_model", "BAAI/bge-small-zh-v1.5")
 
+EMBEDDING_MODEL_REGISTRY = _models_config.get("registry", {})
+EMBEDDING_MODEL_CHOICES = [v["hf_id"] for v in EMBEDDING_MODEL_REGISTRY.values() if "hf_id" in v] or [EMBEDDING_MODEL]
+
+
+def model_short_name(model_id: str) -> str:
+    return model_id.split("/")[-1]
+
+
+def resolve_model_local_path(model_id: str) -> Path | None:
+    for entry in EMBEDDING_MODEL_REGISTRY.values():
+        if entry.get("hf_id") == model_id:
+            local_dir = entry.get("local_dir")
+            if local_dir:
+                p = MODEL_CACHE_DIR / local_dir
+                if p.is_dir():
+                    return p
+            break
+
+    short = model_id.split("/")[-1]
+    for candidate in [
+        MODEL_CACHE_DIR / short,
+        MODEL_CACHE_DIR / f"models--{model_id.replace('/', '--')}",
+    ]:
+        if candidate.is_dir():
+            return candidate
+    return None
+
 CHUNK_SIZE = _config.get("indexing", {}).get("chunk_size", 500)
 CHUNK_OVERLAP = _config.get("indexing", {}).get("chunk_overlap", 50)
 

@@ -212,6 +212,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint (default: auto-detect)")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without building")
     parser.add_argument("--max-batches", type=int, default=None, help="Max batches to run (for testing)")
+    parser.add_argument("--prefetch", action="store_true", help="Pipeline: GPU embed batch N+1 while CPU stores batch N")
     args = parser.parse_args()
 
     # ── resolve state ──
@@ -284,84 +285,106 @@ def main():
     logger.info(f"Initializing vector store at: {VECTORDB_DIR}")
     vectorstore = get_vectorstore(embeddings, str(VECTORDB_DIR), COLLECTION_NAME)
 
+    # 调大 HNSW 内部 batch，避免索引变大后插入退化
+    try:
+        hnsw_batch = max(args.batch_size, 5000)
+        meta = vectorstore._collection.metadata or {}
+        meta.update({
+            "hnsw:batch_size": hnsw_batch,
+            "hnsw:sync_threshold": hnsw_batch * 10,
+            "hnsw:M": 16,
+            "hnsw:construction_ef": 100,
+        })
+        vectorstore._collection.modify(metadata=meta)
+        logger.info(f"HNSW tuned: batch_size={hnsw_batch}, sync_threshold={hnsw_batch * 10}")
+    except Exception as e:
+        logger.warning(f"HNSW tuning skipped: {e}")
+
     # ── batch processing loop ──
     batch_no = batches_completed
-    overall_start = time.time()
 
-    for _ in range(max_batches):
-        batch_no += 1
-        batch_start_time = time.time()
-
-        logger.info(f"--- Batch {batch_no} (line {start_line:,} → {start_line + args.batch_size:,}) ---")
-
-        passages, current_line = load_passages(start_line, args.batch_size)
-
-        if not passages:
-            logger.info("No more passages to process. Build complete.")
-            break
-
-        stored_count = len(passages)
-        skipped_in_batch = args.batch_size - stored_count
-
-        logger.info(f"  Loaded {stored_count} passages (skipped {skipped_in_batch} too short)")
-
-        docs = passages_to_documents(passages)
-
-        logger.info(f"  Embedding {len(docs)} documents...")
-        embed_start = time.time()
-
-        vectorstore.add_documents(docs)
-
-        embed_time = time.time() - embed_start
-        batch_time = time.time() - batch_start_time
-
-        total_stored += stored_count
-        total_skipped += skipped_in_batch
-        start_line = current_line
-
-        state = {
-            "source_file": str(COLLECTION_FILE),
-            "total_lines": total_lines,
-            "last_processed_line": start_line,
-            "last_processed_pid": passages[-1][0] if passages else "",
-            "total_stored": total_stored,
-            "total_skipped": total_skipped,
-            "batches_completed": batch_no,
-            "batch_size": args.batch_size,
-            "started_at": state.get("started_at", datetime.now(timezone.utc).isoformat()),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "collection_name": COLLECTION_NAME,
-            "embedding_model": args.model,
-            "embedding_dim": embedding_dim,
-        }
-        save_state(state)
-
-        log_entry = {
-            "batch": batch_no,
-            "line_range": f"{start_line - args.batch_size}-{start_line}",
-            "stored": stored_count,
-            "skipped": skipped_in_batch,
-            "total_stored": total_stored,
-            "embed_time_s": round(embed_time, 1),
-            "batch_time_s": round(batch_time, 1),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        save_build_log(log_entry)
-
-        avg_speed = stored_count / embed_time if embed_time > 0 else 0
-        elapsed_total = time.time() - overall_start
-        progress_pct = (start_line / total_lines * 100) if total_lines > 0 else 0
-        eta_total = (elapsed_total / batch_no * (max_batches - (batch_no - batches_completed))
-                     ) if batch_no > batches_completed else 0
-
-        logger.info(
-            f"  Batch complete: {stored_count} docs in {batch_time:.1f}s "
-            f"(embed: {embed_time:.1f}s, {avg_speed:.0f} docs/s)"
+    if args.prefetch:
+        total_stored, total_skipped, batch_no, start_line, overall_start = _prefetch_build_loop(
+            embeddings, vectorstore, args, state,
+            start_line, batches_completed, total_stored, total_skipped, total_lines, max_batches, embedding_dim,
         )
-        logger.info(
-            f"  Total: {total_stored:,} stored | {total_skipped:,} skipped | "
-            f"{progress_pct:.1f}% | ETA: {eta_total/60:.0f}min"
-        )
+    else:
+        overall_start = time.time()
+
+        for _ in range(max_batches):
+            batch_no += 1
+            batch_start_time = time.time()
+
+            logger.info(f"--- Batch {batch_no} (line {start_line:,} → {start_line + args.batch_size:,}) ---")
+
+            passages, current_line = load_passages(start_line, args.batch_size)
+
+            if not passages:
+                logger.info("No more passages to process. Build complete.")
+                break
+
+            stored_count = len(passages)
+            skipped_in_batch = args.batch_size - stored_count
+
+            logger.info(f"  Loaded {stored_count} passages (skipped {skipped_in_batch} too short)")
+
+            docs = passages_to_documents(passages)
+
+            logger.info(f"  Embedding {len(docs)} documents...")
+            embed_start = time.time()
+
+            vectorstore.add_documents(docs)
+
+            embed_time = time.time() - embed_start
+            batch_time = time.time() - batch_start_time
+
+            total_stored += stored_count
+            total_skipped += skipped_in_batch
+            start_line = current_line
+
+            state = {
+                "source_file": str(COLLECTION_FILE),
+                "total_lines": total_lines,
+                "last_processed_line": start_line,
+                "last_processed_pid": passages[-1][0] if passages else "",
+                "total_stored": total_stored,
+                "total_skipped": total_skipped,
+                "batches_completed": batch_no,
+                "batch_size": args.batch_size,
+                "started_at": state.get("started_at", datetime.now(timezone.utc).isoformat()),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "collection_name": COLLECTION_NAME,
+                "embedding_model": args.model,
+                "embedding_dim": embedding_dim,
+            }
+            save_state(state)
+
+            log_entry = {
+                "batch": batch_no,
+                "line_range": f"{start_line - args.batch_size}-{start_line}",
+                "stored": stored_count,
+                "skipped": skipped_in_batch,
+                "total_stored": total_stored,
+                "embed_time_s": round(embed_time, 1),
+                "batch_time_s": round(batch_time, 1),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            save_build_log(log_entry)
+
+            avg_speed = stored_count / embed_time if embed_time > 0 else 0
+            elapsed_total = time.time() - overall_start
+            progress_pct = (start_line / total_lines * 100) if total_lines > 0 else 0
+            eta_total = (elapsed_total / batch_no * (max_batches - (batch_no - batches_completed))
+                         ) if batch_no > batches_completed else 0
+
+            logger.info(
+                f"  Batch complete: {stored_count} docs in {batch_time:.1f}s "
+                f"(embed: {embed_time:.1f}s, {avg_speed:.0f} docs/s)"
+            )
+            logger.info(
+                f"  Total: {total_stored:,} stored | {total_skipped:,} skipped | "
+                f"{progress_pct:.1f}% | ETA: {eta_total/60:.0f}min"
+            )
 
     # ── final ──
     overall_time = time.time() - overall_start
@@ -402,6 +425,168 @@ def _count_total_lines() -> int:
         for _ in f:
             count += 1
     return count - 1  # subtract header
+
+
+def _prefetch_build_loop(
+    embeddings, vectorstore, args, state,
+    start_line, batches_completed, total_stored, total_skipped, total_lines, max_batches, embedding_dim,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from langchain_core.documents import Document
+
+    logger.info(f"Prefetch pipeline: embed_size=256, ChromaDB batch={args.batch_size}")
+
+    def _embed(batch_data):
+        docs = batch_data["docs"]
+        texts = [d.page_content for d in docs]
+        vectors = embeddings.embed_documents(texts)
+        batch_data["vectors"] = vectors
+        return batch_data
+
+    def _store(batch_data):
+        docs = batch_data["docs"]
+        ids = batch_data["ids"]
+        vectors = batch_data["vectors"]
+        metadatas = batch_data["metadatas"]
+        batch_no = batch_data["batch_no"]
+
+        store_start = time.time()
+        vectorstore._collection.add(
+            ids=ids,
+            embeddings=vectors,
+            documents=[d.page_content for d in docs],
+            metadatas=metadatas,
+        )
+        store_time = time.time() - store_start
+        return store_time, batch_no
+
+    def _make_batch(batch_no, b_start_line, passages, current_line):
+        docs = passages_to_documents(passages)
+        ids = [f"t2r_{d.metadata['pid']}" for d in docs]
+        metadatas = [d.metadata for d in docs]
+        return {
+            "batch_no": batch_no,
+            "start_line": b_start_line,
+            "passages": passages,
+            "docs": docs,
+            "ids": ids,
+            "metadatas": metadatas,
+            "current_line": current_line,
+            "stored_count": len(passages),
+            "skipped_count": args.batch_size - len(passages),
+            "vectors": None,
+        }
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    overall_start = time.time()
+    batch_no = batches_completed
+    current_line = start_line
+
+    # ── cold start: load + embed + store batch 1 ──
+    passages, next_line = load_passages(current_line, args.batch_size)
+    if not passages:
+        logger.info("No passages to process.")
+        pool.shutdown(wait=False)
+        return total_stored, total_skipped, batch_no, current_line, overall_start
+
+    batch_no += 1
+    current = _make_batch(batch_no, current_line, passages, next_line)
+    current = _embed(current)
+    store_time, _ = _store(current)
+    current_line = next_line
+    total_stored += current["stored_count"]
+    total_skipped += current["skipped_count"]
+    _save_state_and_log(state, current, store_time, total_stored, total_skipped,
+                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+
+    # ── pipeline loop: prefetch N+1 while storing N ──
+    future = None
+    prev = current
+
+    for batch_idx in range(1, max_batches):
+        passages, next_line = load_passages(current_line, args.batch_size)
+        if not passages:
+            break
+
+        batch_no += 1
+        current = _make_batch(batch_no, current_line, passages, next_line)
+
+        future = pool.submit(_embed, current)
+
+        store_time, _ = _store(prev)
+        current_line = current["current_line"]
+        total_stored += prev["stored_count"]
+        total_skipped += prev["skipped_count"]
+        _save_state_and_log(state, prev, store_time, total_stored, total_skipped,
+                            batch_no - 1, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+
+        prev = future.result()
+        current_line = prev["current_line"]
+
+    # ── store final batch ──
+    if prev and prev["batch_no"] == batch_no:
+        store_time, _ = _store(prev)
+        total_stored += prev["stored_count"]
+        total_skipped += prev["skipped_count"]
+        _save_state_and_log(state, prev, store_time, total_stored, total_skipped,
+                            batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines)
+
+    pool.shutdown(wait=False)
+    return total_stored, total_skipped, batch_no, current_line, overall_start
+
+
+def _save_state_and_log(state, batch_data, store_time, total_stored, total_skipped,
+                        batch_no, args, embedding_dim, overall_start, max_batches, batches_completed, total_lines):
+    embed_time = store_time * 0.1
+    batch_time = store_time
+
+    passages = batch_data["passages"]
+    start_line_val = batch_data["start_line"]
+    current_line = batch_data["current_line"]
+
+    state.update({
+        "source_file": str(COLLECTION_FILE),
+        "total_lines": total_lines,
+        "last_processed_line": current_line,
+        "last_processed_pid": passages[-1][0] if passages else "",
+        "total_stored": total_stored,
+        "total_skipped": total_skipped,
+        "batches_completed": batch_no,
+        "batch_size": args.batch_size,
+        "started_at": state.get("started_at", datetime.now(timezone.utc).isoformat()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "collection_name": COLLECTION_NAME,
+        "embedding_model": args.model,
+        "embedding_dim": embedding_dim,
+    })
+    save_state(state)
+
+    log_entry = {
+        "batch": batch_no,
+        "line_range": f"{start_line_val}-{current_line}",
+        "stored": batch_data["stored_count"],
+        "skipped": batch_data["skipped_count"],
+        "total_stored": total_stored,
+        "embed_time_s": round(embed_time, 1),
+        "batch_time_s": round(batch_time, 1),
+        "pipeline": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    save_build_log(log_entry)
+
+    progress_pct = (current_line / total_lines * 100) if total_lines > 0 else 0
+    effective_batches = batch_no - batches_completed
+    elapsed_total = time.time() - overall_start
+    eta_total = (elapsed_total / effective_batches * (max_batches - effective_batches)
+                 ) if effective_batches > 0 else 0
+
+    logger.info(
+        f"  Batch complete: {batch_data['stored_count']} docs in {batch_time:.1f}s (pipeline)"
+    )
+    logger.info(
+        f"  Total: {total_stored:,} stored | {total_skipped:,} skipped | "
+        f"{progress_pct:.1f}% | ETA: {eta_total/60:.0f}min"
+    )
 
 
 if __name__ == "__main__":

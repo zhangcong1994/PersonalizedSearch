@@ -65,6 +65,15 @@ def model_short_name(model_id: str) -> str:
     return model_id.split("/")[-1]
 
 
+def _resolve_hf_snapshot(cache_dir: Path) -> Path | None:
+    snapshots_dir = cache_dir / "snapshots"
+    if snapshots_dir.is_dir():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return snapshots[-1]
+    return None
+
+
 def resolve_model_local_path(model_id: str) -> Path | None:
     for entry in EMBEDDING_MODEL_REGISTRY.values():
         if entry.get("hf_id") == model_id:
@@ -72,7 +81,8 @@ def resolve_model_local_path(model_id: str) -> Path | None:
             if local_dir:
                 p = MODEL_CACHE_DIR / local_dir
                 if p.is_dir():
-                    return p
+                    resolved = _resolve_hf_snapshot(p)
+                    return resolved if resolved is not None else p
             break
 
     short = model_id.split("/")[-1]
@@ -81,7 +91,8 @@ def resolve_model_local_path(model_id: str) -> Path | None:
         MODEL_CACHE_DIR / f"models--{model_id.replace('/', '--')}",
     ]:
         if candidate.is_dir():
-            return candidate
+            resolved = _resolve_hf_snapshot(candidate)
+            return resolved if resolved is not None else candidate
     return None
 
 CHUNK_SIZE = _config.get("indexing", {}).get("chunk_size", 500)

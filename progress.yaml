@@ -29,11 +29,14 @@ milestones:
       - 验证脚本 validate_rag_pipeline.py 6 条测试查询全通过
       - Gradio 前端 app.py 上线（http://127.0.0.1:7860），支持交互式搜索
       - BM25 vs Dense 检索评估脚本 evaluate_retrieval.py 完成，抽样 500 条跑出首批指标
+      - 创建 experiments/ 目录及 exp-001 详细实验计划（嵌入模型对比 + 检索策略 + Hybrid 融合，含成本与时间预估）
+      - 创建 progress.yaml 项目进度记录文件
 
 experiments:
   - id: exp-001
     date: 2026-05-17
     name: BM25 vs Dense 基准对比
+    plan_file: experiments/exp-001-retrieval-baseline.yaml
     description: 首次检索评估，验证 BM25 (B0) 与 Dense (B1) 在 T2Ranking 上的表现差异
     config:
       dataset: T2Ranking dev

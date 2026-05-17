@@ -1,0 +1,125 @@
+# 项目进度与实验记录
+# 记录功能完成节点、实验指标、关键决策
+
+project: PersonalizedSearch
+started: 2026-05-15
+
+milestones:
+  - date: 2026-05-15
+    event: 项目启动，确立 V0→V1→V2 渐进式迭代策略
+    details:
+      - 确定三轨数据集分工：Wikipedia（开发）+ T2Ranking（主力评估）+ MIRACL（辅助参考）
+      - 撰写 proposal.md 设计文档
+
+  - date: 2026-05-16
+    event: T2Ranking 评估数据下载完成
+    details:
+      - 4 个评估文件下载至 data/raw/t2ranking/
+      - collection.tsv（3.5GB，2,303,643 passages）
+      - queries.dev.tsv（24,832 条查询）
+      - queries.test.tsv（24,832 条查询）
+      - qrels.retrieval.dev.tsv（118,932 对 qrels）
+      - 分析脚本 _analyze_collection.py 完成数据探索
+
+  - date: 2026-05-17
+    event: "里程碑：全流程跑通（检索 → Prompt → LLM 生成）"
+    details:
+      - T2Ranking 增量索引构建脚本 build_t2ranking_index.py 完成（1000 条/批）
+      - 第一批 150,000 passages 嵌入并存入 ChromaDB（bge-small-zh-v1.5, dim=512）
+      - 验证脚本 validate_rag_pipeline.py 6 条测试查询全通过
+      - Gradio 前端 app.py 上线（http://127.0.0.1:7860），支持交互式搜索
+      - BM25 vs Dense 检索评估脚本 evaluate_retrieval.py 完成，抽样 500 条跑出首批指标
+      - 创建 experiments/ 目录及 exp-001 详细实验计划（嵌入模型对比 + 检索策略 + Hybrid 融合，含成本与时间预估）
+      - 创建 progress.yaml 项目进度记录文件
+
+experiments:
+  - id: exp-001
+    date: 2026-05-17
+    name: BM25 vs Dense 基准对比
+    plan_file: experiments/exp-001-retrieval-baseline.yaml
+    description: 首次检索评估，验证 BM25 (B0) 与 Dense (B1) 在 T2Ranking 上的表现差异
+    config:
+      dataset: T2Ranking dev
+      passage_pool: 150000（前 150k 条，原始 2,303,643 的 6.6%）
+      embedding_model: BAAI/bge-small-zh-v1.5
+      embedding_dim: 512
+      queries_evaluated: 296（抽样 500 条中，有相关段落落入 passage 池的）
+      top_k: 10
+      bm25_impl: rank_bm25 (0.2.2)
+      device: cpu
+    results:
+      BM25:
+        Recall@1: 0.0000
+        Recall@3: 0.0000
+        Recall@5: 0.0002
+        Recall@10: 0.0010
+        MRR: 0.0011
+        search_speed_ms_per_q: 35
+      Dense:
+        Recall@1: 0.1198
+        Recall@3: 0.2218
+        Recall@5: 0.2612
+        Recall@10: 0.3064
+        MRR: 0.6441
+        search_speed_ms_per_q: 14
+    delta:
+      Recall_at_10: "+0.3054"
+      MRR: "+0.6431"
+    notes:
+      - "BM25 在中文互联网段落上几乎完全失效（Recall@10 仅 0.1%）"
+      - "Dense 检索 MRR 达到 0.64，语义检索远超关键词匹配"
+      - "⚠️ 150k 池子仅覆盖约 65% 查询的相关段落，完整索引建好后数字会有变化"
+      - "后续全量索引 + 更大抽样可获得更可靠的结论"
+
+decisions:
+  - date: 2026-05-16
+    topic: 评估数据集选择
+    decision: T2Ranking 为主力评估集，MIRACL 为辅助参考
+    rationale:
+      - T2Ranking 提供 30 万+ 真实中文查询、4 级细粒度标注、query types 标签
+      - MIRACL 仅 1,500 条查询、二元标注、无语义类别，不适合消融实验
+    status: accepted
+
+  - date: 2026-05-17
+    topic: T2Ranking 分片策略
+    decision: 不分片，passage 即检索单元
+    rationale:
+      - qrels 按 qid→pid 映射，切片会破坏对应关系
+      - passage 中位数 368 字符，天然适合作为检索单元
+      - 保持评估简洁性优先
+    status: accepted
+
+  - date: 2026-05-17
+    topic: 查询重写 & LLM 生成策略
+    decision: V0 阶段全部使用 DeepSeek API，不部署本地模型
+    rationale:
+      - 查询重写每条约 ¥0.001，24k 条评估仅 ¥25
+      - LLM 生成不影响检索评估指标，评估脚本可跳过生成环节
+      - V1 阶段再考虑本地部署
+    status: accepted
+
+  - date: 2026-05-17
+    topic: 向量库目录规范
+    decision: 按 dataset/model/chunk 三级目录组织
+    rationale:
+      - 支持多嵌入模型、多分片策略并存，避免文件名冲突
+      - index_registry.json 记录每个索引的元信息，评估脚本自动发现
+    status: accepted
+
+  - date: 2026-05-17
+    topic: 计算资源策略
+    decision: 本地完成评估脚本开发与小规模验证 → 租 AutoDL 跑全量实验
+    rationale:
+      - 本地 CPU 一次实验 30+ 小时，迭代太慢
+      - AutoDL RTX 4090 约 ¥2-3/小时，一个完整实验周期约 ¥50-70
+      - 先用本地 150k 池子跑通评估逻辑，再上服务器大批量跑
+    status: accepted
+
+index_registry:
+  t2ranking_bge_small:
+    path: data/vector_db/t2ranking/bge-small-zh-v1.5
+    embedding_model: BAAI/bge-small-zh-v1.5
+    embedding_dim: 512
+    total_docs: 150000
+    dataset: t2ranking
+    build_status: partial

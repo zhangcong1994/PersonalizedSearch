@@ -1,0 +1,49 @@
+data:
+  download:
+    aol4ps_url: "https://github.com/AnnKwok/AOL4PS/raw/main/"
+    save_dir: "./data/raw/aol4ps/"
+    timeout: 300
+    max_retries: 3
+  raw_path: "./data/raw/"
+  processed_path: "./data/processed/"
+
+wikipedia:
+  xml_path: "./data/raw/wikipedia/zhwiki-latest-pages-articles.xml"
+  jsonl_path: "./data/processed/wikipedia_articles.jsonl"
+  parse:
+    num_articles: 30000
+    min_text_length: 200
+
+indexing:
+  chunk_size: 500
+  chunk_overlap: 50
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+  vector_db:
+    type: "chromadb"
+    path: "./data/vector_db/"
+    collection_name: "zhwiki_articles"
+
+retrieval:
+  top_k: 5
+  search_type: "similarity"
+
+intent:
+  api_client:
+    type: "deepseek"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+    max_tokens: 512
+    temperature: 0.1
+  prompt_template: "query_rewrite_basic"
+
+generation:
+  api_client:
+    type: "deepseek"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+    max_tokens: 1024
+    temperature: 0.3
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(levelname)s - %(message)s"

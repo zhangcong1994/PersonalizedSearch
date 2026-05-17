@@ -33,7 +33,7 @@ BUILD_LOG_FILE = DATA_DIR / "build_log.jsonl"
 VECTORDB_DIR = VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 
-DEFAULT_BATCH_SIZE = 1000
+DEFAULT_BATCH_SIZE = 5000
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODEL
@@ -130,6 +130,9 @@ def get_embedding_model(
         logger.info(f"Using local embedding model: {model_name}")
     else:
         logger.info(f"Loading embedding model: {model_name}")
+
+    if device == "cuda":
+        batch_size = 256
 
     model_kwargs = {"device": device}
     encode_kwargs = {"normalize_embeddings": True, "batch_size": batch_size}

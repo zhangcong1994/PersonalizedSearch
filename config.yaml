@@ -7,49 +7,42 @@ data:
   raw_path: "./data/raw/"
   processed_path: "./data/processed/"
 
+wikipedia:
+  xml_path: "./data/raw/wikipedia/zhwiki-latest-pages-articles.xml"
+  jsonl_path: "./data/processed/wikipedia_articles.jsonl"
+  parse:
+    num_articles: 30000
+    min_text_length: 200
+
 indexing:
-  chunk_size: 256
-  chunk_overlap: 20
-  embedding_model: "all-MiniLM-L6-v2"
+  chunk_size: 500
+  chunk_overlap: 50
+  embedding_model: "BAAI/bge-small-zh-v1.5"
   vector_db:
     type: "chromadb"
     path: "./data/vector_db/"
-    top_k: 10
+    collection_name: "zhwiki_articles"
 
-intent:  # API客户端配置
-  api_client:
-    type: "deepseek"         # 可选: openai, deepseek
-    api_key: "${DEEPSEEK_API_KEY}"  # 环境变量方式
-    model: "deepseek-chat"   # DeepSeek模型名称
-    max_tokens: 512          # 最大生成token数
-    temperature: 0.1         # 生成温度（0-1，越低越确定，建议低温度保证一致性）
-  
-  # Prompt模板配置
-  prompt_template: "query_rewrite_basic"  # 使用的模板名称
-
-# 搜索检索模块配置
 retrieval:
-  vector_db: "chromadb"      # 可选: chromadb, faiss
-  top_k: 10                  # 返回结果数量
-  chunk_size: 256            # 文档切片大小
-  chunk_overlap: 20          # 切片重叠大小
+  top_k: 5
+  search_type: "similarity"
 
-# LLM生成模块配置
-generation:
+intent:
   api_client:
-    type: "openai"
-    api_key: "${OPENAI_API_KEY}"
-    model: "gpt-3.5-turbo"
+    type: "deepseek"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
     max_tokens: 512
-    temperature: 0.7
-
-retrieval:
-  top_k: 10
-  rerank_top_k: 5
+    temperature: 0.1
+  prompt_template: "query_rewrite_basic"
 
 generation:
-  max_tokens: 1024
-  temperature: 0.7
+  api_client:
+    type: "deepseek"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+    max_tokens: 1024
+    temperature: 0.3
 
 logging:
   level: "INFO"

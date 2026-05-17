@@ -15,3 +15,12 @@ openai
 lightgbm
 loguru
 datasets
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-chroma
+langchain-huggingface
+langchain-text-splitters
+lxml
+opencc-python-reimplemented

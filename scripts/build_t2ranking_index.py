@@ -1,0 +1,404 @@
+import os
+import sys
+import re
+import json
+import time
+import argparse
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ── constants ────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data" / "raw" / "t2ranking"
+COLLECTION_FILE = DATA_DIR / "collection.tsv"
+STATE_FILE = DATA_DIR / "state.json"
+INDEX_INFO_FILE = DATA_DIR / "index_info.json"
+BUILD_LOG_FILE = DATA_DIR / "build_log.jsonl"
+VECTORDB_DIR = PROJECT_ROOT / "data" / "vector_db"
+COLLECTION_NAME = "t2ranking_passages"
+
+DEFAULT_BATCH_SIZE = 1000
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_CHUNK_OVERLAP = 50
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+
+# HTML tag cleanup pattern
+HTML_RE = re.compile(r"<[^>]*>")
+
+# ── html / text cleaning ─────────────────────────────────
+
+def clean_text(text: str) -> str:
+    text = HTML_RE.sub("", text)
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# ── passage loading ──────────────────────────────────────
+
+def load_passages(
+    start_line: int,
+    batch_size: int,
+    min_text_length: int = 10,
+    max_text_length: int = 2000,
+) -> Tuple[List[Tuple[str, str]], int]:
+    passages = []
+    total_lines = 0
+    line_no = 0
+    skipped_too_short = 0
+    skipped_too_long = 0
+
+    with open(COLLECTION_FILE, "r", encoding="utf-8") as f:
+        header = f.readline()
+
+        for line in f:
+            if line_no < start_line:
+                line_no += 1
+                continue
+
+            if len(passages) >= batch_size:
+                break
+
+            parts = line.strip().split("\t", 1)
+            line_no += 1
+            total_lines = line_no
+
+            if len(parts) < 2:
+                continue
+
+            pid, raw_text = parts[0], parts[1]
+            text = clean_text(raw_text)
+
+            if len(text) < min_text_length:
+                skipped_too_short += 1
+                continue
+
+            if len(text) > max_text_length:
+                text = text[:max_text_length]
+
+            passages.append((pid, text))
+
+    return passages, total_lines
+
+
+# ── langchain document conversion ────────────────────────
+
+def passages_to_documents(passages: List[Tuple[str, str]]):
+    from langchain_core.documents import Document
+
+    docs = []
+    for pid, text in passages:
+        docs.append(Document(
+            page_content=text,
+            metadata={
+                "pid": pid,
+                "source": "T2Ranking",
+                "text_length": len(text),
+            },
+        ))
+    return docs
+
+
+# ── embedding model ──────────────────────────────────────
+
+def get_embedding_model(
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+    device: str = "cpu",
+    batch_size: int = 128,
+):
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+    local_path = PROJECT_ROOT / "models" / "bge-small-zh-v1.5"
+    if local_path.is_dir():
+        model_name = str(local_path.resolve())
+        logger.info(f"Using local embedding model: {model_name}")
+    else:
+        logger.info(f"Loading embedding model: {model_name}")
+
+    model_kwargs = {"device": device}
+    encode_kwargs = {"normalize_embeddings": True, "batch_size": batch_size}
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs,
+    )
+    return embeddings
+
+
+# ── vector store ─────────────────────────────────────────
+
+def get_vectorstore(embeddings, persist_dir: str, collection_name: str):
+    from langchain_chroma import Chroma
+
+    os.makedirs(persist_dir, exist_ok=True)
+
+    vectorstore = Chroma(
+        collection_name=collection_name,
+        embedding_function=embeddings,
+        persist_directory=persist_dir,
+    )
+    return vectorstore
+
+
+# ── state management ─────────────────────────────────────
+
+def load_state() -> Dict:
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state: Dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def save_build_log(entry: Dict):
+    BUILD_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(BUILD_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def save_index_info(total_stored: int, embedding_dim: int, model_name: str):
+    info = {
+        "collection_name": COLLECTION_NAME,
+        "description": "T2Ranking evaluation index for passage retrieval",
+        "embedding_model": model_name,
+        "embedding_dim": embedding_dim,
+        "total_passages": total_stored,
+        "build_completed_at": datetime.now(timezone.utc).isoformat(),
+        "collection_file": str(COLLECTION_FILE),
+        "chunking": "none (passages kept intact, long passages truncated at 2000 chars)",
+        "html_cleaned": True,
+        "min_text_length": 10,
+        "vectors_dir": str(VECTORDB_DIR / COLLECTION_NAME),
+    }
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(INDEX_INFO_FILE, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    logger.info(f"Index info saved to: {INDEX_INFO_FILE}")
+
+
+# ── main build loop ──────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Build T2Ranking evaluation vector index incrementally")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Passages per batch (default: 1000)")
+    parser.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL, help="Embedding model name")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="Device for embedding")
+    parser.add_argument("--rebuild", action="store_true", help="Delete existing index and start fresh")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint (default: auto-detect)")
+    parser.add_argument("--dry-run", action="store_true", help="Show plan without building")
+    parser.add_argument("--max-batches", type=int, default=None, help="Max batches to run (for testing)")
+    args = parser.parse_args()
+
+    # ── resolve state ──
+    if args.rebuild:
+        state = {}
+        logger.info("Rebuild mode: clearing state and existing index")
+        import shutil
+        index_dir = VECTORDB_DIR / COLLECTION_NAME
+        if index_dir.exists():
+            shutil.rmtree(index_dir)
+            logger.info(f"Deleted existing index: {index_dir}")
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+        if BUILD_LOG_FILE.exists():
+            BUILD_LOG_FILE.unlink()
+        if INDEX_INFO_FILE.exists():
+            INDEX_INFO_FILE.unlink()
+    else:
+        state = load_state()
+
+    start_line = state.get("last_processed_line", 0)
+    batches_completed = state.get("batches_completed", 0)
+    total_stored = state.get("total_stored", 0)
+    total_skipped = state.get("total_skipped", 0)
+    total_lines = state.get("total_lines", _count_total_lines())
+
+    # ── print plan ──
+    remaining = max(0, total_lines - start_line)
+    max_batches = remaining // args.batch_size
+    if args.max_batches:
+        max_batches = min(max_batches, args.max_batches)
+
+    print()
+    print("=" * 60)
+    print("  T2Ranking 向量索引增量构建")
+    print("=" * 60)
+    print(f"  Collection file:  {COLLECTION_FILE}")
+    print(f"  State file:        {STATE_FILE}")
+    print(f"  Vector DB dir:     {VECTORDB_DIR}")
+    print(f"  Collection name:   {COLLECTION_NAME}")
+    print(f"  Embedding model:   {args.model}")
+    print(f"  Device:            {args.device}")
+    print(f"  Batch size:        {args.batch_size:,} passages/batch")
+    print(f"  Total lines:       {total_lines:,}")
+    print(f"  Start line:        {start_line:,}")
+    print(f"  Batches done:      {batches_completed}")
+    print(f"  Max batches:       {max_batches if args.max_batches else 'all'}")
+    print(f"  Passages stored:   {total_stored:,}")
+    print(f"  Passages skipped:  {total_skipped:,}")
+    print()
+
+    if args.dry_run:
+        print("[DRY RUN] No changes made.")
+        return 0
+
+    # ── init model and vectorstore ──
+    logger.info("Loading embedding model...")
+    embeddings = get_embedding_model(args.model, device=args.device)
+
+    # Determine embedding dimension
+    try:
+        if hasattr(embeddings, "client") and hasattr(embeddings.client, "get_sentence_embedding_dimension"):
+            embedding_dim = embeddings.client.get_sentence_embedding_dimension()
+        else:
+            embedding_dim = len(embeddings.embed_query("test"))
+    except Exception:
+        embedding_dim = 512
+    logger.info(f"Embedding dimension: {embedding_dim}")
+
+    logger.info(f"Initializing vector store at: {VECTORDB_DIR}")
+    vectorstore = get_vectorstore(embeddings, str(VECTORDB_DIR), COLLECTION_NAME)
+
+    # ── batch processing loop ──
+    batch_no = batches_completed
+    overall_start = time.time()
+
+    for _ in range(max_batches):
+        batch_no += 1
+        batch_start_time = time.time()
+
+        logger.info(f"--- Batch {batch_no} (line {start_line:,} → {start_line + args.batch_size:,}) ---")
+
+        passages, current_line = load_passages(start_line, args.batch_size)
+
+        if not passages:
+            logger.info("No more passages to process. Build complete.")
+            break
+
+        stored_count = len(passages)
+        skipped_in_batch = args.batch_size - stored_count
+
+        logger.info(f"  Loaded {stored_count} passages (skipped {skipped_in_batch} too short)")
+
+        docs = passages_to_documents(passages)
+
+        logger.info(f"  Embedding {len(docs)} documents...")
+        embed_start = time.time()
+
+        vectorstore.add_documents(docs)
+
+        embed_time = time.time() - embed_start
+        batch_time = time.time() - batch_start_time
+
+        total_stored += stored_count
+        total_skipped += skipped_in_batch
+        start_line = current_line
+
+        state = {
+            "source_file": str(COLLECTION_FILE),
+            "total_lines": total_lines,
+            "last_processed_line": start_line,
+            "last_processed_pid": passages[-1][0] if passages else "",
+            "total_stored": total_stored,
+            "total_skipped": total_skipped,
+            "batches_completed": batch_no,
+            "batch_size": args.batch_size,
+            "started_at": state.get("started_at", datetime.now(timezone.utc).isoformat()),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "collection_name": COLLECTION_NAME,
+            "embedding_model": args.model,
+            "embedding_dim": embedding_dim,
+        }
+        save_state(state)
+
+        log_entry = {
+            "batch": batch_no,
+            "line_range": f"{start_line - args.batch_size}-{start_line}",
+            "stored": stored_count,
+            "skipped": skipped_in_batch,
+            "total_stored": total_stored,
+            "embed_time_s": round(embed_time, 1),
+            "batch_time_s": round(batch_time, 1),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        save_build_log(log_entry)
+
+        avg_speed = stored_count / embed_time if embed_time > 0 else 0
+        elapsed_total = time.time() - overall_start
+        progress_pct = (start_line / total_lines * 100) if total_lines > 0 else 0
+        eta_total = (elapsed_total / batch_no * (max_batches - (batch_no - batches_completed))
+                     ) if batch_no > batches_completed else 0
+
+        logger.info(
+            f"  Batch complete: {stored_count} docs in {batch_time:.1f}s "
+            f"(embed: {embed_time:.1f}s, {avg_speed:.0f} docs/s)"
+        )
+        logger.info(
+            f"  Total: {total_stored:,} stored | {total_skipped:,} skipped | "
+            f"{progress_pct:.1f}% | ETA: {eta_total/60:.0f}min"
+        )
+
+    # ── final ──
+    overall_time = time.time() - overall_start
+    save_index_info(total_stored, embedding_dim, args.model)
+    final_state = load_state()
+
+    print()
+    print("=" * 60)
+    print("  Build Summary")
+    print("=" * 60)
+    print(f"  Total passages stored:   {total_stored:,}")
+    print(f"  Total passages skipped:  {total_skipped:,}")
+    print(f"  Batches completed:       {batch_no}")
+    print(f"  Progress:                {start_line:,}/{total_lines:,} lines "
+          f"({start_line/max(total_lines,1)*100:.1f}%)")
+    print(f"  Total time:              {overall_time/60:.1f} min")
+    print(f"  Collection:              {COLLECTION_NAME}")
+    print(f"  Vector DB:               {VECTORDB_DIR}")
+    print(f"  State file:              {STATE_FILE}")
+    print(f"  Index info:              {INDEX_INFO_FILE}")
+    print(f"  Build log:               {BUILD_LOG_FILE}")
+
+    if start_line >= total_lines:
+        print("\n  [DONE] All passages indexed. Ready for retrieval evaluation.")
+    else:
+        print(f"\n  [PAUSED] {total_lines - start_line:,} passages remaining.")
+        print(f"  Resume with: python scripts/build_t2ranking_index.py")
+
+    return 0
+
+
+def _count_total_lines() -> int:
+    if not COLLECTION_FILE.exists():
+        logger.warning(f"Collection file not found: {COLLECTION_FILE}")
+        return 0
+    count = 0
+    with open(COLLECTION_FILE, "r", encoding="utf-8") as f:
+        for _ in f:
+            count += 1
+    return count - 1  # subtract header
+
+
+if __name__ == "__main__":
+    sys.exit(main())

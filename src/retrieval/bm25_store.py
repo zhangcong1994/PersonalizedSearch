@@ -98,7 +98,6 @@ def build(
     name: str = "t2ranking",
     n_jobs: int = 1,
 ) -> Path:
-    import jieba
     from rank_bm25 import BM25Okapi
 
     if store_dir is None:
@@ -154,11 +153,10 @@ def build(
     logger.info("Building BM25 index...")
     bm25 = BM25Okapi(tokenized)
 
+    del tokenized
+
     pkl_path = store_dir / f"{name}.pkl"
-    data = {
-        "bm25": bm25,
-        "tokenized": tokenized,
-    }
+    data = {"bm25": bm25}
     logger.info(f"Saving index to {pkl_path}...")
     with open(pkl_path, "wb") as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -185,7 +183,9 @@ def load(store_dir: Optional[Path] = None, name: str = "t2ranking") -> tuple:
         data = pickle.load(f)
 
     bm25 = data["bm25"]
-    tokenized = data["tokenized"]
+    tokenized = data.get("tokenized")
+    if tokenized is None:
+        tokenized = bm25.corpus
     logger.info(f"BM25 index loaded: {len(tokenized)} docs, {bm25.corpus_size} terms")
     return bm25, tokenized
 

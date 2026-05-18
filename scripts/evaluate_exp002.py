@@ -103,7 +103,7 @@ def _ensure_llm_output(
             ("human", human_msg),
         ]) | llm
 
-    new_entries = []
+    processed = 0
     for qid, text in missing:
         try:
             result = chain.invoke({"query": text})
@@ -114,13 +114,13 @@ def _ensure_llm_output(
             parsed = text if cfg["output_parser"] == "text" else [text]
 
         cached_all[qid] = parsed
-        new_entries.append((qid, text, parsed))
+        cache.put(experiment_id, qid, text, parsed)
+        processed += 1
 
-        if len(new_entries) % 100 == 0:
-            logger.info(f"  LLM progress: {len(new_entries)}/{len(missing)}")
+        if processed % 100 == 0:
+            logger.info(f"  LLM progress: {processed}/{len(missing)}")
 
-    cache.put_batch(experiment_id, new_entries)
-    logger.info(f"LLM calls complete: {len(missing)} queries, {len(new_entries)} cached")
+    logger.info(f"LLM calls complete: {processed} queries processed, {processed} cached")
     return cached_all
 
 

@@ -138,7 +138,7 @@ def get_embedding_model(
     if device == "cuda":
         batch_size = 256
         if use_fp16:
-            model_kwargs["torch_dtype"] = torch.float16
+            model_kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
             logger.info("Loading model in FP16 to reduce GPU memory")
 
     encode_kwargs = {"normalize_embeddings": True, "batch_size": batch_size}

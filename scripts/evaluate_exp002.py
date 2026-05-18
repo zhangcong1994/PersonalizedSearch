@@ -631,7 +631,7 @@ def main():
             RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{args.dense_strategy}.jsonl"
         )
 
-    run_experiment(
+    output = run_experiment(
         experiment_id=args.experiment,
         sample_size=args.sample,
         top_k=args.top_k,
@@ -646,6 +646,29 @@ def main():
     print()
     print(f"Results saved to: {save_path}")
     print(f"LLM cache: {RESULTS_DIR}/rewrite_cache/{args.experiment}.jsonl")
+
+    if output is not None and output[0] is not None:
+        results, meta = output
+
+        retrievals_keys = set()
+        for r in results:
+            retrievals_keys.update(r["retrievals"].keys())
+
+        metrics_map = {}
+        for key in sorted(retrievals_keys):
+            metrics_map[key] = compute_metrics(results, key)
+
+        print_comparison(metrics_map)
+
+        metrics_path = str(
+            RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{args.dense_strategy}_metrics.json"
+        )
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "meta": meta,
+                "metrics": metrics_map,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"Metrics saved to: {metrics_path}")
 
     return 0
 

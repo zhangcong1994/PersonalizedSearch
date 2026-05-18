@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import html
 import json
 import time
 import argparse
@@ -40,13 +41,18 @@ DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODEL
 
 # HTML tag cleanup pattern
 HTML_RE = re.compile(r"<[^>]*>")
+URL_RE = re.compile(r"https?://\S+")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # ── html / text cleaning ─────────────────────────────────
 
 def clean_text(text: str) -> str:
     text = HTML_RE.sub("", text)
-    text = text.replace("\n", " ").replace("\r", " ")
+    text = html.unescape(text)
+    text = URL_RE.sub("", text)
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     text = re.sub(r"\s+", " ", text)
+    text = CONTROL_RE.sub("", text)
     return text.strip()
 
 

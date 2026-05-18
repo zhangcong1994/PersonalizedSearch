@@ -1,4 +1,5 @@
 import re
+import html
 import logging
 from pathlib import Path
 
@@ -10,12 +11,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 HTML_RE = re.compile(r"<[^>]*>")
+URL_RE = re.compile(r"https?://\S+")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 TRUNCATE_LEN = 2000
 MIN_TEXT_LEN = 10
 
 
 def clean_text(text: str) -> str:
     text = HTML_RE.sub("", text)
+    text = html.unescape(text)
+    text = URL_RE.sub("", text)
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = CONTROL_RE.sub("", text)
     text = text.strip()
     return text
 

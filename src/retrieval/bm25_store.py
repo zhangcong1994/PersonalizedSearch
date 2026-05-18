@@ -79,7 +79,11 @@ def _tokenize_worker(text: str) -> list[str]:
     global _worker_stopwords
     import jieba
 
-    tokens = jieba.lcut(text)
+    try:
+        tokens = jieba.lcut(text)
+    except Exception:
+        return []
+
     sw = _worker_stopwords
     if sw:
         tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1 and w not in sw]
@@ -108,26 +112,35 @@ def build(
     elif n_jobs < 0:
         n_jobs = mp.cpu_count()
 
+    max_safe_jobs = max(1, min(mp.cpu_count(), 8))
+    if n_jobs > max_safe_jobs:
+        logger.warning(
+            f"Limiting workers from {n_jobs} to {max_safe_jobs} "
+            f"(to avoid memory pressure from loading jieba per worker)"
+        )
+        n_jobs = max_safe_jobs
+
     stopwords = _load_stopwords()
 
     use_multiprocessing = n_jobs > 1 and n_total > 1000
 
     if use_multiprocessing:
+        import math
+
         logger.info(
             f"Tokenizing {n_total:,} passages (jieba, stopwords={len(stopwords)}, workers={n_jobs})..."
         )
-        chunksize = max(1, n_total // (n_jobs * 100))
-        with mp.Pool(processes=n_jobs, initializer=_init_worker, initargs=(stopwords,)) as pool:
+        chunksize = max(500, math.ceil(n_total / (n_jobs * 20)))
+        with mp.Pool(
+            processes=n_jobs,
+            initializer=_init_worker,
+            initargs=(stopwords,),
+            maxtasksperchild=max(1, n_total // (n_jobs * 5)),
+        ) as pool:
+            iterator = pool.imap_unordered(_tokenize_worker, texts, chunksize=chunksize)
             if tqdm is not None:
-                tokenized = list(tqdm(
-                    pool.imap(_tokenize_worker, texts, chunksize=chunksize),
-                    total=n_total,
-                    desc="Tokenizing",
-                    unit="docs",
-                    mininterval=2,
-                ))
-            else:
-                tokenized = pool.map(_tokenize_worker, texts, chunksize=chunksize)
+                iterator = tqdm(iterator, total=n_total, desc="Tokenizing", unit="docs", mininterval=2)
+            tokenized = list(iterator)
     else:
         logger.info(f"Tokenizing {n_total:,} passages (jieba, stopwords={len(stopwords)})...")
         iterator = texts

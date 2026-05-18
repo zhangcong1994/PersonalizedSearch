@@ -121,8 +121,10 @@ def get_embedding_model(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     device: str = "cpu",
     batch_size: int = 128,
+    use_fp16: bool = True,
 ):
     from langchain_huggingface import HuggingFaceEmbeddings
+    import torch
 
     local_path = resolve_model_local_path(model_name)
     if local_path is not None:
@@ -131,10 +133,14 @@ def get_embedding_model(
     else:
         logger.info(f"Loading embedding model: {model_name}")
 
+    model_kwargs = {"device": device}
+
     if device == "cuda":
         batch_size = 256
+        if use_fp16:
+            model_kwargs["torch_dtype"] = torch.float16
+            logger.info("Loading model in FP16 to reduce GPU memory")
 
-    model_kwargs = {"device": device}
     encode_kwargs = {"normalize_embeddings": True, "batch_size": batch_size}
 
     embeddings = HuggingFaceEmbeddings(
@@ -215,6 +221,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show plan without building")
     parser.add_argument("--max-batches", type=int, default=None, help="Max batches to run (for testing)")
     parser.add_argument("--prefetch", action="store_true", help="Pipeline: GPU embed batch N+1 while CPU stores batch N")
+    parser.add_argument("--no-fp16", action="store_true", help="Disable FP16 precision on CUDA (use FP32, more memory)")
     args = parser.parse_args()
 
     vector_db_dir = _BASE_VECTOR_DB_DIR / "t2ranking" / model_short_name(args.model)
@@ -280,7 +287,7 @@ def main():
 
     # ── init model and vectorstore ──
     logger.info("Loading embedding model...")
-    embeddings = get_embedding_model(args.model, device=args.device)
+    embeddings = get_embedding_model(args.model, device=args.device, use_fp16=not args.no_fp16)
 
     # Determine embedding dimension
     try:

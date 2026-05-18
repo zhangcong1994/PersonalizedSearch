@@ -1,0 +1,440 @@
+# 实验计划：V0 查询重写增强检索
+# exp-002: Prompt 工程 + Multi-Query 融合 + HyDE + PRF
+# 创建日期: 2026-05-18
+
+meta:
+  experiment_id: exp-002
+  phase: V0
+  objective: "在不引入微调的前提下，通过 Prompt 工程、多查询融合、预回答扩展、伪相关反馈提升检索召回率"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-001 E1 嵌入模型消融完成（至少 bge-small 全量索引就绪）"
+  fixed_model: "BAAI/bge-small-zh-v1.5"  # 先用已有结果的模型跑通流程
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么要做查询重写
+# =============================================================================
+
+motivation:
+
+  current_gap:
+    baseline_recall_at_10: 0.4548  # bge-small, similarity, 全量 230 万池, 2000 条
+    theoretical_upper_bound: 0.9809
+    achieved_ratio: "46%"          # 仅达到理论上限的 46%
+    gap_size: "+0.5261"            # 仍有超过一半的提升空间
+
+  qrels_analysis:
+    total_queries_with_qrels: 22812
+    total_qrels_pairs: 118932
+    avg_qrels_per_query: 5.2
+    percent_leq_10_qrels: 91.5    # 91.5% 的查询 ≤10 个相关 passage，理论上限接近 1.0
+    key_blocker: "短查询（5-15 字）与长 passage 之间的语义鸿沟"
+
+  why_not_multi_round:
+    reason: "当前基线 Recall@10=0.455，超过一半的相关 passage 在第一轮就找不到。Agent 二轮重搜无法弥补检索器本身的能力上限。"
+    plan: "先提升单轮检索能力 → V1 阶段加入 Agent 多轮"
+
+  why_not_finetune:
+    reason: "微调需要 GPU 时间 + 数据准备，V0 阶段优先验证 Prompt/HyDE/PRF 的增益上限。若效果不够再考虑 V1 微调。"
+
+
+# =============================================================================
+# 第二部分：评估数据与指标
+# =============================================================================
+
+evaluation:
+  source: "T2Ranking dev（复用 exp-001）"
+  queries_file: "data/raw/t2ranking/queries.dev.tsv"
+  qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+
+  sampling:
+    ablation: 2000    # 消融实验用 2000 条
+    full:    22812   # 最终确认用全量
+
+  metrics:
+    core:
+      - Recall@1
+      - Recall@3
+      - Recall@5
+      - Recall@10
+      - MRR
+    note: "NDCG@5/10 暂不计算——T2Ranking 的 4 级标注（0/1/2/3）需要 qrels 文件中的 label 列，当前脚本只读取了 qid-pid 二元关系"
+
+  cost:
+    deepseek_pricing:
+      input: "¥1 / 1M tokens"
+      output: "¥2 / 1M tokens"
+    per_query_estimate:
+      rewrite_tokens: "~200 input + ~80 output ≈ ¥0.00036"
+      hyde_tokens: "~200 input + ~150 output ≈ ¥0.00050"
+    total_ablation:
+      E2a: "2000 × 7 组 × ¥0.00036 ≈ ¥5.0"
+      E2b: "2000 × 3 组 × ¥0.00036 ≈ ¥2.2"    # 一次 API 调用的 prompt 变长，但输出仍是 1 次条
+      E2c: "2000 × ¥0.00050 ≈ ¥1.0"
+      E2d: "¥0（零 API 成本）"
+      total: "~¥8.2"
+    total_full:
+      all: "22812 × ... ≈ ¥30"
+      conclusion: "消融阶段成本极低，全量也仅 ¥30"
+
+
+# =============================================================================
+# 第三部分：实验分组
+# =============================================================================
+
+experiment_groups:
+
+  # ========== E2a：基础 Prompt 迭代 ==========
+  prompt_iteration:
+    objective: "在不引入多路检索和预回答的前提下，纯靠 Prompt 工程提升单条查询的检索召回。5 个变体从规则密度、示例来源、输出格式三个维度消融。"
+    fixed:
+      embedding_model: "BAAI/bge-small-zh-v1.5"
+      retrieval_strategy: "similarity"
+      top_k: 10
+      passage_pool: "全量 230 万"
+      llm: "deepseek-chat (temperature=0.1, max_tokens=128)"
+      note: "每组均只做单条查询改写（1 API 调用 → 1 条改写文本），不涉及多路检索"
+
+    design_rationale:
+      core_principle: "Prompt 优化的本质是让 LLM 往查询里注入'正确的额外 token'，缩小短查询（5-15 字）与长 passage（中位数 368 字）之间的语义鸿沟。"
+      dimensions:
+        - dimension: "规则密度"
+          variants: ["B1: 4 条简单规则", "P1: 8-10 条细化规则 + 硬约束"]
+          hypothesis: "更细的规则减少 LLM 偏离，特别是'至少补充 X 个概念词'这类硬约束"
+        - dimension: "示例来源"
+          variants: ["B1: 通用知识 7 例", "P2: T2Ranking 真实查询 10 例", "P3: P2 + 对比（好/坏）"]
+          hypothesis: "领域内 few-shot > 通用 few-shot；对比教学让 LLM 学到边界"
+        - dimension: "输出格式"
+          variants: ["B1/P1/P2/P3: 自然语句", "P5: 关键词串"]
+          hypothesis: "关键词串密度更高，可能比自然语句更适合向量检索"
+        - dimension: "类型感知"
+          variants: ["B1/P1/P2/P3: 统一 prompt", "P4: 按 query type 分发不同 prompt"]
+          hypothesis: "不同查询类型需要不同扩展策略，但分发粒度需要消融验证"
+
+    groups:
+      - id: "E2a-B0"
+        name: "no rewrite (baseline)"
+        method: "原始查询直接检索，不经任何改写"
+        rationale: "对照组——量化改写本身能带来多大增益"
+        api_calls_per_query: 0
+
+      - id: "E2a-B1"
+        name: "v1 rewrite (current unified prompt)"
+        method: "当前 evaluate_retrieval.py 中 QUERY_REWRITE_PROMPT：4 条规则（补全缩写/口语化、保留原意、不编造）+ 7 个通用领域示例"
+        prompt_location: "scripts/evaluate_retrieval.py:L140-L168"
+        rationale: "统一基线的重写方案，验证简单 Prompt 是否有增益、增益多大"
+        api_calls_per_query: 1
+
+      - id: "E2a-P1"
+        name: "rich rules (规则增强)"
+        method: "在 B1 基础上增加硬约束和细化指令：\n  - 如果查询包含缩写，必须展开为全称\n  - 如果查询是口语化表达，必须补充正式术语作为同义词\n  - 至少添加 2 个相关概念词\n  - 改写长度规则：原查询 < 15 字时输出 20-40 字；≥15 字时输出 15-30 字\n  - 保留原查询中的所有核心名词"
+        rationale: "规则密度消融——更细的约束能否让 LLM 输出更高质量、更一致的改写"
+        api_calls_per_query: 1
+
+      - id: "E2a-P2"
+        name: "domain few-shot (T2Ranking 示例)"
+        method: "从 T2Ranking 真实查询中人工挑选 8-10 条高质量示例，覆盖 factual/concept/comparison/open_discussion 四种 query type。每条配一个'好改写'。Prompt 结构和规则继承自 B1，仅替换示例部分。"
+        rationale: "领域示例 vs 通用示例消融——LLM 见过来自同一分布的输入后，改写风格会更匹配 T2Ranking 查询特征"
+        api_calls_per_query: 1
+
+      - id: "E2a-P3"
+        name: "contrastive few-shot (对比示例)"
+        method: "在 P2 的基础上，每条示例展示好改写和坏改写两个版本：\n  原始: 蜂巢验证码摁错\n  ✗ 坏: 蜂巢快递柜验证码摁错（太口语，缺乏术语）\n  ✓ 好: 蜂巢快递柜取件验证码输入错误如何重新获取验证码\n  对比示例让 LLM 学到'边界'——不仅知道做什么，还知道不做什么"
+        rationale: "对比教学消融——对比 > 单例，LLM 通过反面教材学到改写边界"
+        api_calls_per_query: 1
+
+      - id: "E2a-P4"
+        name: "query-type-aware rewrite (类型感知)"
+        method: "在 B1 的基础上，System Prompt 中加入类型判断逻辑：\n  - factual: 改写为完整疑问句 + 补充时间/地点/人物等上下文\n  - comparison: 明确对比双方全称 + 添加对比维度关键词（区别/优缺点/适用场景）\n  - concept: 添加'定义''原理''特点''应用'等术语\n  - open_discussion: 生成包含多角度的搜索关键词串"
+        rationale: "差异化改写消融——不同查询类型需要不同的扩展策略，统一 prompt 一刀切可能不是最优"
+        api_calls_per_query: 1
+
+      - id: "E2a-P5"
+        name: "keyword expansion (纯关键词扩展)"
+        method: "不走'改写为自然语句'路线，而是直接输出扩展关键词串：\n  原始: 蜂巢取快递验证码摁错怎么办\n  输出: 蜂巢快递柜 取件 验证码 输入错误 重新获取 忘记密码 操作方法\n  规则：提取 3-7 个关键词/短语，用空格分隔，包含原查询核心词 + 相关扩展词。\n  这种格式让向量检索面对更高密度的语义 token，可能比自然语句更有效。同时为 E2b 的 multi-query 方案提供一种备选查询格式。"
+        rationale: "输出格式消融——关键词串 vs 自然语句。同时验证这种高密度格式是否适合作为 E2b 多路检索中的一个分支"
+        api_calls_per_query: 1
+
+    comparison_matrix:
+      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      columns:
+        - "B0 (no rewrite)"
+        - "B1 (v1 unified)"
+        - "P1 (rich rules)"
+        - "P2 (domain few-shot)"
+        - "P3 (contrastive)"
+        - "P4 (type-aware)"
+        - "P5 (keyword exp)"
+
+    analysis_questions:
+      - "Q1: 任何一个改写方案能否显著超过 B0（原始查询）？如果没有，说明单 query 改写路线在 bge-small 上不可行。"
+      - "Q2: 规则密度提升（B1→P1）的增益有多大？如果接近 0，说明 LLM 已经够聪明，规则不是瓶颈。"
+      - "Q3: 领域示例（B1→P2）和对比示例（P2→P3）各自带来多少增量？这是 Prompt 工程最经典的两个杠杆。"
+      - "Q4: 类型感知（P4）比统一 prompt（B1）好吗？如果不好，说明 query type 分发不需要这么细的粒度。"
+      - "Q5: 关键词串（P5）vs 自然语句（B1-P4），哪种输出格式更适合向量检索？"
+      - "Q6: P1-P5 加总到 E2b multi-query 融合，最优 Prompt 方案作为 E2b 的 single-query 底座。"
+
+  # ========== E2b：Multi-Query 融合 ==========
+  multi_query_fusion:
+    objective: "验证多路查询扩展 → 各自检索 → RRF 融合能否提高召回。三组实验按失败模式定义改写角度，做干净的单变量消融：M1 vs B0（多角度是否有增益）、M2 vs M1（step-back 的边际贡献）、M3 vs M1（类型感知 vs 统一策略）。"
+    fixed:
+      embedding_model: "BAAI/bge-small-zh-v1.5"
+      retrieval_strategy: "similarity"
+      top_k: 10
+      passage_pool: "全量 230 万"
+      fusion: "RRF (k=60, c=60)"
+      single_query_prompt: "使用 E2a 中最优的 single-query Prompt 方案（B0/B1/P1-P5 之一）作为每条子查询的基础改写策略"
+      note: "每组均一次 LLM API 调用（prompt 内输出多条子查询），子查询各自 Dense 检索后 RRF 合并，不涉及多轮调用"
+
+    design_rationale:
+      core_principle: "单条查询的语义向量只能锚定一个方向。多条覆盖不同侧面和抽象层次的查询，通过 RRF 融合能互补覆盖 passage 的不同区域。"
+      failure_mode_based_angles:
+        description: "改写角度的定义基于 T2Ranking 短查询的三类典型检索失败模式"
+        modes:
+          - mode: "术语不匹配"
+            cause: "用户用口语词，passage 用正式术语"
+            rewrite: "术语规范化：将口语表达替换为正式术语"
+            example: "蜂巢验证码摁错 → 蜂巢快递柜取件验证码输入错误"
+          - mode: "缺少隐含上下文"
+            cause: "短查询省略了隐含场景信息"
+            rewrite: "上下文补全：补充查询隐含的时间/地点/场景等背景"
+            example: "生产过后肚子 → 产后腹部脂肪堆积原因及恢复方法"
+          - mode: "语义覆盖不足"
+            cause: "一条查询的向量只锚定一个语义方向"
+            rewrite: "多侧面覆盖：从不同侧面表述同一信息需求"
+            example: "考研英语一英语二区别 → 考研英语一英语二考试内容难度对比 + 考研英语一英语二适用专业学位区别"
+      step_back:
+        description: "源于 Google DeepMind 2023 论文 Take a Step Back。将具体查询抽象化为更高层的上层问题，扩大检索范围。"
+        mechanism: "具体查询 → 抽象查询（上移一个概念层级），使得检索能召回那些'未直接提及查询细节点但描述了相关背景'的 passage。"
+        example: "XX 是哪年成立的 → XX 的历史背景和创立过程"
+        applies_to: "全部查询类型均为 M2 生成 step-back 版本（而非仅 factual），确保 M2 vs M1 是干净的 step-back 消融"
+      query_decomposition:
+        description: "将复合型查询拆解为多条独立子查询，各自检索互补信息。"
+        mechanism: "复合查询 → 多条子查询（基础介绍 / 对比维度 / 未来趋势等），各自检索后 RRF 合并。子查询之间信息互补而非重复。"
+        applies_to: "comparison / open_discussion 查询 —— 这些查询天然涉及多个实体和多个维度"
+        example_entry: "XX 和 YY 的区别及未来发展"
+        example_output:
+          - "XX 概念 核心特点"
+          - "YY 概念 核心特点"
+          - "XX YY 区别 对比分析"
+          - "XX 未来发展趋势 前景"
+          - "YY 未来发展趋势 前景"
+
+    groups:
+      - id: "E2b-M1"
+        name: "multi-angle rewrite (按失败模式)"
+        method: "1 条查询 → LLM 生成 2 条改写（术语规范化版 + 上下文补全版）→ 3 路检索（原查询 + 术语版 + 上下文版）→ RRF 合并"
+        sub_queries_per_call: "3（含原查询）"
+        api_calls_per_query: 1
+        rationale: "基于失败模式的两个固定角度，验证多角度改写本身是否优于单条改写。不引入 step-back 和 type 感知，作为 E2b 的干净基线。"
+
+      - id: "E2b-M2"
+        name: "M1 + step-back（全类型）"
+        method: "M1 的基础上，LLM 额外生成 1 条 step-back 抽象查询 → 4 路检索（M1 的 3 路 + step-back 1 路）→ RRF 合并"
+        sub_queries_per_call: "4（含原查询）"
+        api_calls_per_query: 1
+        rationale: "M2 vs M1 是干净的 step-back 消融——唯一变量是多了 1 条抽象层查询。对所有查询类型都生成 step-back，避免混合 query-type 分布变化带来的干扰。"
+
+      - id: "E2b-M3"
+        name: "type-differentiated strategy"
+        method: "LLM 一次 API 调用内：先判断查询类型 → 按类型分配不同策略 → 全部子查询分别检索 → RRF 合并。策略分配：factual → M1 + step-back；comparison → 子查询分解；concept → M1 + 同义词扩展；open → 子查询分解。"
+        sub_queries_per_call: "4-7 条（含原查询）"
+        api_calls_per_query: 1
+        rationale: "M3 vs M1 是类型感知 vs 统一策略的消融——验证按类型差异化是否有额外增益。分解和 step-back 只在被认为有效的类型上使用。"
+
+    llm_output_format:
+      description: "所有 E2b 实验组要求 LLM 输出 JSON，便于解析和分流检索"
+      M1_example: "{\"sub_queries\": [\"原查询的术语规范化版本\", \"原查询的上下文补全版本\"]}"
+      M2_example: "{\"sub_queries\": [\"术语版本\", \"上下文版本\", \"step-back抽象问题\"]}"
+      M3_example: "{\"query_type\": \"comparison\", \"sub_queries\": [\"子查询1\", \"子查询2\", \"子查询3\", ...]}"
+
+    comparison_matrix:
+      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      columns: ["B0 (no rewrite)", "M1 (multi-angle)", "M2 (+step-back)", "M3 (type-diff)"]
+
+    analysis_questions:
+      - "Q1: M1 的多角度改写比 E2a 最优 single-query Prompt 好吗？增益来自多个角度覆盖 vs 单角度更广的覆盖？"
+      - "Q2: M2 的 step-back 在全部类型上都有增益，还是只在 factual 上？如果只在 factual 上有增益，M3 的方案就找到了正确的分配方式。"
+      - "Q3: M3 的类型差异化策略能否超过 M1 的统一多角度？如果不能，说明 Prompt 工程中的 query type 分发收益不如预期。"
+      - "Q4: 子查询数量（M1 的 3 路 → M2 的 4 路 → M3 的 4-7 路）与召回增益是否线性？多少条子查询后收益递减？"
+
+  # ========== E2c：HyDE 预回答扩展 ==========
+  hyde_pretend_answer:
+    objective: "验证 HyDE（生成假答案 → 用答案检索）相比原查询检索的增益。各组均用原始不加改写的 query，确保干净地衡量 HyDE 本身的贡献。HyDE × 最优改写的交叉组合留给 Phase 3。"
+    fixed:
+      embedding_model: "BAAI/bge-small-zh-v1.5"
+      retrieval_strategy: "similarity"
+      top_k: 10
+      passage_pool: "全量 230 万"
+      base_query: "原查询，不经任何改写（B0 版本）"
+      note: "E2c 的 query 统一使用原始 B0 版本，不与 E2a 的任何 Prompt 方案混淆。最优 Prompt + HyDE 的交叉组合放在 Phase 3 单独测试。"
+
+    groups:
+      - id: "E2c-H1"
+        name: "HyDE only"
+        method: "query → LLM 生成 100-150 字假答案 → 用假答案做向量检索"
+        api_calls_per_query: 1
+        rationale: "最基础的 HyDE，业界验证效果最好的单策略"
+
+      - id: "E2c-H2"
+        name: "HyDE + original query (RRF)"
+        method: "原查询（B0）检索 + HyDE 假答案检索 → 两路 RRF 合并"
+        api_calls_per_query: 1
+        rationale: "原查询和假答案互补，预期优于纯 HyDE。不引入改写 query，干净消融 HyDE 的增量。"
+
+      - id: "E2c-H3"
+        name: "HyDE answer length ablation"
+        method: "H2 方案下对比 50 / 100 / 200 字假答案的召回差异"
+        api_calls_per_query: 1
+        rationale: "确定最优答案长度，过长可能引入噪音"
+
+    comparison_matrix:
+      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      columns: ["B0 (no rewrite)", "H1 (HyDE only)", "H2 (HyDE+original)", "H3 (length optimal)"]
+
+    analysis_questions:
+      - "Q1: HyDE 假答案检索能否超过原始查询检索（H1 vs B0）？语义密度更高的假答案是否弥补了短查询的不足？"
+      - "Q2: 原查询 + 假答案 RRF 是否优于纯 HyDE（H2 vs H1）？两者覆盖的 passage 是否有重叠或互补？"
+      - "Q3: 假答案长度的最优值是多少（H3 内部对比）？过长是否引入噪音导致召回下降？"
+
+  # ========== E2d：伪相关反馈 (PRF) ==========
+  pseudo_relevance_feedback:
+    objective: "验证零 API 成本的 PRF 方案能否缩小与 LLM 重写方案之间的差距"
+    fixed:
+      embedding_model: "BAAI/bge-small-zh-v1.5"
+      retrieval_strategy: "similarity"
+      top_k: 10
+      passage_pool: "全量 230 万"
+      note: "PRF 完全不调用 LLM API，成本为零。非常适合作为检索增强的 baseline 下限。"
+
+    method:
+      step1: "Dense similarity 检索 top-20（扩大 pool 利于提词）"
+      step2: "从 top-20 文本中提取 TF-IDF 最高频的 5-10 个词（排除停用词）"
+      step3: "原查询 + 扩展词拼接 → 重新 Dense 检索 → 取 top-10"
+      variants:
+        - "PRF-TFIDF: 标准 TF-IDF 提词"
+        - "PRF-TFIDF-weighted: 提词后按 TF-IDF 分数加权拼入原查询（如原 query 重复 3 次，扩展词重复 1 次）"
+
+    groups:
+      - id: "E2d-P0"
+        name: "no rewrite (baseline)"
+        method: "原查询直接检索"
+        expected_results:
+          Recall@10: 0.4548
+          MRR: 0.5097
+        rationale: "复用 E2a-B0"
+
+      - id: "E2d-P1"
+        name: "PRF (TF-IDF, 5 terms)"
+        method: "top-20 TF-IDF 提取 5 词 → 拼入原查询 → 重搜"
+        api_calls_per_query: 0
+        rationale: "最简 PRF"
+
+      - id: "E2d-P2"
+        name: "PRF (TF-IDF, 10 terms, weighted)"
+        method: "top-20 TF-IDF 提取 10 词 → 按权重拼入原查询 → 重搜"
+        api_calls_per_query: 0
+        rationale: "更多扩展词 + 加权"
+
+    comparison_matrix:
+      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      columns: ["B0 (no rewrite)", "P1 (PRF 5 terms)", "P2 (PRF 10 terms weighted)"]
+
+
+# =============================================================================
+# 第四部分：执行计划
+# =============================================================================
+
+execution_plan:
+
+  phase_1_quick_smoke:
+    duration: "~15 分钟"
+    sample_size: 100
+    tasks:
+      - "E2a: 验证新 Prompt 不报错 → 跑 100 条看趋势"
+      - "E2b: 验证 multi-query 融合 pipeline → 100 条"
+      - "E2c: 验证 HyDE pipeline → 100 条"
+      - "E2d: 验证 PRF pipeline → 100 条"
+    note: "4 个实验组的 smoke test 可以在 bge-small 上快速完成，确认代码无 bug"
+
+  phase_2_ablation:
+    duration: "~1 小时"
+    sample_size: 2000
+    tasks:
+      - "E2a: Prompt 迭代 7 组 × 2000 queries（API ~15 分钟 + 检索 ~8 分钟）"
+      - "E2b: Multi-Query 融合 3 组 × 2000 queries（API ~10 分钟 + 检索 ~15 分钟）"
+      - "E2c: HyDE 3 组 × 2000 queries（API ~10 分钟 + 检索 ~15 分钟）"
+      - "E2d: PRF 2 组 × 2000 queries（0 API + 检索 ~5 分钟）"
+      - "汇总消融结果，选出最优 Prompt / Multi-Query / HyDE / PRF 方案"
+
+  phase_3_cross_combination:
+    duration: "~20 分钟"
+    sample_size: 2000
+    tasks:
+      - "最佳 Prompt + 最佳 Multi-Query 合并测试"
+      - "最佳 Prompt + 最佳 HyDE 合并测试"
+      - "确定最终推荐的 V0 查询增强方案"
+
+  phase_4_full_evaluation:
+    duration: "~30 分钟"
+    sample_size: 22812
+    tasks:
+      - "最优方案全量评估，产出论文级指标"
+    note: "可选——等所有嵌入模型实验完成后再全量"
+
+  total_server_time: "~2.5 小时（含 API 等待）"
+  total_api_cost: "~¥8（2000 条消融）+ ~¥30（全量，可选）"
+
+  dependency:
+    - "exp-001 全量索引（至少 bge-small-zh-v1.5）"
+    - "不依赖 exp-001 的其他模型——先在小模型上跑通流程"
+
+
+# =============================================================================
+# 第五部分：输出物
+# =============================================================================
+
+deliverables:
+
+  - name: "query_rewrite_prompts.py"
+    description: "统一管理所有重写 Prompt（基础重写 / multi-perspective / HyDE / step-back / decomposition），每种一个模板函数"
+    location: "src/intent/query_rewrite_prompts.py"
+
+  - name: "multi_query_retriever.py"
+    description: "Multi-Query 融合检索器：接收多条查询 → 各自检索 → RRF/加权合并"
+    location: "src/retrieval/multi_query_retriever.py"
+
+  - name: "prf_retriever.py"
+    description: "PRF 检索器：Dense 检索 top-K → TF-IDF 提词 → 扩展查询 → 重新检索"
+    location: "src/retrieval/prf_retriever.py"
+
+  - name: "评估指标表格"
+    format: "Markdown table (写入 progress.yaml)"
+    content: "E2a / E2b / E2c / E2d 各组在核心指标上的完整数字"
+
+  - name: "消融分析结论"
+    format: "文字总结"
+    content: "Prompt 策略 / Multi-Query 策略 / HyDE 策略 / PRF 策略的最优方案及其增益"
+
+
+# =============================================================================
+# 第六部分：风险与预案
+# =============================================================================
+
+risks:
+
+  - risk: "Prompt/Multi-Query/HyDE 增益不显著（Recall@10 < +0.05）"
+    probability: low
+    impact: "V0 检索增强路线不可行"
+    mitigation: "升到 bge-large-zh-v1.5 后再测——更大的嵌入模型可能对改写更敏感"
+
+  - risk: "Multi-Query 导致检索延迟增长 3-5 倍"
+    probability: medium
+    impact: "生产不可用"
+    mitigation: "V0 仅评估质量，不优化延迟；V1 考虑并行检索"
+
+  - risk: "HyDE 答案幻觉导致检索偏移"
+    probability: medium
+    impact: "假答案方向错误则召回不升反降"
+    mitigation: "H2（HyDE + original query RRF）可缓解；H3 答案长度消融可找出最优配置"

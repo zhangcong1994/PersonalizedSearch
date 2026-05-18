@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import json
 import time
 import argparse
@@ -17,78 +16,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, DATA_ROOT, EMBEDDING_MODEL, resolve_model_local_path
+from src.evaluation.data_loader import load_queries, load_qrels, load_passages
 
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QUERIES_FILE = T2RANKING_DIR / "queries.dev.tsv"
 QRELS_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
 COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
 RESULTS_DIR = DATA_ROOT / "results"
-
-HTML_RE = re.compile(r"<[^>]*>")
-TRUNCATE_LEN = 2000
-MIN_TEXT_LEN = 10
-
-
-def clean_text(text: str) -> str:
-    text = HTML_RE.sub("", text)
-    text = text.strip()
-    return text
-
-
-def load_queries(path: Path) -> list[tuple[str, str]]:
-    pairs = []
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                pairs.append((parts[0], parts[1]))
-    logger.info(f"Loaded {len(pairs)} queries from {path.name}")
-    return pairs
-
-
-def load_qrels(path: Path) -> dict[str, set[str]]:
-    qrels = {}
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                qid, pid = parts[0], parts[1]
-                qrels.setdefault(qid, set()).add(pid)
-    logger.info(f"Loaded qrels: {len(qrels)} queries, {sum(len(v) for v in qrels.values())} pairs")
-    return qrels
-
-
-def load_passages(path: Path, max_passages: int = 0) -> tuple[list[str], list[str]]:
-    pids, texts = [], []
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) < 2:
-                continue
-            pid, text = parts[0], parts[1]
-            text = clean_text(text)
-            if len(text) < MIN_TEXT_LEN:
-                continue
-            if len(text) > TRUNCATE_LEN:
-                text = text[:TRUNCATE_LEN]
-            pids.append(pid)
-            texts.append(text)
-            if max_passages > 0 and len(pids) >= max_passages:
-                break
-    logger.info(f"Loaded {len(pids)} passages")
-    return pids, texts
 
 
 def build_bm25(texts: list[str]):
@@ -249,125 +183,10 @@ def load_rewritten_queries(path: str) -> dict[str, str]:
 
 
 # ── result cache ─────────────────────────────────────────
-
-def save_results(results: list[dict], path: str, meta: dict = None):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    if meta:
-        lines.append(json.dumps({"__meta__": meta}, ensure_ascii=False))
-    for r in results:
-        line = {
-            "qid": r["qid"],
-            "query": r["query"],
-            "relevant_pids": sorted(r["relevant_pids"]),
-        }
-        for key, pids in r.get("retrievals", {}).items():
-            line[key] = pids
-        lines.append(json.dumps(line, ensure_ascii=False))
-    with open(p, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    logger.info(f"Saved {len(results)} results to {p}")
-
-
-def load_results(path: str) -> tuple[list[dict], dict]:
-    results = []
-    meta = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            if "__meta__" in obj:
-                meta = obj["__meta__"]
-                continue
-            relevant = set(obj.pop("relevant_pids", []))
-            retrievals = {}
-            qid = obj.pop("qid")
-            query = obj.pop("query", "")
-            for key in list(obj.keys()):
-                retrievals[key] = obj.pop(key)
-            results.append({
-                "qid": qid,
-                "query": query,
-                "relevant_pids": relevant,
-                "retrievals": retrievals,
-            })
-    if meta:
-        logger.info(f"Loaded {len(results)} results from {path} (meta: {json.dumps(meta, ensure_ascii=False)})")
-    else:
-        logger.info(f"Loaded {len(results)} results from {path}")
-    return results, meta
-
+from src.evaluation.result_cache import save_results, load_results
 
 # ── metrics ──────────────────────────────────────────────
-
-def compute_metrics(results: list[dict], method_key: str, k_values: list[int] = None):
-    if k_values is None:
-        k_values = [1, 3, 5, 10]
-
-    metrics = {}
-    for k in k_values:
-        recalls = []
-        precisions = []
-        reciprocal_ranks = []
-        hits = 0
-
-        for r in results:
-            retrieved_pids = r["retrievals"].get(method_key, [])[:k]
-            relevant = r["relevant_pids"]
-
-            hits_in_k = sum(1 for pid in retrieved_pids if pid in relevant)
-            recalls.append(hits_in_k / len(relevant) if relevant else 0.0)
-            precisions.append(hits_in_k / k if k > 0 else 0.0)
-
-            rr = 0.0
-            for rank, pid in enumerate(retrieved_pids, 1):
-                if pid in relevant:
-                    rr = 1.0 / rank
-                    break
-            reciprocal_ranks.append(rr)
-
-            if hits_in_k > 0:
-                hits += 1
-
-        n = len(results) if results else 1
-        metrics[f"Recall@{k}"] = sum(recalls) / n
-        metrics[f"Precision@{k}"] = sum(precisions) / n
-        metrics[f"Hit@{k}"] = hits / n
-        if k == max(k_values):
-            metrics["MRR"] = sum(reciprocal_ranks) / n
-
-    return metrics
-
-
-def print_comparison(metrics_map: dict[str, dict], metric_names: list[str] = None):
-    if not metric_names:
-        metric_names = ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
-
-    methods = list(metrics_map.keys())
-    col_width = 10
-
-    print()
-    print("=" * (16 + len(methods) * (col_width + 2)))
-    print("  RESULTS")
-    print("=" * (16 + len(methods) * (col_width + 2)))
-
-    header = f"  {'Metric':<16}"
-    for m in methods:
-        header += f" {m:>{col_width}}"
-    print(header)
-    print("  " + "-" * (16 + len(methods) * (col_width + 2)))
-
-    for metric_name in metric_names:
-        row = f"  {metric_name:<16}"
-        for m in methods:
-            val = metrics_map[m].get(metric_name, float("nan"))
-            row += f" {val:>{col_width}.4f}"
-        print(row)
-
-    print("=" * (16 + len(methods) * (col_width + 2)))
+from src.evaluation.metrics import compute_metrics, print_comparison
 
 
 # ── main pipeline ────────────────────────────────────────

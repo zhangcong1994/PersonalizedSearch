@@ -1,8 +1,14 @@
 import os
 import pickle
 import logging
+import multiprocessing as mp
 from pathlib import Path
 from typing import Optional
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +65,34 @@ def _default_stopwords() -> set[str]:
     }
 
 
+_worker_stopwords: Optional[set] = None
+
+
+def _init_worker(stopwords_set: set) -> None:
+    global _worker_stopwords
+    _worker_stopwords = stopwords_set
+    import jieba
+    jieba.lcut("")
+
+
+def _tokenize_worker(text: str) -> list[str]:
+    global _worker_stopwords
+    import jieba
+
+    tokens = jieba.lcut(text)
+    sw = _worker_stopwords
+    if sw:
+        tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1 and w not in sw]
+    else:
+        tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1]
+    return tokens
+
+
 def build(
     texts: list[str],
     store_dir: Optional[Path] = None,
     name: str = "t2ranking",
+    n_jobs: int = 1,
 ) -> Path:
     import jieba
     from rank_bm25 import BM25Okapi
@@ -72,10 +102,39 @@ def build(
     store_dir = Path(store_dir)
     store_dir.mkdir(parents=True, exist_ok=True)
 
-    stopwords = _load_stopwords()
-    logger.info(f"Tokenizing {len(texts)} passages (jieba, stopwords={len(stopwords)})...")
+    n_total = len(texts)
+    if n_jobs == 0:
+        n_jobs = 1
+    elif n_jobs < 0:
+        n_jobs = mp.cpu_count()
 
-    tokenized = [_tokenize(t, stopwords) for t in texts]
+    stopwords = _load_stopwords()
+
+    use_multiprocessing = n_jobs > 1 and n_total > 1000
+
+    if use_multiprocessing:
+        logger.info(
+            f"Tokenizing {n_total:,} passages (jieba, stopwords={len(stopwords)}, workers={n_jobs})..."
+        )
+        chunksize = max(1, n_total // (n_jobs * 100))
+        with mp.Pool(processes=n_jobs, initializer=_init_worker, initargs=(stopwords,)) as pool:
+            if tqdm is not None:
+                tokenized = list(tqdm(
+                    pool.imap(_tokenize_worker, texts, chunksize=chunksize),
+                    total=n_total,
+                    desc="Tokenizing",
+                    unit="docs",
+                    mininterval=2,
+                ))
+            else:
+                tokenized = pool.map(_tokenize_worker, texts, chunksize=chunksize)
+    else:
+        logger.info(f"Tokenizing {n_total:,} passages (jieba, stopwords={len(stopwords)})...")
+        iterator = texts
+        if tqdm is not None:
+            iterator = tqdm(texts, desc="Tokenizing", unit="docs", mininterval=2)
+        tokenized = [_tokenize(t, stopwords) for t in iterator]
+
     n_tokens = sum(len(tk) for tk in tokenized)
     logger.info(f"Tokenized: {n_tokens:,} total tokens, avg {n_tokens // max(len(tokenized), 1)} tokens/doc")
 
@@ -87,6 +146,7 @@ def build(
         "bm25": bm25,
         "tokenized": tokenized,
     }
+    logger.info(f"Saving index to {pkl_path}...")
     with open(pkl_path, "wb") as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 

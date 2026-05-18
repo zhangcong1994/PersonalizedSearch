@@ -2,6 +2,11 @@ import re
 import logging
 from pathlib import Path
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 logger = logging.getLogger(__name__)
 
 HTML_RE = re.compile(r"<[^>]*>")
@@ -46,11 +51,14 @@ def load_qrels(path: Path) -> dict[str, set[str]]:
     return qrels
 
 
-def load_passages(path: Path, max_passages: int = 0) -> tuple[list[str], list[str]]:
+def load_passages(path: Path, max_passages: int = 0, show_progress: bool = False) -> tuple[list[str], list[str]]:
     pids, texts = [], []
     with open(path, "r", encoding="utf-8") as f:
         f.readline()
-        for line in f:
+        iterator = f
+        if show_progress and tqdm is not None:
+            iterator = tqdm(f, desc="Loading passages", unit="lines", mininterval=2)
+        for line in iterator:
             line = line.strip()
             if not line:
                 continue

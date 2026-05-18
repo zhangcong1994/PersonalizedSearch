@@ -8,8 +8,15 @@ meta:
   objective: "在不引入微调的前提下，通过 Prompt 工程、多查询融合、预回答扩展、伪相关反馈提升检索召回率"
   status: planned
   target_platform: "AutoDL (RTX 4090 24GB)"
-  prerequisite: "exp-001 E1 嵌入模型消融完成（至少 bge-small 全量索引就绪）"
-  fixed_model: "BAAI/bge-small-zh-v1.5"  # 先用已有结果的模型跑通流程
+  prerequisite: "exp-001 BM25 全量分词索引就绪（scripts/build_bm25_index.py）"
+  retrieval_backend:
+    current: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
+    future_candidate: "moka-ai/m3e-base (Dense, 768-dim)"
+    excluded:
+      - model: "BAAI/bge-small-zh-v1.5"
+        reason: "训练数据污染——C-MTP labeled 含 T2Ranking query-passage 对，模型已在评估集上微调过，导致改写效果无法公正评估"
+      - model: "BAAI/bge-large-zh-v1.5"
+        reason: "同 bge-small，共享同一套训练数据和范式"
 
 
 # =============================================================================
@@ -18,11 +25,16 @@ meta:
 
 motivation:
 
+  model_exclusion:
+    reason: "BGE 系列（small/base/large）的 C-MTP labeled 训练数据包含 T2Ranking 的 query-passage 对，模型已在评估集上见过原始 query 分布。LLM 改写后的 query 成为分布外（OOD）输入，导致改写效果无法公正评估。BGE 系列因此从 exp-002 中排除。"
+    details: "见 meta.retrieval_backend.excluded"
+
   current_gap:
-    baseline_recall_at_10: 0.4548  # bge-small, similarity, 全量 230 万池, 2000 条
+    baseline_recall_at_10: 0.4548  # bge-small, similarity, 全量 230 万池, 2000 条 —— 此模型已排除，数字仅供参照
     theoretical_upper_bound: 0.9809
-    achieved_ratio: "46%"          # 仅达到理论上限的 46%
-    gap_size: "+0.5261"            # 仍有超过一半的提升空间
+    achieved_ratio: "46%"
+    gap_size: "+0.5261"
+    note: "上述基线来自 bge-small（已排除）。BM25 的全量基线待 exp-001 补充。"
 
   qrels_analysis:
     total_queries_with_qrels: 22812
@@ -69,14 +81,13 @@ evaluation:
       rewrite_tokens: "~200 input + ~80 output ≈ ¥0.00036"
       hyde_tokens: "~200 input + ~150 output ≈ ¥0.00050"
     total_ablation:
-      E2a: "2000 × 7 组 × ¥0.00036 ≈ ¥5.0"
-      E2b: "2000 × 3 组 × ¥0.00036 ≈ ¥2.2"    # 一次 API 调用的 prompt 变长，但输出仍是 1 次条
-      E2c: "2000 × ¥0.00050 ≈ ¥1.0"
-      E2d: "¥0（零 API 成本）"
-      total: "~¥8.2"
+      E2a_BM25: "2000 × 7 组 × ¥0.00036 ≈ ¥5.0"
+      E2b_BM25: "2000 × 3 组 × ¥0.00036 ≈ ¥2.2"
+      BM25_total: "~¥7.2"
+      note: "E2c (HyDE) 和 E2d (PRF) 暂缓——它们依赖 Dense Retriever，成本另计"
     total_full:
       all: "22812 × ... ≈ ¥30"
-      conclusion: "消融阶段成本极低，全量也仅 ¥30"
+      conclusion: "消融阶段 BM25 成本极低，全量也仅 ¥30"
 
 
 # =============================================================================
@@ -87,17 +98,16 @@ experiment_groups:
 
   # ========== E2a：基础 Prompt 迭代 ==========
   prompt_iteration:
-    objective: "在不引入多路检索和预回答的前提下，纯靠 Prompt 工程提升单条查询的检索召回。5 个变体从规则密度、示例来源、输出格式三个维度消融。"
+    objective: "在不引入多路检索和预回答的前提下，纯靠 Prompt 工程提升单条查询的检索召回。5 个变体从规则密度、示例来源、输出格式三个维度消融。检索后端为 BM25，避免 Dense 模型训练数据污染问题。"
     fixed:
-      embedding_model: "BAAI/bge-small-zh-v1.5"
-      retrieval_strategy: "similarity"
+      retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
       top_k: 10
       passage_pool: "全量 230 万"
       llm: "deepseek-chat (temperature=0.1, max_tokens=128)"
-      note: "每组均只做单条查询改写（1 API 调用 → 1 条改写文本），不涉及多路检索"
+      note: "每组均只做单条查询改写（1 API 调用 → 1 条改写文本），不涉及多路检索。BM25 天然对改写友好——新增的每个 term 都是独立的正向匹配信号，不存在 Dense 模型的'向量偏移'问题。"
 
     design_rationale:
-      core_principle: "Prompt 优化的本质是让 LLM 往查询里注入'正确的额外 token'，缩小短查询（5-15 字）与长 passage（中位数 368 字）之间的语义鸿沟。"
+      core_principle: "Prompt 优化的本质是让 LLM 往查询里注入'正确的额外 token'，缩小短查询（5-15 字）与长 passage（中位数 368 字）之间的词面鸿沟。BM25 对改写友好——新增 term 直接参与词袋匹配，不存在向量偏移问题。"
       dimensions:
         - dimension: "规则密度"
           variants: ["B1: 4 条简单规则", "P1: 8-10 条细化规则 + 硬约束"]
@@ -107,7 +117,7 @@ experiment_groups:
           hypothesis: "领域内 few-shot > 通用 few-shot；对比教学让 LLM 学到边界"
         - dimension: "输出格式"
           variants: ["B1/P1/P2/P3: 自然语句", "P5: 关键词串"]
-          hypothesis: "关键词串密度更高，可能比自然语句更适合向量检索"
+          hypothesis: "关键词串密度更高，但 BM25 对自然语句中的分词也有效——IDF 自动压低通用词权重。需要消融验证"
         - dimension: "类型感知"
           variants: ["B1/P1/P2/P3: 统一 prompt", "P4: 按 query type 分发不同 prompt"]
           hypothesis: "不同查询类型需要不同扩展策略，但分发粒度需要消融验证"
@@ -115,15 +125,15 @@ experiment_groups:
     groups:
       - id: "E2a-B0"
         name: "no rewrite (baseline)"
-        method: "原始查询直接检索，不经任何改写"
+        method: "原始查询直接 BM25 检索，不经任何改写"
         rationale: "对照组——量化改写本身能带来多大增益"
         api_calls_per_query: 0
 
       - id: "E2a-B1"
         name: "v1 rewrite (current unified prompt)"
-        method: "当前 evaluate_retrieval.py 中 QUERY_REWRITE_PROMPT：4 条规则（补全缩写/口语化、保留原意、不编造）+ 7 个通用领域示例"
-        prompt_location: "scripts/evaluate_retrieval.py:L140-L168"
-        rationale: "统一基线的重写方案，验证简单 Prompt 是否有增益、增益多大"
+        method: "当前 evaluate_retrieval.py 中 QUERY_REWRITE_PROMPT：4 条规则（补全缩写/口语化、保留原意、不编造）+ 7 个通用领域示例。LLM 改写 → BM25 检索"
+        prompt_location: "src/intent/query_rewrite_prompts.py (B1 prompt)"
+        rationale: "统一基线的重写方案，验证简单 Prompt 在 BM25 上是否有增益、增益多大"
         api_calls_per_query: 1
 
       - id: "E2a-P1"
@@ -152,7 +162,7 @@ experiment_groups:
 
       - id: "E2a-P5"
         name: "keyword expansion (纯关键词扩展)"
-        method: "不走'改写为自然语句'路线，而是直接输出扩展关键词串：\n  原始: 蜂巢取快递验证码摁错怎么办\n  输出: 蜂巢快递柜 取件 验证码 输入错误 重新获取 忘记密码 操作方法\n  规则：提取 3-7 个关键词/短语，用空格分隔，包含原查询核心词 + 相关扩展词。\n  这种格式让向量检索面对更高密度的语义 token，可能比自然语句更有效。同时为 E2b 的 multi-query 方案提供一种备选查询格式。"
+        method: "不走'改写为自然语句'路线，而是直接输出扩展关键词串：\n  原始: 蜂巢取快递验证码摁错怎么办\n  输出: 蜂巢快递柜 取件 验证码 输入错误 重新获取 忘记密码 操作方法\n  规则：提取 3-7 个关键词/短语，用空格分隔，包含原查询核心词 + 相关扩展词。\n  BM25 上关键词串直接参与 term 匹配——关键词密度越高，命中概率越大。同时为 E2b 的 multi-query 方案提供一种备选查询格式。"
         rationale: "输出格式消融——关键词串 vs 自然语句。同时验证这种高密度格式是否适合作为 E2b 多路检索中的一个分支"
         api_calls_per_query: 1
 
@@ -168,24 +178,23 @@ experiment_groups:
         - "P5 (keyword exp)"
 
     analysis_questions:
-      - "Q1: 任何一个改写方案能否显著超过 B0（原始查询）？如果没有，说明单 query 改写路线在 bge-small 上不可行。"
+      - "Q1: 任何一个改写方案能否显著超过 B0（原始查询，BM25）？如果没有，说明单 query 改写路线在 BM25 上也不可行——问题可能出在 LLM 改写质量本身。"
       - "Q2: 规则密度提升（B1→P1）的增益有多大？如果接近 0，说明 LLM 已经够聪明，规则不是瓶颈。"
       - "Q3: 领域示例（B1→P2）和对比示例（P2→P3）各自带来多少增量？这是 Prompt 工程最经典的两个杠杆。"
       - "Q4: 类型感知（P4）比统一 prompt（B1）好吗？如果不好，说明 query type 分发不需要这么细的粒度。"
-      - "Q5: 关键词串（P5）vs 自然语句（B1-P4），哪种输出格式更适合向量检索？"
+      - "Q5: 关键词串（P5）vs 自然语句（B1-P4），哪种输出格式更适合 BM25 检索？"
       - "Q6: P1-P5 加总到 E2b multi-query 融合，最优 Prompt 方案作为 E2b 的 single-query 底座。"
 
   # ========== E2b：Multi-Query 融合 ==========
   multi_query_fusion:
-    objective: "验证多路查询扩展 → 各自检索 → RRF 融合能否提高召回。三组实验按失败模式定义改写角度，做干净的单变量消融：M1 vs B0（多角度是否有增益）、M2 vs M1（step-back 的边际贡献）、M3 vs M1（类型感知 vs 统一策略）。"
+    objective: "验证多路查询扩展 → 各自 BM25 检索 → RRF 融合能否提高召回。三组实验按失败模式定义改写角度，做干净的单变量消融：M1 vs B0（多角度是否有增益）、M2 vs M1（step-back 的边际贡献）、M3 vs M1（类型感知 vs 统一策略）。"
     fixed:
-      embedding_model: "BAAI/bge-small-zh-v1.5"
-      retrieval_strategy: "similarity"
+      retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
       top_k: 10
       passage_pool: "全量 230 万"
-      fusion: "RRF (k=60, c=60)"
+      fusion: "RRF (k=60)"
       single_query_prompt: "使用 E2a 中最优的 single-query Prompt 方案（B0/B1/P1-P5 之一）作为每条子查询的基础改写策略"
-      note: "每组均一次 LLM API 调用（prompt 内输出多条子查询），子查询各自 Dense 检索后 RRF 合并，不涉及多轮调用"
+      note: "每组均一次 LLM API 调用（prompt 内输出多条子查询），子查询各自 BM25 检索后 RRF 合并，不涉及多轮调用"
 
     design_rationale:
       core_principle: "单条查询的语义向量只能锚定一个方向。多条覆盖不同侧面和抽象层次的查询，通过 RRF 融合能互补覆盖 passage 的不同区域。"
@@ -261,51 +270,50 @@ experiment_groups:
 
   # ========== E2c：HyDE 预回答扩展 ==========
   hyde_pretend_answer:
-    objective: "验证 HyDE（生成假答案 → 用答案检索）相比原查询检索的增益。各组均用原始不加改写的 query，确保干净地衡量 HyDE 本身的贡献。HyDE × 最优改写的交叉组合留给 Phase 3。"
+    objective: "验证 HyDE（生成假答案 → 用答案文本做 BM25 检索）相比原查询检索的增益。各组均用原始不加改写的 query，确保干净地衡量 HyDE 本身的贡献。HyDE × 最优改写的交叉组合留给 Phase 3。"
     fixed:
-      embedding_model: "BAAI/bge-small-zh-v1.5"
-      retrieval_strategy: "similarity"
+      retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
       top_k: 10
       passage_pool: "全量 230 万"
       base_query: "原查询，不经任何改写（B0 版本）"
-      note: "E2c 的 query 统一使用原始 B0 版本，不与 E2a 的任何 Prompt 方案混淆。最优 Prompt + HyDE 的交叉组合放在 Phase 3 单独测试。"
+      note: "BM25 版 HyDE：LLM 生成假答案文本 → jieba 分词 → BM25 term 匹配。假答案比短 query 术语更丰富、信息密度更高，预期能命中更多相关 passage。"
+      key_difference_from_dense_hyde: "Dense 版 HyDE 靠假答案的语义向量匹配；BM25 版靠假答案的 term 直接命中。两者机制不同但理念相同。"
 
     groups:
       - id: "E2c-H1"
         name: "HyDE only"
-        method: "query → LLM 生成 100-150 字假答案 → 用假答案做向量检索"
+        method: "query → LLM 生成 100-150 字假答案 → jieba 分词 → BM25 检索"
         api_calls_per_query: 1
-        rationale: "最基础的 HyDE，业界验证效果最好的单策略"
+        rationale: "最基础的 HyDE，验证假答案文本是否比原始短查询更适合 BM25 term 匹配"
 
       - id: "E2c-H2"
         name: "HyDE + original query (RRF)"
-        method: "原查询（B0）检索 + HyDE 假答案检索 → 两路 RRF 合并"
+        method: "原查询（B0）BM25 检索 + HyDE 假答案 BM25 检索 → 两路 RRF 合并"
         api_calls_per_query: 1
-        rationale: "原查询和假答案互补，预期优于纯 HyDE。不引入改写 query，干净消融 HyDE 的增量。"
+        rationale: "原查询和假答案互补——原 query 保留精确 term，假答案补充扩展术语"
 
       - id: "E2c-H3"
         name: "HyDE answer length ablation"
         method: "H2 方案下对比 50 / 100 / 200 字假答案的召回差异"
         api_calls_per_query: 1
-        rationale: "确定最优答案长度，过长可能引入噪音"
+        rationale: "确定最优答案长度。过长可能引入过多高频噪声词，BM25 的 IDF 会自动压制但仍有稀释风险"
 
     comparison_matrix:
       rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
       columns: ["B0 (no rewrite)", "H1 (HyDE only)", "H2 (HyDE+original)", "H3 (length optimal)"]
 
     analysis_questions:
-      - "Q1: HyDE 假答案检索能否超过原始查询检索（H1 vs B0）？语义密度更高的假答案是否弥补了短查询的不足？"
+      - "Q1: BM25 版 HyDE 假答案检索能否超过原始查询检索（H1 vs B0）？假答案更丰富的术语是否通过词袋匹配弥补了短查询的不足？"
       - "Q2: 原查询 + 假答案 RRF 是否优于纯 HyDE（H2 vs H1）？两者覆盖的 passage 是否有重叠或互补？"
-      - "Q3: 假答案长度的最优值是多少（H3 内部对比）？过长是否引入噪音导致召回下降？"
+      - "Q3: 假答案长度的最优值是多少（H3 内部对比）？BM25 下过长文本的 IDF 稀释效应是否比 Dense 版更严重？"
 
   # ========== E2d：伪相关反馈 (PRF) ==========
   pseudo_relevance_feedback:
+    status: "deferred (代码未实现 BM25 版 PRF handler。PRF 本质上是为 term-based 检索发明的经典技术——第一轮BM25→TF-IDF提词→扩展查询→第二轮BM25，完全兼容。待实现 BM25 handler 后恢复。)"
+    original_plan: "见下方保留内容"
     objective: "验证零 API 成本的 PRF 方案能否缩小与 LLM 重写方案之间的差距"
     fixed:
-      embedding_model: "BAAI/bge-small-zh-v1.5"
-      retrieval_strategy: "similarity"
-      top_k: 10
-      passage_pool: "全量 230 万"
+      retrieval_backend: "Dense (待定: m3e-base 或其他)"
       note: "PRF 完全不调用 LLM API，成本为零。非常适合作为检索增强的 baseline 下限。"
 
     method:
@@ -352,43 +360,27 @@ execution_plan:
     duration: "~15 分钟"
     sample_size: 100
     tasks:
-      - "E2a: 验证新 Prompt 不报错 → 跑 100 条看趋势"
-      - "E2b: 验证 multi-query 融合 pipeline → 100 条"
-      - "E2c: 验证 HyDE pipeline → 100 条"
-      - "E2d: 验证 PRF pipeline → 100 条"
-    note: "4 个实验组的 smoke test 可以在 bge-small 上快速完成，确认代码无 bug"
+      - "E2a: 验证 BM25 改写 pipeline 不报错 → 跑 100 条看趋势"
+      - "E2b: 验证 BM25 multi-query 融合 pipeline → 100 条"
+      - "E2c: 验证 BM25 HyDE pipeline（需实现 BM25 版 HyDE handler）→ 100 条"
+    note: "BM25 版不需要 GPU。E2d (PRF) 暂缓——代码未实现 BM25 版 PRF handler。"
 
   phase_2_ablation:
-    duration: "~1 小时"
+    duration: "~45 分钟"
     sample_size: 2000
     tasks:
-      - "E2a: Prompt 迭代 7 组 × 2000 queries（API ~15 分钟 + 检索 ~8 分钟）"
-      - "E2b: Multi-Query 融合 3 组 × 2000 queries（API ~10 分钟 + 检索 ~15 分钟）"
-      - "E2c: HyDE 3 组 × 2000 queries（API ~10 分钟 + 检索 ~15 分钟）"
-      - "E2d: PRF 2 组 × 2000 queries（0 API + 检索 ~5 分钟）"
-      - "汇总消融结果，选出最优 Prompt / Multi-Query / HyDE / PRF 方案"
+      - "E2a: Prompt 迭代 7 组 × 2000 queries（API ~15 分钟 + BM25 检索 ~2 分钟）"
+      - "E2b: Multi-Query 融合 3 组 × 2000 queries（API ~10 分钟 + BM25 检索 ~5 分钟）"
+      - "E2c: HyDE 3 组 × 2000 queries（API ~10 分钟 + BM25 检索 ~3 分钟）"
+      - "汇总消融结果，选出最优 Prompt / Multi-Query / HyDE 方案"
+    note: "E2c 需要在 evaluate_exp002.py 中实现 _run_bm25_strategy_hyde handler。E2d 暂缓。"
 
-  phase_3_cross_combination:
-    duration: "~20 分钟"
-    sample_size: 2000
+  phase_3_e2d_and_m3e:
+    duration: "待定"
     tasks:
-      - "最佳 Prompt + 最佳 Multi-Query 合并测试"
-      - "最佳 Prompt + 最佳 HyDE 合并测试"
-      - "确定最终推荐的 V0 查询增强方案"
-
-  phase_4_full_evaluation:
-    duration: "~30 分钟"
-    sample_size: 22812
-    tasks:
-      - "最优方案全量评估，产出论文级指标"
-    note: "可选——等所有嵌入模型实验完成后再全量"
-
-  total_server_time: "~2.5 小时（含 API 等待）"
-  total_api_cost: "~¥8（2000 条消融）+ ~¥30（全量，可选）"
-
-  dependency:
-    - "exp-001 全量索引（至少 bge-small-zh-v1.5）"
-    - "不依赖 exp-001 的其他模型——先在小模型上跑通流程"
+      - "E2d (PRF): 实现 BM25 版 PRF——第一轮 BM25 → TF-IDF 提词 → 扩展查询 → 第二轮 BM25"
+      - "构建 M3E Dense 向量索引（小 passage 池快速验证）"
+      - "在 M3E 上复现 BM25 最优方案 + HyDE/PRF 的 Dense 版本"
 
 
 # =============================================================================
@@ -424,17 +416,12 @@ deliverables:
 
 risks:
 
-  - risk: "Prompt/Multi-Query/HyDE 增益不显著（Recall@10 < +0.05）"
-    probability: low
-    impact: "V0 检索增强路线不可行"
-    mitigation: "升到 bge-large-zh-v1.5 后再测——更大的嵌入模型可能对改写更敏感"
-
-  - risk: "Multi-Query 导致检索延迟增长 3-5 倍"
+  - risk: "Prompt/Multi-Query 在 BM25 上增益不显著（Recall@10 < +0.05）"
     probability: medium
-    impact: "生产不可用"
-    mitigation: "V0 仅评估质量，不优化延迟；V1 考虑并行检索"
+    impact: "LLM 查询改写本身可能对 T2Ranking 无效——补充的 term 无法命中相关 passage 中的词"
+    mitigation: "1) 分析改写失败 case，看 LLM 输出是否合理；2) 若 BM25 也无增益，则表明短查询语义鸿沟无法靠简单的 term 扩充弥合——需转向 HyDE 或混合检索方案"
 
-  - risk: "HyDE 答案幻觉导致检索偏移"
+  - risk: "BM25 基线过低，改写增益有天花板"
     probability: medium
-    impact: "假答案方向错误则召回不升反降"
-    mitigation: "H2（HyDE + original query RRF）可缓解；H3 答案长度消融可找出最优配置"
+    impact: "BM25 短查询 Recall@10 可能本身就远低于 Dense，即使改写有相对增益，绝对分数仍不够"
+    mitigation: "exp-001 中同步运行 BM25 基线，若过低则加速 M3E migration"

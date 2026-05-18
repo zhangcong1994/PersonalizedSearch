@@ -25,4 +25,5 @@ langchain-text-splitters
 lxml
 opencc-python-reimplemented
 jieba
+tqdm
 rank-bm25

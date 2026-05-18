@@ -39,6 +39,10 @@ def main():
         "--collection", default=str(COLLECTION_FILE),
         help="Path to collection.tsv (default: T2Ranking collection.tsv)",
     )
+    parser.add_argument(
+        "-j", "--workers", type=int, default=-1,
+        help="Number of parallel workers for jieba tokenization (-1 = all CPUs, 1 = single-process, default: -1)",
+    )
     args = parser.parse_args()
 
     collection_path = Path(args.collection)
@@ -48,12 +52,12 @@ def main():
 
     logger.info(f"Loading passages from {collection_path}...")
     t0 = time.time()
-    pids, texts = load_passages(collection_path)
+    pids, texts = load_passages(collection_path, show_progress=True)
     load_time = time.time() - t0
     logger.info(f"Loaded {len(pids):,} passages in {load_time:.1f}s")
 
     output_dir = Path(args.output_dir)
-    pkl_path = build(texts, store_dir=output_dir, name=args.name)
+    pkl_path = build(texts, store_dir=output_dir, name=args.name, n_jobs=args.workers)
 
     total_time = time.time() - t0
     logger.info(f"Done in {total_time:.1f}s: {pkl_path}")

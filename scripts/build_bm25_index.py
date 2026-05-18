@@ -43,6 +43,10 @@ def main():
         "-j", "--workers", type=int, default=-1,
         help="Number of parallel workers for jieba tokenization (-1 = all CPUs, 1 = single-process, default: -1)",
     )
+    parser.add_argument(
+        "-s", "--shards", type=int, default=4,
+        help="Number of shards to split the index into (reduces per-shard pickle memory, default: 4)",
+    )
     args = parser.parse_args()
 
     collection_path = Path(args.collection)
@@ -57,10 +61,10 @@ def main():
     logger.info(f"Loaded {len(pids):,} passages in {load_time:.1f}s")
 
     output_dir = Path(args.output_dir)
-    pkl_path = build(texts, store_dir=output_dir, name=args.name, n_jobs=args.workers)
+    pkl_paths = build(texts, store_dir=output_dir, name=args.name, n_jobs=args.workers, n_shards=args.shards)
 
     total_time = time.time() - t0
-    logger.info(f"Done in {total_time:.1f}s: {pkl_path}")
+    logger.info(f"Done in {total_time:.1f}s: {len(pkl_paths)} shard(s) → {output_dir}")
     return 0
 
 

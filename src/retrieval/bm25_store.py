@@ -92,12 +92,66 @@ def _tokenize_worker(text: str) -> list[str]:
     return tokens
 
 
+def _compute_global_stats(
+    tokenized: list,
+    show_progress: bool = False,
+) -> tuple:
+    import math
+
+    nd = {}
+    total_len = 0
+    n_docs = len(tokenized)
+
+    iterator = tokenized
+    if show_progress and tqdm is not None:
+        iterator = tqdm(tokenized, desc="Computing global IDF", unit="docs", mininterval=2)
+
+    for doc in iterator:
+        total_len += len(doc)
+        seen = set()
+        for word in doc:
+            if word not in seen:
+                nd[word] = nd.get(word, 0) + 1
+                seen.add(word)
+
+    avgdl = total_len / n_docs if n_docs > 0 else 1.0
+    idf = {
+        word: math.log((n_docs - doc_count + 0.5) / (doc_count + 0.5) + 1)
+        for word, doc_count in nd.items()
+    }
+    logger.info(f"Global stats: {len(idf):,} unique terms, avgdl={avgdl:.1f}")
+    return idf, avgdl, n_docs
+
+
+class ShardedBM25:
+    def __init__(self, shards: list, shard_offsets: list):
+        self._shards = shards
+        self._offsets = shard_offsets
+        self.corpus_size = sum(s.corpus_size for s in shards)
+        self.doc_len = []
+        for s in shards:
+            self.doc_len.extend(s.doc_len)
+
+    def get_scores(self, query: list[str]) -> "np.ndarray":
+        import numpy as np
+
+        all_scores = np.empty(sum(len(s.doc_len) for s in self._shards), dtype=np.float64)
+        start = 0
+        for s in self._shards:
+            n = len(s.doc_len)
+            all_scores[start:start + n] = s.get_scores(query)
+            start += n
+        return all_scores
+
+
 def build(
     texts: list[str],
     store_dir: Optional[Path] = None,
     name: str = "t2ranking",
     n_jobs: int = 1,
-) -> Path:
+    n_shards: int = 4,
+) -> list[Path]:
+    import math
     from rank_bm25 import BM25Okapi
 
     if store_dir is None:
@@ -119,13 +173,16 @@ def build(
         )
         n_jobs = max_safe_jobs
 
-    stopwords = _load_stopwords()
+    if n_shards < 1:
+        n_shards = max(1, n_total // 500000)
+    n_shards = min(n_shards, max(1, n_total // 50000))
+    shard_size = math.ceil(n_total / n_shards)
 
+    # ── tokenization ──────────────────────────────────────
+    stopwords = _load_stopwords()
     use_multiprocessing = n_jobs > 1 and n_total > 1000
 
     if use_multiprocessing:
-        import math
-
         logger.info(
             f"Tokenizing {n_total:,} passages (jieba, stopwords={len(stopwords)}, workers={n_jobs})..."
         )
@@ -148,22 +205,61 @@ def build(
         tokenized = [_tokenize(t, stopwords) for t in iterator]
 
     n_tokens = sum(len(tk) for tk in tokenized)
-    logger.info(f"Tokenized: {n_tokens:,} total tokens, avg {n_tokens // max(len(tokenized), 1)} tokens/doc")
+    logger.info(f"Tokenized: {n_tokens:,} total tokens, avg {n_tokens // max(n_total, 1)} tokens/doc")
 
-    logger.info("Building BM25 index...")
-    bm25 = BM25Okapi(tokenized)
+    # ── compute global IDF ────────────────────────────────
+    global_idf, global_avgdl, n_docs = _compute_global_stats(tokenized, show_progress=True)
+
+    # ── build shards ──────────────────────────────────────
+    logger.info(
+        f"Building {n_shards} shard(s), {shard_size:,} docs each "
+        f"({global_avgdl:.0f} avg tokens/doc, {len(global_idf):,} terms)"
+    )
+
+    saved_paths = []
+    for i in range(n_shards):
+        start = i * shard_size
+        end = min(start + shard_size, n_total)
+        shard_tokenized = tokenized[start:end]
+
+        logger.info(f"  Shard {i+1}/{n_shards}: building BM25 for docs {start:,}–{end:,}...")
+        bm25 = BM25Okapi(shard_tokenized)
+
+        shard_terms = set()
+        for doc in shard_tokenized:
+            shard_terms.update(doc)
+        bm25.idf = {k: v for k, v in global_idf.items() if k in shard_terms}
+        bm25.avgdl = global_avgdl
+
+        del shard_tokenized, shard_terms
+
+        pkl_path = store_dir / f"{name}_shard_{i:04d}.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump({"bm25": bm25}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        size_mb = pkl_path.stat().st_size / (1024 * 1024)
+        logger.info(f"  Shard {i+1}/{n_shards} saved: {pkl_path.name} ({size_mb:.1f} MB)")
+        saved_paths.append(pkl_path)
+
+        del bm25
 
     del tokenized
 
-    pkl_path = store_dir / f"{name}.pkl"
-    data = {"bm25": bm25}
-    logger.info(f"Saving index to {pkl_path}...")
-    with open(pkl_path, "wb") as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # ── save metadata ─────────────────────────────────────
+    meta_path = store_dir / f"{name}_meta.pkl"
+    meta = {
+        "version": 2,
+        "name": name,
+        "n_shards": n_shards,
+        "n_docs": n_total,
+        "n_terms": len(global_idf),
+        "global_avgdl": global_avgdl,
+    }
+    with open(meta_path, "wb") as f:
+        pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info(f"Metadata saved: {meta_path.name}")
 
-    size_mb = pkl_path.stat().st_size / (1024 * 1024)
-    logger.info(f"BM25 index saved: {pkl_path} ({size_mb:.1f} MB)")
-    return pkl_path
+    return saved_paths
 
 
 def load(store_dir: Optional[Path] = None, name: str = "t2ranking") -> tuple:
@@ -171,23 +267,57 @@ def load(store_dir: Optional[Path] = None, name: str = "t2ranking") -> tuple:
         store_dir = DEFAULT_STORE_DIR
     store_dir = Path(store_dir)
 
-    pkl_path = store_dir / f"{name}.pkl"
-    if not pkl_path.exists():
+    meta_path = store_dir / f"{name}_meta.pkl"
+    single_path = store_dir / f"{name}.pkl"
+
+    if meta_path.exists():
+        # ── v2 sharded format ──────────────────────────
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+
+        n_shards = meta.get("n_shards", 0)
+        if n_shards < 1:
+            raise RuntimeError(f"Invalid shard metadata in {meta_path}")
+
+        logger.info(f"Loading sharded BM25 index: {n_shards} shard(s), {meta['n_docs']:,} docs")
+        shards = []
+        for i in range(n_shards):
+            shard_path = store_dir / f"{name}_shard_{i:04d}.pkl"
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Missing shard: {shard_path}")
+            with open(shard_path, "rb") as f:
+                data = pickle.load(f)
+            shards.append(data["bm25"])
+
+        offsets = [0]
+        for s in shards:
+            offsets.append(offsets[-1] + len(s.doc_len))
+
+        bm25 = ShardedBM25(shards, offsets)
+        logger.info(
+            f"BM25 index loaded: {meta['n_docs']:,} docs across {n_shards} shard(s), "
+            f"{bm25.corpus_size} terms"
+        )
+        return bm25, None
+
+    elif single_path.exists():
+        # ── v1 single file format ──────────────────────
+        logger.info(f"Loading BM25 index from {single_path}...")
+        with open(single_path, "rb") as f:
+            data = pickle.load(f)
+
+        bm25 = data["bm25"]
+        tokenized = data.get("tokenized")
+        if tokenized is None:
+            tokenized = bm25.corpus
+        logger.info(f"BM25 index loaded: {len(tokenized)} docs, {bm25.corpus_size} terms")
+        return bm25, tokenized
+
+    else:
         raise FileNotFoundError(
-            f"BM25 index not found: {pkl_path}. "
+            f"BM25 index not found in {store_dir}. "
             f"Run 'python scripts/build_bm25_index.py' first."
         )
-
-    logger.info(f"Loading BM25 index from {pkl_path}...")
-    with open(pkl_path, "rb") as f:
-        data = pickle.load(f)
-
-    bm25 = data["bm25"]
-    tokenized = data.get("tokenized")
-    if tokenized is None:
-        tokenized = bm25.corpus
-    logger.info(f"BM25 index loaded: {len(tokenized)} docs, {bm25.corpus_size} terms")
-    return bm25, tokenized
 
 
 def tokenize_query(query: str) -> list[str]:

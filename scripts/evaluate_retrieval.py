@@ -16,12 +16,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, MODEL_CACHE_DIR, EMBEDDING_MODEL, resolve_model_local_path
+from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, DATA_ROOT, EMBEDDING_MODEL, resolve_model_local_path
 
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QUERIES_FILE = T2RANKING_DIR / "queries.dev.tsv"
 QRELS_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
 COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
+RESULTS_DIR = DATA_ROOT / "results"
 
 HTML_RE = re.compile(r"<[^>]*>")
 TRUNCATE_LEN = 2000
@@ -586,7 +587,7 @@ def main():
         load_and_print(args.load, top_k=args.top_k)
         return 0
 
-    rewrite_cache = args.rewrite_cache or "results/rewritten_queries.jsonl"
+    rewrite_cache = args.rewrite_cache or str(RESULTS_DIR / "rewritten_queries.jsonl")
     rewrite_map = None
     if args.rewrite:
         all_queries = load_queries(QUERIES_FILE)
@@ -599,7 +600,7 @@ def main():
         if args.rewrite:
             strategy_tag = "rewrite_" + strategy_tag
         save_path = str(
-            Path("results") /
+            RESULTS_DIR /
             f"retrieval_{strategy_tag}_s{args.sample}_{args.dense_strategy}.jsonl"
         )
 

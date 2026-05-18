@@ -75,6 +75,7 @@ def _ensure_llm_output(
     queries: list[tuple[str, str]],
     cfg: dict,
     cache,
+    llm_concurrency: int = 20,
 ) -> dict[str, str | list[str]]:
     from langchain_core.prompts import ChatPromptTemplate
 
@@ -91,7 +92,8 @@ def _ensure_llm_output(
 
     logger.info(
         f"Calling LLM for {len(missing)}/{len(queries)} queries "
-        f"(cached: {len(cached_all)}, experiment={experiment_id})"
+        f"(cached: {len(cached_all)}, experiment={experiment_id}, "
+        f"concurrency={llm_concurrency})"
     )
 
     llm = _get_llm(max_tokens=cfg["max_tokens"])
@@ -106,24 +108,32 @@ def _ensure_llm_output(
             ("human", human_msg),
         ]) | llm
 
-    processed = 0
-    for qid, text in missing:
-        try:
-            result = chain.invoke({"query": text})
-            output = result.content.strip() if hasattr(result, "content") else str(result).strip()
-            parsed = _parse_llm_output(output, cfg["output_parser"])
-        except Exception as e:
-            logger.warning(f"LLM call failed for qid={qid}: {e}, using original")
-            parsed = text if cfg["output_parser"] == "text" else [text]
+    batch_size = llm_concurrency
+    total_processed = 0
 
-        cached_all[qid] = parsed
-        cache.put(experiment_id, qid, text, parsed)
-        processed += 1
+    for i in range(0, len(missing), batch_size):
+        chunk = missing[i:i + batch_size]
+        inputs = [{"query": text} for _, text in chunk]
 
-        if processed % 100 == 0:
-            logger.info(f"  LLM progress: {processed}/{len(missing)}")
+        results = chain.batch(inputs, config={"max_concurrency": batch_size}, return_exceptions=True)
 
-    logger.info(f"LLM calls complete: {processed} queries processed, {processed} cached")
+        for (qid, text), result in zip(chunk, results):
+            try:
+                if isinstance(result, Exception):
+                    raise result
+                output = result.content.strip() if hasattr(result, "content") else str(result).strip()
+                parsed = _parse_llm_output(output, cfg["output_parser"])
+            except Exception as e:
+                logger.warning(f"LLM call failed for qid={qid}: {e}, using original")
+                parsed = text if cfg["output_parser"] == "text" else [text]
+
+            cached_all[qid] = parsed
+            cache.put(experiment_id, qid, text, parsed)
+            total_processed += 1
+
+        logger.info(f"  LLM progress: {total_processed}/{len(missing)}")
+
+    logger.info(f"LLM calls complete: {total_processed} queries processed, {total_processed} cached")
     return cached_all
 
 
@@ -451,6 +461,7 @@ def run_experiment(
     dense_search_type: str,
     save_path: str,
     model_id: str = None,
+    llm_concurrency: int = 20,
 ):
     cfg = get_experiment_config(experiment_id)
     strategy = cfg["strategy"]
@@ -468,7 +479,7 @@ def run_experiment(
 
     from src.retrieval.rewrite_cache import RewriteCache
     cache = RewriteCache(RESULTS_DIR)
-    llm_outputs = _ensure_llm_output(experiment_id, valid_queries, cfg, cache)
+    llm_outputs = _ensure_llm_output(experiment_id, valid_queries, cfg, cache, llm_concurrency)
 
     pids, texts = load_passages(COLLECTION_FILE)
     pool_queries = _filter_pool_queries(valid_queries, pids, qrels)
@@ -608,6 +619,10 @@ def main():
     )
     parser.add_argument("--save", default=None, help="Save retrieval results to JSONL file")
     parser.add_argument("--load", default=None, help="Load cached results from JSONL (skip retrieval)")
+    parser.add_argument(
+        "--llm-concurrency", type=int, default=20,
+        help="Max concurrent LLM API calls (default: 20). Set lower if hitting HTTP 429.",
+    )
     parser.add_argument("--list", action="store_true", help="List available experiments and exit")
 
     args = parser.parse_args()
@@ -644,6 +659,7 @@ def main():
         dense_search_type=args.dense_strategy,
         save_path=save_path,
         model_id=args.embedding_model,
+        llm_concurrency=args.llm_concurrency,
     )
 
     print()

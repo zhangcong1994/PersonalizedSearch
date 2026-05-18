@@ -25,9 +25,21 @@ COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
 RESULTS_DIR = DATA_ROOT / "results"
 
 
-def build_bm25(texts: list[str]):
+def build_bm25(texts: list[str], bm25_index_dir: str = None):
+    from src.retrieval.bm25_store import load as bm25_load, DEFAULT_STORE_DIR
+
+    if bm25_index_dir is None:
+        bm25_index_dir = str(DEFAULT_STORE_DIR)
+
+    try:
+        bm25, tokenized = bm25_load(Path(bm25_index_dir))
+        return bm25, tokenized
+    except FileNotFoundError:
+        pass
+
     from rank_bm25 import BM25Okapi
 
+    logger.warning("BM25 cache not found, building from scratch (use scripts/build_bm25_index.py first)")
     tokenized = [t.split() for t in texts]
     return BM25Okapi(tokenized), tokenized
 
@@ -203,6 +215,7 @@ def run_and_save(
     skip_dense: bool = False,
     rewrite_map: dict[str, str] = None,
     model_id: str = None,
+    bm25_index: str = None,
 ):
     queries = load_queries(QUERIES_FILE)
     qrels = load_qrels(QRELS_FILE)
@@ -243,7 +256,7 @@ def run_and_save(
         print("  Building BM25...")
         print("=" * 60)
         t0 = time.time()
-        bm25, tokenized = build_bm25(texts)
+        bm25, tokenized = build_bm25(texts, bm25_index_dir=bm25_index)
         logger.info(f"BM25 build: {time.time() - t0:.1f}s ({len(pids)} docs)")
 
     dense_retriever = None
@@ -281,7 +294,8 @@ def run_and_save(
 
         if bm25 is not None:
             t0 = time.time()
-            tokenized_query = query_text.split()
+            from src.retrieval.bm25_store import tokenize_query
+            tokenized_query = tokenize_query(query_text)
             scores = bm25.get_scores(tokenized_query)
             bm25_elapsed = time.time() - t0
             bm25_total_time += bm25_elapsed
@@ -387,6 +401,10 @@ def main():
              "Accepted: BAAI/bge-small-zh-v1.5, BAAI/bge-large-zh-v1.5, moka-ai/m3e-base, BAAI/bge-m3",
     )
 
+    parser.add_argument(
+        "--bm25-index", default=None,
+        help="Directory of pre-built BM25 index (default: data/bm25_index)",
+    )
     parser.add_argument("--save", default=None, help="Save retrieval results to JSONL file")
     parser.add_argument("--load", default=None, help="Load cached results from JSONL (skip retrieval)")
 
@@ -438,6 +456,7 @@ def main():
         skip_dense=args.bm25_only,
         rewrite_map=rewrite_map,
         model_id=args.embedding_model,
+        bm25_index=args.bm25_index,
     )
     return 0
 

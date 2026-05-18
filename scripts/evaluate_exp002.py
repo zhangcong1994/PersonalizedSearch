@@ -428,6 +428,134 @@ def _run_strategy_prf(
     return results
 
 
+# ── BM25 strategy handlers ────────────────────────────────
+
+
+def _run_bm25_strategy_none(
+    bm25,
+    tokenized_corpus: list[list[str]],
+    pool_queries: list[tuple[str, str]],
+    pids: list[str],
+    qrels: dict[str, set[str]],
+    top_k: int,
+) -> list[dict]:
+    from src.retrieval.bm25_store import tokenize_query
+
+    results = []
+    total_time = 0.0
+
+    for i, (qid, query_text) in enumerate(pool_queries):
+        relevant = qrels.get(qid, set())
+        entry = {"qid": qid, "query": query_text, "relevant_pids": relevant, "retrievals": {}}
+
+        t0 = time.time()
+        tokenized_query = tokenize_query(query_text)
+        scores = bm25.get_scores(tokenized_query)
+        top_idx = sorted(range(len(scores)), key=lambda j: scores[j], reverse=True)[:top_k]
+        elapsed = time.time() - t0
+        total_time += elapsed
+
+        entry["retrievals"]["bm25"] = [pids[j] for j in top_idx]
+        results.append(entry)
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Progress: {i+1}/{len(pool_queries)} | BM25 {total_time/(i+1)*1000:.0f}ms/q")
+
+    logger.info(f"BM25 total search time: {total_time:.1f}s "
+                f"({total_time/len(pool_queries)*1000:.0f}ms/q)")
+    return results
+
+
+def _run_bm25_strategy_single(
+    bm25,
+    tokenized_corpus: list[list[str]],
+    llm_outputs: dict[str, str | list[str]],
+    pool_queries: list[tuple[str, str]],
+    pids: list[str],
+    qrels: dict[str, set[str]],
+    top_k: int,
+) -> list[dict]:
+    from src.retrieval.bm25_store import tokenize_query
+
+    results = []
+    total_time = 0.0
+
+    for i, (qid, original_text) in enumerate(pool_queries):
+        rewritten = llm_outputs.get(qid, original_text)
+        if isinstance(rewritten, list):
+            rewritten = rewritten[0] if rewritten else original_text
+
+        relevant = qrels.get(qid, set())
+        entry = {"qid": qid, "query": rewritten, "relevant_pids": relevant, "retrievals": {}}
+
+        t0 = time.time()
+        tokenized_query = tokenize_query(rewritten)
+        scores = bm25.get_scores(tokenized_query)
+        top_idx = sorted(range(len(scores)), key=lambda j: scores[j], reverse=True)[:top_k]
+        elapsed = time.time() - t0
+        total_time += elapsed
+
+        entry["retrievals"]["bm25"] = [pids[j] for j in top_idx]
+        results.append(entry)
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Progress: {i+1}/{len(pool_queries)} | BM25 {total_time/(i+1)*1000:.0f}ms/q")
+
+    logger.info(f"BM25 total search time: {total_time:.1f}s "
+                f"({total_time/len(pool_queries)*1000:.0f}ms/q)")
+    return results
+
+
+def _run_bm25_strategy_multi_query(
+    bm25,
+    tokenized_corpus: list[list[str]],
+    llm_outputs: dict[str, str | list[str]],
+    pool_queries: list[tuple[str, str]],
+    pids: list[str],
+    qrels: dict[str, set[str]],
+    top_k: int,
+    rrf_k: int,
+) -> list[dict]:
+    from collections import defaultdict
+    from src.retrieval.bm25_store import tokenize_query
+
+    results = []
+    total_time = 0.0
+
+    for i, (qid, original_text) in enumerate(pool_queries):
+        sub_queries = llm_outputs.get(qid, [original_text])
+        if isinstance(sub_queries, str):
+            sub_queries = [sub_queries]
+
+        relevant = qrels.get(qid, set())
+        entry = {"qid": qid, "query": original_text, "relevant_pids": relevant, "retrievals": {}}
+
+        t0 = time.time()
+        rrf_scores: dict[str, float] = defaultdict(float)
+        for rank, sq in enumerate(sub_queries):
+            tokenized_sq = tokenize_query(sq)
+            sq_scores = bm25.get_scores(tokenized_sq)
+            top_idx = sorted(range(len(sq_scores)), key=lambda j: sq_scores[j], reverse=True)[:top_k * 2]
+            for local_rank, j in enumerate(top_idx):
+                pid = pids[j]
+                rrf_scores[pid] += 1.0 / (rrf_k + local_rank + 1)
+
+        merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        elapsed = time.time() - t0
+        total_time += elapsed
+
+        key = f"bm25_multi_query_rrf@k{rrf_k}"
+        entry["retrievals"][key] = [pid for pid, _ in merged]
+        results.append(entry)
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Progress: {i+1}/{len(pool_queries)} | BM25-MQ {total_time/(i+1)*1000:.0f}ms/q")
+
+    logger.info(f"BM25 MultiQuery total search time: {total_time:.1f}s "
+                f"({total_time/len(pool_queries)*1000:.0f}ms/q)")
+    return results
+
+
 # ── main pipeline ────────────────────────────────────────
 
 
@@ -462,6 +590,8 @@ def run_experiment(
     save_path: str,
     model_id: str = None,
     llm_concurrency: int = 20,
+    use_bm25: bool = False,
+    bm25_index_dir: str = None,
 ):
     cfg = get_experiment_config(experiment_id)
     strategy = cfg["strategy"]
@@ -488,54 +618,91 @@ def run_experiment(
         print("WARNING: No queries have relevant passages in the loaded pool!")
         return None
 
-    print()
-    print("=" * 60)
-    print("  Loading Dense Retriever...")
-    print("=" * 60)
-    t0 = time.time()
-    if vector_db_dir is None:
-        vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
-    dense_retriever, dense_count = _load_dense_retriever(
-        vector_db_dir, collection_name, device,
-        search_type=dense_search_type, model_id=model_id,
-    )
-    logger.info(f"Dense retriever load: {time.time() - t0:.1f}s")
+    if use_bm25:
+        from src.retrieval.bm25_store import load as bm25_load, DEFAULT_STORE_DIR
 
-    print()
-    print("=" * 60)
-    print(f"  Running retrieval: {len(pool_queries)} queries x {len(pids)} passages")
-    print(f"  Strategy: {strategy} | Experiment: {experiment_id}")
-    print("=" * 60)
+        if bm25_index_dir is None:
+            bm25_index_dir = str(DEFAULT_STORE_DIR)
 
-    if strategy == "none":
-        results = _run_strategy_none(
-            dense_retriever, pool_queries, pids, qrels, top_k, dense_search_type,
-        )
-    elif strategy == "single":
-        results = _run_strategy_single(
-            dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
-        )
-    elif strategy == "multi_query":
-        rrf_k = cfg.get("rrf_k", 60)
-        results = _run_strategy_multi_query(
-            dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
-        )
-    elif strategy == "hyde":
-        results = _run_strategy_hyde(
-            dense_retriever, llm_outputs, pool_queries, qrels, top_k, with_original=False,
-        )
-    elif strategy == "hyde_rrf":
-        rrf_k = cfg.get("rrf_k", 60)
-        results = _run_strategy_hyde(
-            dense_retriever, llm_outputs, pool_queries, qrels, top_k,
-            rrf_k=rrf_k, with_original=True,
-        )
-    elif strategy == "prf":
-        results = _run_strategy_prf(
-            dense_retriever, pool_queries, texts, pids, qrels, top_k, cfg,
-        )
+        print()
+        print("=" * 60)
+        print("  Loading BM25 Index...")
+        print("=" * 60)
+        t0 = time.time()
+        bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
+
+        print()
+        print("=" * 60)
+        print(f"  Running retrieval: {len(pool_queries)} queries x {len(pids)} passages")
+        print(f"  Strategy: {strategy} | Experiment: {experiment_id} | BM25")
+        print("=" * 60)
+
+        if strategy == "none":
+            results = _run_bm25_strategy_none(
+                bm25, tokenized_corpus, pool_queries, pids, qrels, top_k,
+            )
+        elif strategy == "single":
+            results = _run_bm25_strategy_single(
+                bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+            )
+        elif strategy == "multi_query":
+            rrf_k = cfg.get("rrf_k", 60)
+            results = _run_bm25_strategy_multi_query(
+                bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+            )
+        else:
+            raise ValueError(f"BM25 mode does not support strategy: {strategy} "
+                             f"(use none/single/multi_query)")
     else:
-        raise ValueError(f"Unknown strategy: {strategy}")
+        print()
+        print("=" * 60)
+        print("  Loading Dense Retriever...")
+        print("=" * 60)
+        t0 = time.time()
+        if vector_db_dir is None:
+            vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
+        dense_retriever, dense_count = _load_dense_retriever(
+            vector_db_dir, collection_name, device,
+            search_type=dense_search_type, model_id=model_id,
+        )
+        logger.info(f"Dense retriever load: {time.time() - t0:.1f}s")
+
+        print()
+        print("=" * 60)
+        print(f"  Running retrieval: {len(pool_queries)} queries x {len(pids)} passages")
+        print(f"  Strategy: {strategy} | Experiment: {experiment_id}")
+        print("=" * 60)
+
+        if strategy == "none":
+            results = _run_strategy_none(
+                dense_retriever, pool_queries, pids, qrels, top_k, dense_search_type,
+            )
+        elif strategy == "single":
+            results = _run_strategy_single(
+                dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
+            )
+        elif strategy == "multi_query":
+            rrf_k = cfg.get("rrf_k", 60)
+            results = _run_strategy_multi_query(
+                dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+            )
+        elif strategy == "hyde":
+            results = _run_strategy_hyde(
+                dense_retriever, llm_outputs, pool_queries, qrels, top_k, with_original=False,
+            )
+        elif strategy == "hyde_rrf":
+            rrf_k = cfg.get("rrf_k", 60)
+            results = _run_strategy_hyde(
+                dense_retriever, llm_outputs, pool_queries, qrels, top_k,
+                rrf_k=rrf_k, with_original=True,
+            )
+        elif strategy == "prf":
+            results = _run_strategy_prf(
+                dense_retriever, pool_queries, texts, pids, qrels, top_k, cfg,
+            )
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
 
     meta = {
         "experiment_id": experiment_id,
@@ -620,6 +787,14 @@ def main():
     parser.add_argument("--save", default=None, help="Save retrieval results to JSONL file")
     parser.add_argument("--load", default=None, help="Load cached results from JSONL (skip retrieval)")
     parser.add_argument(
+        "--bm25", action="store_true",
+        help="Use BM25 (sparse) retrieval instead of Dense (vector) retrieval",
+    )
+    parser.add_argument(
+        "--bm25-index", default=None,
+        help="Directory of pre-built BM25 index (default: data/bm25_index)",
+    )
+    parser.add_argument(
         "--llm-concurrency", type=int, default=20,
         help="Max concurrent LLM API calls (default: 20). Set lower if hitting HTTP 429.",
     )
@@ -645,8 +820,9 @@ def main():
 
     save_path = args.save
     if not save_path:
+        mode_tag = "bm25" if args.bm25 else args.dense_strategy
         save_path = str(
-            RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{args.dense_strategy}.jsonl"
+            RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{mode_tag}.jsonl"
         )
 
     output = run_experiment(
@@ -660,6 +836,8 @@ def main():
         save_path=save_path,
         model_id=args.embedding_model,
         llm_concurrency=args.llm_concurrency,
+        use_bm25=args.bm25,
+        bm25_index_dir=args.bm25_index,
     )
 
     print()

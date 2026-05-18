@@ -24,3 +24,5 @@ langchain-huggingface
 langchain-text-splitters
 lxml
 opencc-python-reimplemented
+jieba
+rank-bm25

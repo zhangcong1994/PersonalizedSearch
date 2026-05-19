@@ -665,7 +665,7 @@ def run_experiment(
                 (bm25_index_dir / "params.index.json").exists() or
                 (bm25_index_dir / "shards.json").exists()
             )
-        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
+        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index")) / "t2ranking"
 
         print()
         print("=" * 60)
@@ -814,7 +814,7 @@ def run_experiments_batch(
                 (bm25_index_dir / "params.index.json").exists() or
                 (bm25_index_dir / "shards.json").exists()
             )
-        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
+        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index")) / "t2ranking"
 
         print()
         print("=" * 60)

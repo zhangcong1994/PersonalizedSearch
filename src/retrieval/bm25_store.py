@@ -134,13 +134,27 @@ class ShardedBM25:
 
     def get_scores(self, query: list[str]) -> "np.ndarray":
         import numpy as np
+        from concurrent.futures import ThreadPoolExecutor
 
-        all_scores = np.empty(sum(len(s.doc_len) for s in self._shards), dtype=np.float64)
-        start = 0
-        for s in self._shards:
-            n = len(s.doc_len)
-            all_scores[start:start + n] = s.get_scores(query)
-            start += n
+        n_shards = len(self._shards)
+        if n_shards == 1:
+            return self._shards[0].get_scores(query)
+
+        max_workers = min(n_shards, 12)
+        all_scores = np.empty(len(self.doc_len), dtype=np.float64)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for idx, s in enumerate(self._shards):
+                future = executor.submit(s.get_scores, query)
+                futures[future] = idx
+
+            for future in futures:
+                idx = futures[future]
+                start = self._offsets[idx]
+                end = self._offsets[idx + 1]
+                all_scores[start:end] = future.result()
+
         return all_scores
 
 

@@ -30,13 +30,21 @@ def _tokenize(text: str, stopwords: Optional[set] = None) -> list[str]:
     return tokens
 
 
+_stopwords_cache: Optional[set] = None
+
+
 def _load_stopwords() -> set[str]:
+    global _stopwords_cache
+    if _stopwords_cache is not None:
+        return _stopwords_cache
+
     import jieba.analyse
 
     try:
         default_path = os.path.join(jieba.analyse.STOP_WORDS)
     except Exception:
-        return _default_stopwords()
+        _stopwords_cache = _default_stopwords()
+        return _stopwords_cache
 
     stopwords = set()
     if os.path.exists(default_path):
@@ -49,6 +57,7 @@ def _load_stopwords() -> set[str]:
     if not stopwords:
         stopwords = _default_stopwords()
 
+    _stopwords_cache = stopwords
     return stopwords
 
 
@@ -123,6 +132,48 @@ def _compute_global_stats(
     return idf, avgdl, n_docs
 
 
+class InvertedIndexShard:
+    def __init__(self, tokenized: list, global_idf: dict, global_avgdl: float):
+        from collections import defaultdict
+
+        self.doc_len = [len(doc) for doc in tokenized]
+        self.n_docs = len(tokenized)
+        self.avgdl = global_avgdl
+        self.idf = global_idf
+        self.corpus_size = len(global_idf)
+
+        postings = defaultdict(list)
+        for doc_idx, doc in enumerate(tokenized):
+            tf_counts = {}
+            for term in doc:
+                tf_counts[term] = tf_counts.get(term, 0) + 1
+            for term, tf in tf_counts.items():
+                postings[term].append((doc_idx, tf))
+        self.postings = dict(postings)
+
+    def get_scores(self, query_tokens: list[str]) -> "np.ndarray":
+        import numpy as np
+
+        k1 = 1.5
+        b = 0.75
+        scores = np.zeros(self.n_docs, dtype=np.float64)
+
+        for term in query_tokens:
+            idf_val = self.idf.get(term, 0.0)
+            if idf_val == 0.0:
+                continue
+            posting_list = self.postings.get(term)
+            if posting_list is None:
+                continue
+            for doc_idx, tf in posting_list:
+                doc_len = self.doc_len[doc_idx]
+                numerator = tf * (k1 + 1.0)
+                denominator = tf + k1 * (1.0 - b + b * doc_len / self.avgdl)
+                scores[doc_idx] += idf_val * numerator / denominator
+
+        return scores
+
+
 class ShardedBM25:
     _executor = None
 
@@ -177,7 +228,6 @@ def build(
     n_shards: int = 4,
 ) -> list[Path]:
     import math
-    from rank_bm25 import BM25Okapi
 
     if store_dir is None:
         store_dir = DEFAULT_STORE_DIR
@@ -247,33 +297,27 @@ def build(
         end = min(start + shard_size, n_total)
         shard_tokenized = tokenized[start:end]
 
-        logger.info(f"  Shard {i+1}/{n_shards}: building BM25 for docs {start:,}–{end:,}...")
-        bm25 = BM25Okapi(shard_tokenized)
+        logger.info(f"  Shard {i+1}/{n_shards}: building inverted index for docs {start:,}–{end:,}...")
+        inv = InvertedIndexShard(shard_tokenized, global_idf, global_avgdl)
 
-        shard_terms = set()
-        for doc in shard_tokenized:
-            shard_terms.update(doc)
-        bm25.idf = {k: v for k, v in global_idf.items() if k in shard_terms}
-        bm25.avgdl = global_avgdl
-
-        del shard_tokenized, shard_terms
+        del shard_tokenized
 
         pkl_path = store_dir / f"{name}_shard_{i:04d}.pkl"
         with open(pkl_path, "wb") as f:
-            pickle.dump({"bm25": bm25}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({"bm25": inv}, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         size_mb = pkl_path.stat().st_size / (1024 * 1024)
         logger.info(f"  Shard {i+1}/{n_shards} saved: {pkl_path.name} ({size_mb:.1f} MB)")
         saved_paths.append(pkl_path)
 
-        del bm25
+        del inv
 
     del tokenized
 
     # ── save metadata ─────────────────────────────────────
     meta_path = store_dir / f"{name}_meta.pkl"
     meta = {
-        "version": 2,
+        "version": 3,
         "name": name,
         "n_shards": n_shards,
         "n_docs": n_total,

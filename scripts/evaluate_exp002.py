@@ -444,11 +444,11 @@ def _topk_indices(scores: "np.ndarray", k: int) -> list[int]:
 
 def _run_bm25_strategy_none(
     bm25,
-    tokenized_corpus: list[list[str]],
-    pool_queries: list[tuple[str, str]],
-    pids: list[str],
-    qrels: dict[str, set[str]],
-    top_k: int,
+    tokenized_corpus=None,
+    pool_queries: list[tuple[str, str]] = None,
+    pids: list[str] = None,
+    qrels: dict[str, set[str]] = None,
+    top_k: int = 10,
 ) -> list[dict]:
     from src.retrieval.bm25_store import tokenize_query
 
@@ -479,12 +479,12 @@ def _run_bm25_strategy_none(
 
 def _run_bm25_strategy_single(
     bm25,
-    tokenized_corpus: list[list[str]],
-    llm_outputs: dict[str, str | list[str]],
-    pool_queries: list[tuple[str, str]],
-    pids: list[str],
-    qrels: dict[str, set[str]],
-    top_k: int,
+    tokenized_corpus=None,
+    llm_outputs: dict[str, str | list[str]] = None,
+    pool_queries: list[tuple[str, str]] = None,
+    pids: list[str] = None,
+    qrels: dict[str, set[str]] = None,
+    top_k: int = 10,
 ) -> list[dict]:
     from src.retrieval.bm25_store import tokenize_query
 
@@ -519,13 +519,13 @@ def _run_bm25_strategy_single(
 
 def _run_bm25_strategy_multi_query(
     bm25,
-    tokenized_corpus: list[list[str]],
-    llm_outputs: dict[str, str | list[str]],
-    pool_queries: list[tuple[str, str]],
-    pids: list[str],
-    qrels: dict[str, set[str]],
-    top_k: int,
-    rrf_k: int,
+    tokenized_corpus=None,
+    llm_outputs: dict[str, str | list[str]] = None,
+    pool_queries: list[tuple[str, str]] = None,
+    pids: list[str] = None,
+    qrels: dict[str, set[str]] = None,
+    top_k: int = 10,
+    rrf_k: int = 60,
 ) -> list[dict]:
     from collections import defaultdict
     from src.retrieval.bm25_store import tokenize_query
@@ -630,17 +630,30 @@ def run_experiment(
         return None
 
     if use_bm25:
-        from src.retrieval.bm25_store import load as bm25_load, DEFAULT_STORE_DIR
+        import bm25s
+        from src.retrieval.bm25_store import DEFAULT_STORE_DIR
 
         if bm25_index_dir is None:
             bm25_index_dir = str(DEFAULT_STORE_DIR)
+        bm25_index_dir = Path(bm25_index_dir)
+
+        # Auto-detect: try BM25S path first, fall back to ShardedBM25
+        bm25s_candidate = bm25_index_dir if (bm25_index_dir / "params.index.json").exists() \
+            else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
 
         print()
         print("=" * 60)
         print("  Loading BM25 Index...")
         print("=" * 60)
         t0 = time.time()
-        bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        if (bm25s_candidate / "params.index.json").exists():
+            logger.info(f"Loading BM25S index from {bm25s_candidate}...")
+            bm25 = bm25s.BM25.load(str(bm25s_candidate))
+            tokenized_corpus = None
+        else:
+            from src.retrieval.bm25_store import load as bm25_load
+            logger.info(f"Loading ShardedBM25 index from {bm25_index_dir}...")
+            bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
         logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
 
         print()
@@ -771,17 +784,29 @@ def run_experiments_batch(
         return None
 
     if use_bm25:
-        from src.retrieval.bm25_store import load as bm25_load, DEFAULT_STORE_DIR
+        import bm25s
+        from src.retrieval.bm25_store import DEFAULT_STORE_DIR
 
         if bm25_index_dir is None:
             bm25_index_dir = str(DEFAULT_STORE_DIR)
+        bm25_index_dir = Path(bm25_index_dir)
+
+        bm25s_candidate = bm25_index_dir if (bm25_index_dir / "params.index.json").exists() \
+            else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
 
         print()
         print("=" * 60)
         print("  Loading BM25 Index (shared across all experiments)...")
         print("=" * 60)
         t0 = time.time()
-        bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        if (bm25s_candidate / "params.index.json").exists():
+            logger.info(f"Loading BM25S index from {bm25s_candidate}...")
+            bm25 = bm25s.BM25.load(str(bm25s_candidate))
+            tokenized_corpus = None
+        else:
+            from src.retrieval.bm25_store import load as bm25_load
+            logger.info(f"Loading ShardedBM25 index from {bm25_index_dir}...")
+            bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
         logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
     else:
         print()
@@ -1018,7 +1043,8 @@ def main():
     )
     parser.add_argument(
         "--bm25-index", default=None,
-        help="Directory of pre-built BM25 index (default: data/bm25_index)",
+        help="Directory of pre-built BM25S or ShardedBM25 index "
+             "(auto-detected; build with scripts/build_bm25s_index.py first)",
     )
     parser.add_argument(
         "--llm-concurrency", type=int, default=20,

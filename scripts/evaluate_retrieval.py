@@ -300,7 +300,13 @@ def run_and_save(
             bm25_elapsed = time.time() - t0
             bm25_total_time += bm25_elapsed
 
-            top_idx = sorted(range(len(scores)), key=lambda j: scores[j], reverse=True)[:top_k]
+            import numpy as np
+            n = len(scores)
+            if n <= top_k:
+                top_idx = np.argsort(scores)[::-1].tolist()
+            else:
+                part = np.argpartition(scores, n - top_k)[n - top_k:]
+                top_idx = part[np.argsort(scores[part])[::-1]].tolist()
             entry["retrievals"]["bm25"] = [pids[j] for j in top_idx]
 
         if dense_retriever is not None:

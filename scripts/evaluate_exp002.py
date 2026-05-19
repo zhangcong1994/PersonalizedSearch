@@ -431,6 +431,17 @@ def _run_strategy_prf(
 # ── BM25 strategy handlers ────────────────────────────────
 
 
+def _topk_indices(scores: "np.ndarray", k: int) -> list[int]:
+    import numpy as np
+
+    if len(scores) <= k:
+        return np.argsort(scores)[::-1].tolist()
+    n = len(scores)
+    partition_idx = np.argpartition(scores, n - k)[n - k:]
+    topk = partition_idx[np.argsort(scores[partition_idx])[::-1]]
+    return topk.tolist()
+
+
 def _run_bm25_strategy_none(
     bm25,
     tokenized_corpus: list[list[str]],
@@ -451,7 +462,7 @@ def _run_bm25_strategy_none(
         t0 = time.time()
         tokenized_query = tokenize_query(query_text)
         scores = bm25.get_scores(tokenized_query)
-        top_idx = sorted(range(len(scores)), key=lambda j: scores[j], reverse=True)[:top_k]
+        top_idx = _topk_indices(scores, top_k)
         elapsed = time.time() - t0
         total_time += elapsed
 
@@ -491,7 +502,7 @@ def _run_bm25_strategy_single(
         t0 = time.time()
         tokenized_query = tokenize_query(rewritten)
         scores = bm25.get_scores(tokenized_query)
-        top_idx = sorted(range(len(scores)), key=lambda j: scores[j], reverse=True)[:top_k]
+        top_idx = _topk_indices(scores, top_k)
         elapsed = time.time() - t0
         total_time += elapsed
 
@@ -535,7 +546,7 @@ def _run_bm25_strategy_multi_query(
         for rank, sq in enumerate(sub_queries):
             tokenized_sq = tokenize_query(sq)
             sq_scores = bm25.get_scores(tokenized_sq)
-            top_idx = sorted(range(len(sq_scores)), key=lambda j: sq_scores[j], reverse=True)[:top_k * 2]
+            top_idx = _topk_indices(sq_scores, top_k * 2)
             for local_rank, j in enumerate(top_idx):
                 pid = pids[j]
                 rrf_scores[pid] += 1.0 / (rrf_k + local_rank + 1)

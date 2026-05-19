@@ -124,6 +124,8 @@ def _compute_global_stats(
 
 
 class ShardedBM25:
+    _executor = None
+
     def __init__(self, shards: list, shard_offsets: list):
         self._shards = shards
         self._offsets = shard_offsets
@@ -131,31 +133,40 @@ class ShardedBM25:
         self.doc_len = []
         for s in shards:
             self.doc_len.extend(s.doc_len)
+        self._max_workers = min(len(shards), 12)
+        self._executor = None
+
+    def _ensure_executor(self):
+        if self._executor is None and self._max_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
 
     def get_scores(self, query: list[str]) -> "np.ndarray":
         import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
 
         n_shards = len(self._shards)
         if n_shards == 1:
             return self._shards[0].get_scores(query)
 
-        max_workers = min(n_shards, 12)
+        self._ensure_executor()
+
         all_scores = np.empty(len(self.doc_len), dtype=np.float64)
+        futures = {}
+        for idx, s in enumerate(self._shards):
+            future = self._executor.submit(s.get_scores, query)
+            futures[future] = idx
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            for idx, s in enumerate(self._shards):
-                future = executor.submit(s.get_scores, query)
-                futures[future] = idx
-
-            for future in futures:
-                idx = futures[future]
-                start = self._offsets[idx]
-                end = self._offsets[idx + 1]
-                all_scores[start:end] = future.result()
+        for future in futures:
+            idx = futures[future]
+            start = self._offsets[idx]
+            end = self._offsets[idx + 1]
+            all_scores[start:end] = future.result()
 
         return all_scores
+
+    def __del__(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
 def build(

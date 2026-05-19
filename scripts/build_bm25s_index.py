@@ -59,40 +59,33 @@ def _init_worker(stopwords_set):
     jieba.lcut("")
 
 
-def _chunk_tokenize(args):
-    chunk_texts, stopwords_set = args
+def _tokenize_one(text):
     import jieba
+
+    if text is _ERROR_SENTINEL:
+        return _ERROR_SENTINEL
+
     try:
-        results = []
-        for text in chunk_texts:
-            tokens = jieba.lcut(text)
-            if stopwords_set:
-                tokens = [w.strip() for w in tokens
-                          if w.strip() and len(w) > 1 and w not in stopwords_set]
-            else:
-                tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1]
-            results.append(tokens)
-        return results
+        tokens = jieba.lcut(text)
+        tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1]
+        return tokens
     except Exception:
         return RuntimeError(traceback.format_exc())
+
+
+_ERROR_SENTINEL = object()
 
 
 def tokenize_parallel(texts, n_jobs, stopwords):
     ctx = _get_mp_context()
     n_jobs = max(1, min(n_jobs, mp.cpu_count()))
 
-    # Split into chunks: each worker gets one big chunk
     n_total = len(texts)
-    n_chunks = n_jobs * 4
-    chunk_size = max(1, math.ceil(n_total / n_chunks))
-    chunks = []
-    for i in range(0, n_total, chunk_size):
-        chunks.append((texts[i:i + chunk_size], stopwords))
+    chunksize = max(200, math.ceil(n_total / (n_jobs * 40)))
 
     logger.info(
         f"Tokenizing {n_total:,} passages "
-        f"(jieba, stopwords={len(stopwords)}, workers={n_jobs}, "
-        f"chunks={len(chunks)}/{chunk_size})..."
+        f"(jieba, stopwords={len(stopwords)}, workers={n_jobs})..."
     )
     t0 = time.time()
 
@@ -102,33 +95,35 @@ def tokenize_parallel(texts, n_jobs, stopwords):
         initargs=(stopwords,),
     )
     try:
-        iterator = pool.imap_unordered(_chunk_tokenize, chunks, chunksize=1)
+        iterator = pool.imap_unordered(
+            _tokenize_one, texts, chunksize=chunksize
+        )
         if tqdm is not None:
-            iterator = tqdm(iterator, total=len(chunks),
-                            desc="Tokenizing", unit="chunk", mininterval=2)
+            iterator = tqdm(iterator, total=n_total,
+                            desc="Tokenizing", unit="docs", mininterval=2)
 
         tokenized = []
-        errors = []
-        for chunk_result in iterator:
-            if isinstance(chunk_result, Exception):
-                errors.append(str(chunk_result))
+        errors = 0
+        for result in iterator:
+            if isinstance(result, Exception):
+                errors += 1
+                tokenized.append([])
             else:
-                tokenized.extend(chunk_result)
+                if stopwords:
+                    result = [w for w in result if w not in stopwords]
+                tokenized.append(result)
 
         if errors:
-            logger.error(
-                f"{len(errors)}/{len(chunks)} chunks failed:\n{errors[0][:500]}"
-            )
-            raise RuntimeError(
-                f"Tokenization failed: {len(errors)} chunks errored. "
-                f"First error: {errors[0][:200]}"
-            )
+            logger.warning(f"{errors}/{n_total} docs failed during tokenization "
+                           f"({100*errors/n_total:.2f}%)")
     finally:
         pool.terminate()
         pool.join()
 
     elapsed = time.time() - t0
     n_tokens = sum(len(tk) for tk in tokenized)
+    assert len(tokenized) == n_total, \
+        f"tokenized count mismatch: {len(tokenized)} != {n_total}"
     logger.info(
         f"Tokenized in {elapsed:.1f}s ({n_total/elapsed:.0f} docs/s): "
         f"{n_tokens:,} tokens, avg {n_tokens//max(len(tokenized),1)} tokens/doc"

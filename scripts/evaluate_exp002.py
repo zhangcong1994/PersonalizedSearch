@@ -430,6 +430,30 @@ def _run_strategy_prf(
 
 # ── BM25 strategy handlers ────────────────────────────────
 
+def _load_bm25_index(bm25_index_dir: "Path", default_dir: "Path"):
+    import bm25s
+    from src.retrieval.bm25_store import load as sharded_load
+
+    index_path = bm25_index_dir
+
+    # 1. Check for sharded BM25S (shards.json)
+    if (index_path / "shards.json").exists():
+        logger.info(f"Loading sharded BM25S index from {index_path}...")
+        from src.retrieval.bm25s_store import ShardedBM25S
+        bm25 = ShardedBM25S.load(str(index_path))
+        return bm25, None
+
+    # 2. Check for single BM25S (params.index.json)
+    if (index_path / "params.index.json").exists():
+        logger.info(f"Loading single BM25S index from {index_path}...")
+        bm25 = bm25s.BM25.load(str(index_path))
+        return bm25, None
+
+    # 3. Fall back to ShardedBM25
+    logger.info(f"Loading ShardedBM25 index from {index_path}...")
+    bm25, tokenized_corpus = sharded_load(index_path)
+    return bm25, tokenized_corpus
+
 
 def _topk_indices(scores: "np.ndarray", k: int) -> list[int]:
     import numpy as np
@@ -630,30 +654,25 @@ def run_experiment(
         return None
 
     if use_bm25:
-        import bm25s
         from src.retrieval.bm25_store import DEFAULT_STORE_DIR
 
         if bm25_index_dir is None:
             bm25_index_dir = str(DEFAULT_STORE_DIR)
         bm25_index_dir = Path(bm25_index_dir)
 
-        # Auto-detect: try BM25S path first, fall back to ShardedBM25
-        bm25s_candidate = bm25_index_dir if (bm25_index_dir / "params.index.json").exists() \
-            else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
+        bm25s_candidate = bm25_index_dir if (
+            bm25_index_dir.exists() and (
+                (bm25_index_dir / "params.index.json").exists() or
+                (bm25_index_dir / "shards.json").exists()
+            )
+        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
 
         print()
         print("=" * 60)
         print("  Loading BM25 Index...")
         print("=" * 60)
         t0 = time.time()
-        if (bm25s_candidate / "params.index.json").exists():
-            logger.info(f"Loading BM25S index from {bm25s_candidate}...")
-            bm25 = bm25s.BM25.load(str(bm25s_candidate))
-            tokenized_corpus = None
-        else:
-            from src.retrieval.bm25_store import load as bm25_load
-            logger.info(f"Loading ShardedBM25 index from {bm25_index_dir}...")
-            bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        bm25, tokenized_corpus = _load_bm25_index(bm25s_candidate, DEFAULT_STORE_DIR)
         logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
 
         print()
@@ -784,29 +803,25 @@ def run_experiments_batch(
         return None
 
     if use_bm25:
-        import bm25s
         from src.retrieval.bm25_store import DEFAULT_STORE_DIR
 
         if bm25_index_dir is None:
             bm25_index_dir = str(DEFAULT_STORE_DIR)
         bm25_index_dir = Path(bm25_index_dir)
 
-        bm25s_candidate = bm25_index_dir if (bm25_index_dir / "params.index.json").exists() \
-            else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
+        bm25s_candidate = bm25_index_dir if (
+            bm25_index_dir.exists() and (
+                (bm25_index_dir / "params.index.json").exists() or
+                (bm25_index_dir / "shards.json").exists()
+            )
+        ) else Path(str(DEFAULT_STORE_DIR).replace("bm25_index", "bm25s_index"))
 
         print()
         print("=" * 60)
         print("  Loading BM25 Index (shared across all experiments)...")
         print("=" * 60)
         t0 = time.time()
-        if (bm25s_candidate / "params.index.json").exists():
-            logger.info(f"Loading BM25S index from {bm25s_candidate}...")
-            bm25 = bm25s.BM25.load(str(bm25s_candidate))
-            tokenized_corpus = None
-        else:
-            from src.retrieval.bm25_store import load as bm25_load
-            logger.info(f"Loading ShardedBM25 index from {bm25_index_dir}...")
-            bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        bm25, tokenized_corpus = _load_bm25_index(bm25s_candidate, DEFAULT_STORE_DIR)
         logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
     else:
         print()

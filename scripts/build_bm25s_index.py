@@ -164,7 +164,16 @@ def tokenize_sequential(texts, stopwords):
 # Main
 # ═══════════════════════════════════════════════════════════
 
+def _tokenize_texts(texts, n_jobs, stopwords):
+    if n_jobs > 1 and len(texts) > 1000:
+        return tokenize_parallel(texts, n_jobs, stopwords)
+    else:
+        return tokenize_sequential(texts, stopwords)
+
+
 def main():
+    import json
+
     parser = argparse.ArgumentParser(
         description="Build a BM25S index for T2Ranking passages",
     )
@@ -200,6 +209,11 @@ def main():
     parser.add_argument(
         "--b", type=float, default=0.75, help="BM25 b parameter",
     )
+    parser.add_argument(
+        "--docs-per-shard", type=int, default=300000,
+        help="Docs per index shard to control peak memory (default: 300000). "
+             "Lower = less RAM needed. Set to 0 to disable sharding.",
+    )
     args = parser.parse_args()
 
     import bm25s
@@ -212,8 +226,16 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Resolve worker count ──
+    n_jobs = args.workers
+    if n_jobs == 0:
+        n_jobs = 1
+    elif n_jobs < 0:
+        n_jobs = mp.cpu_count()
+
     # ── Load ──
     logger.info(f"Loading passages from {collection_path}...")
+    t_total = time.time()
     t0 = time.time()
     if args.limit > 0:
         pids, texts = load_passages(
@@ -222,69 +244,114 @@ def main():
     else:
         pids, texts = load_passages(collection_path, show_progress=True)
     load_time = time.time() - t0
+    n_total = len(texts)
     total_mb = sum(len(t) for t in texts) / (1024 * 1024)
-    avg_len = sum(len(t) for t in texts) / max(len(texts), 1)
+    avg_len = sum(len(t) for t in texts) / max(n_total, 1)
     logger.info(
-        f"Loaded {len(texts):,} passages in {load_time:.1f}s "
+        f"Loaded {n_total:,} passages in {load_time:.1f}s "
         f"({total_mb:.1f} MB, avg {avg_len:.0f} chars/doc)"
     )
 
-    # ── Tokenize ──
-    stopwords = _load_stopwords()
-    n_jobs = args.workers
-    if n_jobs == 0:
-        n_jobs = 1
-    elif n_jobs < 0:
-        n_jobs = mp.cpu_count()
+    # ── Shard config ──
+    shard_size = args.docs_per_shard
+    if shard_size <= 0 or shard_size >= n_total:
+        shard_size = n_total
+    n_shards = math.ceil(n_total / shard_size)
 
-    if n_jobs > 1 and len(texts) > 1000:
-        tokenized = tokenize_parallel(texts, n_jobs, stopwords)
-    else:
-        tokenized = tokenize_sequential(texts, stopwords)
+    stopwords = _load_stopwords()
+
+    # ── Build shards ──
+    shard_base = output_dir / args.name
+    shard_base.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        f"Building {n_shards} shard(s) of ~{shard_size:,} docs each "
+        f"(method={args.method}, k1={args.k1}, b={args.b})"
+        f"\n  Output: {shard_base}"
+    )
+
+    total_index_time = 0.0
+    total_save_time = 0.0
+    total_save_size = 0
+    shard_offsets = [0]
+
+    for shard_idx in range(n_shards):
+        start = shard_idx * shard_size
+        end = min(start + shard_size, n_total)
+        shard_texts = texts[start:end]
+        shard_pids = pids[start:end]
+
+        logger.info(
+            f"\n{'='*50}\n"
+            f"Shard {shard_idx+1}/{n_shards}: docs {start:,}–{end:,} "
+            f"({len(shard_texts):,} docs)\n"
+            f"{'='*50}"
+        )
+
+        shard_tokens = _tokenize_texts(shard_texts, n_jobs, stopwords)
+        del shard_texts
+
+        t0 = time.time()
+        retriever = bm25s.BM25(method=args.method, k1=args.k1, b=args.b)
+        retriever.index(shard_tokens)
+        index_time = time.time() - t0
+        total_index_time += index_time
+        logger.info(
+            f"  Index built in {index_time:.1f}s "
+            f"({len(shard_tokens)/index_time:.0f} docs/s)"
+        )
+
+        del shard_tokens
+
+        shard_name = f"shard_{shard_idx:04d}"
+        shard_path = shard_base / shard_name
+        t0 = time.time()
+        retriever.save(str(shard_path))
+        save_time = time.time() - t0
+        total_save_time += save_time
+        shard_size_bytes = sum(
+            f.stat().st_size for f in shard_path.rglob("*") if f.is_file()
+        )
+        total_save_size += shard_size_bytes
+        logger.info(
+            f"  Saved: {shard_path.name} "
+            f"({save_time:.1f}s, {shard_size_bytes/1024/1024:.1f} MB)"
+        )
+
+        shard_offsets.append(shard_offsets[-1] + len(shard_pids))
+        del retriever
 
     del texts
 
-    # ── Build BM25S index ──
-    logger.info(
-        f"Building BM25S index (method={args.method}, k1={args.k1}, b={args.b})..."
-    )
-    t0 = time.time()
-
-    retriever = bm25s.BM25(method=args.method, k1=args.k1, b=args.b)
-    retriever.index(tokenized)
-
-    index_time = time.time() - t0
-    logger.info(
-        f"Index built in {index_time:.1f}s ({len(tokenized)/index_time:.0f} docs/s)"
-    )
-
-    del tokenized
-
-    # ── Save ──
-    save_path = output_dir / args.name
-    logger.info(f"Saving index to {save_path}...")
-    t0 = time.time()
-
-    retriever.save(str(save_path))
-
-    save_time = time.time() - t0
-    save_size = sum(
-        f.stat().st_size for f in save_path.rglob("*") if f.is_file()
-    )
-    logger.info(
-        f"Index saved in {save_time:.1f}s ({save_size/1024/1024:.1f} MB)"
-    )
+    # ── Save manifest ──
+    manifest = {
+        "version": 1,
+        "name": args.name,
+        "n_shards": n_shards,
+        "n_docs": n_total,
+        "shard_offsets": shard_offsets,
+        "method": args.method,
+        "k1": args.k1,
+        "b": args.b,
+    }
+    manifest_path = shard_base / "shards.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    logger.info(f"Manifest saved: {manifest_path}")
 
     # ── Summary ──
+    t_total = time.time() - t_total
     print()
-    print("=" * 55)
+    print("=" * 60)
     print(f"  BM25S index built successfully")
-    print("=" * 55)
-    print(f"  Documents:  {len(pids):,}")
-    print(f"  Method:     {args.method} (k1={args.k1}, b={args.b})")
-    print(f"  Index path: {save_path}")
-    print(f"  Index size: {save_size/1024/1024:.1f} MB")
-    print("=" * 55)
+    print("=" * 60)
+    print(f"  Documents:     {n_total:,}")
+    print(f"  Shards:        {n_shards} × ~{shard_size:,} docs")
+    print(f"  Method:        {args.method} (k1={args.k1}, b={args.b})")
+    print(f"  Index dir:     {shard_base}")
+    print(f"  Total size:    {total_save_size/1024/1024:.1f} MB")
+    print(f"  Total time:    {t_total:.0f}s "
+          f"(build {total_index_time:.0f}s + save {total_save_time:.0f}s)")
+    print("=" * 60)
 
     return 0
 

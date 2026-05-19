@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 from src.utils.config import RAW_DATA_DIR, VECTOR_DB_DIR, DATA_ROOT, EMBEDDING_MODEL, resolve_model_local_path
 from src.evaluation.data_loader import load_queries, load_qrels, load_passages
-from src.evaluation.metrics import compute_metrics, print_comparison
+from src.evaluation.metrics import compute_metrics, print_comparison, get_metric_params
 from src.evaluation.result_cache import save_results, load_results
 from src.intent.query_rewrite_prompts import REGISTRY, get_experiment_config, list_experiments
 
@@ -755,10 +755,11 @@ def load_and_print(load_path: str, top_k: int = None):
                 r["retrievals"][key] = r["retrievals"][key][:top_k]
 
     metrics_map = {}
+    k_values, metric_names = get_metric_params(top_k)
     for key in sorted(retrievals_keys):
-        metrics_map[key] = compute_metrics(results, key)
+        metrics_map[key] = compute_metrics(results, key, k_values=k_values)
 
-    print_comparison(metrics_map)
+    print_comparison(metrics_map, metric_names=metric_names)
     return metrics_map
 
 
@@ -863,10 +864,11 @@ def main():
             retrievals_keys.update(r["retrievals"].keys())
 
         metrics_map = {}
+        k_values, metric_names = get_metric_params(args.top_k)
         for key in sorted(retrievals_keys):
-            metrics_map[key] = compute_metrics(results, key)
+            metrics_map[key] = compute_metrics(results, key, k_values=k_values)
 
-        print_comparison(metrics_map)
+        print_comparison(metrics_map, metric_names=metric_names)
 
         metrics_path = str(
             RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{args.dense_strategy}_metrics.json"

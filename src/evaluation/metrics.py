@@ -2,6 +2,12 @@ DEFAULT_K_VALUES = [1, 3, 5, 10]
 DEFAULT_METRIC_NAMES = ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
 
 
+def get_metric_params(top_k: int):
+    k_values = sorted(set(DEFAULT_K_VALUES + [top_k]))
+    metric_names = [f"Recall@{k}" for k in k_values] + ["MRR"]
+    return k_values, metric_names
+
+
 def compute_metrics(results: list[dict], method_key: str, k_values: list[int] = None):
     if k_values is None:
         k_values = DEFAULT_K_VALUES

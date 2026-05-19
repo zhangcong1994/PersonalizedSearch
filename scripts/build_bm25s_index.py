@@ -6,7 +6,10 @@ Usage:
     python scripts/build_bm25s_index.py --limit 10000
 
     # Build full 2.3M index on server
-    python scripts/build_bm25s_index.py
+    python scripts/build_bm25s_index.py -j 16
+
+    # Sequential fallback (if multiprocessing fails)
+    python scripts/build_bm25s_index.py -j 1
 """
 import os
 import sys
@@ -14,6 +17,7 @@ import time
 import argparse
 import math
 import multiprocessing as mp
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -41,62 +45,92 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════
-# Multiprocessing tokenization (mirrors bm25_store pattern)
+# Multiprocessing tokenization
 # ═══════════════════════════════════════════════════════════
 
-_worker_stopwords = None
+def _get_mp_context():
+    if sys.platform == "linux" or sys.platform == "darwin":
+        return mp.get_context("spawn")
+    return mp.get_context()
 
 
 def _init_worker(stopwords_set):
-    global _worker_stopwords
-    _worker_stopwords = stopwords_set
     import jieba
     jieba.lcut("")
 
 
-def _tokenize_worker(text):
-    global _worker_stopwords
+def _chunk_tokenize(args):
+    chunk_texts, stopwords_set = args
     import jieba
-
-    tokens = jieba.lcut(text)
-    sw = _worker_stopwords
-    if sw:
-        tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1 and w not in sw]
-    else:
-        tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1]
-    return tokens
+    try:
+        results = []
+        for text in chunk_texts:
+            tokens = jieba.lcut(text)
+            if stopwords_set:
+                tokens = [w.strip() for w in tokens
+                          if w.strip() and len(w) > 1 and w not in stopwords_set]
+            else:
+                tokens = [w.strip() for w in tokens if w.strip() and len(w) > 1]
+            results.append(tokens)
+        return results
+    except Exception:
+        return RuntimeError(traceback.format_exc())
 
 
 def tokenize_parallel(texts, n_jobs, stopwords):
+    ctx = _get_mp_context()
     n_jobs = max(1, min(n_jobs, mp.cpu_count()))
-    chunksize = max(500, math.ceil(len(texts) / (n_jobs * 20)))
+
+    # Split into chunks: each worker gets one big chunk
+    n_total = len(texts)
+    n_chunks = n_jobs * 4
+    chunk_size = max(1, math.ceil(n_total / n_chunks))
+    chunks = []
+    for i in range(0, n_total, chunk_size):
+        chunks.append((texts[i:i + chunk_size], stopwords))
 
     logger.info(
-        f"Tokenizing {len(texts):,} passages "
-        f"(jieba, stopwords={len(stopwords)}, workers={n_jobs})..."
+        f"Tokenizing {n_total:,} passages "
+        f"(jieba, stopwords={len(stopwords)}, workers={n_jobs}, "
+        f"chunks={len(chunks)}/{chunk_size})..."
     )
     t0 = time.time()
 
-    with mp.Pool(
+    pool = ctx.Pool(
         processes=n_jobs,
         initializer=_init_worker,
         initargs=(stopwords,),
-        maxtasksperchild=max(1, len(texts) // (n_jobs * 5)),
-    ) as pool:
-        iterator = pool.imap_unordered(
-            _tokenize_worker, texts, chunksize=chunksize
-        )
+    )
+    try:
+        iterator = pool.imap_unordered(_chunk_tokenize, chunks, chunksize=1)
         if tqdm is not None:
-            iterator = tqdm(
-                iterator, total=len(texts), desc="Tokenizing",
-                unit="docs", mininterval=2,
+            iterator = tqdm(iterator, total=len(chunks),
+                            desc="Tokenizing", unit="chunk", mininterval=2)
+
+        tokenized = []
+        errors = []
+        for chunk_result in iterator:
+            if isinstance(chunk_result, Exception):
+                errors.append(str(chunk_result))
+            else:
+                tokenized.extend(chunk_result)
+
+        if errors:
+            logger.error(
+                f"{len(errors)}/{len(chunks)} chunks failed:\n{errors[0][:500]}"
             )
-        tokenized = list(iterator)
+            raise RuntimeError(
+                f"Tokenization failed: {len(errors)} chunks errored. "
+                f"First error: {errors[0][:200]}"
+            )
+    finally:
+        pool.terminate()
+        pool.join()
 
     elapsed = time.time() - t0
     n_tokens = sum(len(tk) for tk in tokenized)
     logger.info(
-        f"Tokenized in {elapsed:.1f}s ({len(texts)/elapsed:.0f} docs/s): "
+        f"Tokenized in {elapsed:.1f}s ({n_total/elapsed:.0f} docs/s): "
         f"{n_tokens:,} tokens, avg {n_tokens//max(len(tokenized),1)} tokens/doc"
     )
     return tokenized

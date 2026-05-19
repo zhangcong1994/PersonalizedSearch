@@ -163,7 +163,7 @@ def _parse_llm_output(output: str, parser: str) -> str | list[str]:
 
 
 def _load_dense_retriever(vector_db_dir: str, collection_name: str, device: str,
-                          search_type: str, model_id: str = None):
+                          search_type: str, model_id: str = None, top_k: int = 10):
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -189,9 +189,9 @@ def _load_dense_retriever(vector_db_dir: str, collection_name: str, device: str,
     count = vs._collection.count()
     logger.info(f"Dense retriever loaded: {count:,} docs in '{collection_name}'")
 
-    search_kwargs = {"k": 10}
+    search_kwargs = {"k": top_k}
     if search_type == "mmr":
-        search_kwargs["fetch_k"] = 20
+        search_kwargs["fetch_k"] = max(top_k * 2, 20)
         search_kwargs["lambda_mult"] = 0.5
 
     return vs.as_retriever(search_type=search_type, search_kwargs=search_kwargs), count
@@ -675,7 +675,7 @@ def run_experiment(
             vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
         dense_retriever, dense_count = _load_dense_retriever(
             vector_db_dir, collection_name, device,
-            search_type=dense_search_type, model_id=model_id,
+            search_type=dense_search_type, model_id=model_id, top_k=top_k,
         )
         logger.info(f"Dense retriever load: {time.time() - t0:.1f}s")
 
@@ -733,6 +733,219 @@ def run_experiment(
     return results, meta
 
 
+def run_experiments_batch(
+    experiment_ids: list[str],
+    sample_size: int,
+    top_k: int,
+    device: str,
+    vector_db_dir: str,
+    collection_name: str,
+    dense_search_type: str,
+    model_id: str = None,
+    llm_concurrency: int = 20,
+    use_bm25: bool = False,
+    bm25_index_dir: str = None,
+):
+    cfgs = {}
+    for eid in experiment_ids:
+        cfgs[eid] = get_experiment_config(eid)
+
+    queries = load_queries(QUERIES_FILE)
+    qrels = load_qrels(QRELS_FILE)
+
+    if sample_size > len(queries):
+        sample_size = len(queries)
+    sampled = queries[:sample_size]
+
+    valid_queries = [(qid, text) for qid, text in sampled if qid in qrels and qrels[qid]]
+    logger.info(f"Sampled queries with qrels: {len(valid_queries)} / {sample_size}")
+
+    from src.retrieval.rewrite_cache import RewriteCache
+    cache = RewriteCache(RESULTS_DIR)
+
+    pids, texts = load_passages(COLLECTION_FILE)
+    pool_queries = _filter_pool_queries(valid_queries, pids, qrels)
+
+    if not pool_queries:
+        print("WARNING: No queries have relevant passages in the loaded pool!")
+        return None
+
+    if use_bm25:
+        from src.retrieval.bm25_store import load as bm25_load, DEFAULT_STORE_DIR
+
+        if bm25_index_dir is None:
+            bm25_index_dir = str(DEFAULT_STORE_DIR)
+
+        print()
+        print("=" * 60)
+        print("  Loading BM25 Index (shared across all experiments)...")
+        print("=" * 60)
+        t0 = time.time()
+        bm25, tokenized_corpus = bm25_load(Path(bm25_index_dir))
+        logger.info(f"BM25 index load: {time.time() - t0:.1f}s")
+    else:
+        print()
+        print("=" * 60)
+        print("  Loading Dense Retriever (shared across all experiments)...")
+        print("=" * 60)
+        t0 = time.time()
+        if vector_db_dir is None:
+            vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
+        dense_retriever, dense_count = _load_dense_retriever(
+            vector_db_dir, collection_name, device,
+            search_type=dense_search_type, model_id=model_id, top_k=top_k,
+        )
+        logger.info(f"Dense retriever load: {time.time() - t0:.1f}s")
+
+    mode_tag = "bm25" if use_bm25 else dense_search_type
+    all_meta = {}
+
+    for idx, experiment_id in enumerate(experiment_ids):
+        cfg = cfgs[experiment_id]
+        strategy = cfg["strategy"]
+
+        print()
+        print("=" * 60)
+        print(f"  [{idx+1}/{len(experiment_ids)}] {experiment_id}: {cfg['name']}")
+        print(f"  Strategy: {strategy} | {len(pool_queries)} queries x {len(pids)} passages")
+        print("=" * 60)
+
+        llm_outputs = _ensure_llm_output(
+            experiment_id, valid_queries, cfg, cache, llm_concurrency,
+        )
+
+        if use_bm25:
+            if strategy == "none":
+                results = _run_bm25_strategy_none(
+                    bm25, tokenized_corpus, pool_queries, pids, qrels, top_k,
+                )
+            elif strategy == "single":
+                results = _run_bm25_strategy_single(
+                    bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+                )
+            elif strategy == "multi_query":
+                rrf_k = cfg.get("rrf_k", 60)
+                results = _run_bm25_strategy_multi_query(
+                    bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+                )
+            else:
+                raise ValueError(
+                    f"BM25 mode does not support strategy: {strategy} "
+                    f"(use none/single/multi_query)"
+                )
+        else:
+            if strategy == "none":
+                results = _run_strategy_none(
+                    dense_retriever, pool_queries, pids, qrels, top_k, dense_search_type,
+                )
+            elif strategy == "single":
+                results = _run_strategy_single(
+                    dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
+                )
+            elif strategy == "multi_query":
+                rrf_k = cfg.get("rrf_k", 60)
+                results = _run_strategy_multi_query(
+                    dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+                )
+            elif strategy == "hyde":
+                results = _run_strategy_hyde(
+                    dense_retriever, llm_outputs, pool_queries, qrels, top_k, with_original=False,
+                )
+            elif strategy == "hyde_rrf":
+                rrf_k = cfg.get("rrf_k", 60)
+                results = _run_strategy_hyde(
+                    dense_retriever, llm_outputs, pool_queries, qrels, top_k,
+                    rrf_k=rrf_k, with_original=True,
+                )
+            elif strategy == "prf":
+                results = _run_strategy_prf(
+                    dense_retriever, pool_queries, texts, pids, qrels, top_k, cfg,
+                )
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+
+        meta = {
+            "experiment_id": experiment_id,
+            "experiment_name": cfg["name"],
+            "strategy": strategy,
+            "sample_size": sample_size,
+            "total_passages": len(pids),
+            "pool_queries": len(pool_queries),
+            "top_k": top_k,
+            "dense_search_type": dense_search_type,
+            "collection_name": collection_name,
+            "dataset": "T2Ranking dev",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_path = str(
+            RESULTS_DIR / f"exp002_{experiment_id}_s{sample_size}_{mode_tag}.jsonl"
+        )
+        save_results(results, save_path, meta)
+
+        retrievals_keys = set()
+        for r in results:
+            retrievals_keys.update(r["retrievals"].keys())
+
+        metrics_map = {}
+        k_values, metric_names = get_metric_params(top_k)
+        for key in sorted(retrievals_keys):
+            metrics_map[key] = compute_metrics(results, key, k_values=k_values)
+
+        print_comparison(metrics_map, metric_names=metric_names)
+
+        metrics_path = str(
+            RESULTS_DIR / f"exp002_{experiment_id}_s{sample_size}_{mode_tag}_metrics.json"
+        )
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump({"meta": meta, "metrics": metrics_map}, f, ensure_ascii=False, indent=2)
+
+        all_meta[experiment_id] = metrics_map
+        logger.info(f"Results: {save_path} | Metrics: {metrics_path}")
+
+    _print_batch_summary(all_meta, experiment_ids, top_k)
+
+    return all_meta
+
+
+def _print_batch_summary(
+    all_metrics: dict[str, dict],
+    experiment_ids: list[str],
+    top_k: int,
+):
+    print()
+    print("=" * 80)
+    print("  BATCH SUMMARY — All Experiments")
+    print("=" * 80)
+
+    _, metric_names = get_metric_params(top_k)
+
+    extra_keys = set()
+    for metrics_map in all_metrics.values():
+        for method_key in metrics_map:
+            for k in metrics_map[method_key]:
+                if k not in metric_names:
+                    extra_keys.add(k)
+    all_names = metric_names + sorted(extra_keys)
+
+    col_width = max(10, max(len(eid) for eid in experiment_ids) + 2)
+    header = f"  {'Metric':<16}"
+    for eid in experiment_ids:
+        header += f" {eid:>{col_width}}"
+    print(header)
+    print("  " + "-" * (16 + len(experiment_ids) * (col_width + 1)))
+
+    for metric_name in all_names:
+        row = f"  {metric_name:<16}"
+        for eid in experiment_ids:
+            mm = all_metrics[eid]
+            primary = list(mm.keys())[0]
+            val = mm[primary].get(metric_name, float("nan"))
+            row += f" {val:>{col_width}.4f}"
+        print(row)
+
+    print("=" * 80)
+
+
 def load_and_print(load_path: str, top_k: int = None):
     results, meta = load_results(load_path)
 
@@ -777,7 +990,8 @@ def main():
     )
     parser.add_argument(
         "--experiment", required=True,
-        help="Experiment ID (e.g. E2a-B1, E2b-M1, E2c-H2, E2d-P1)",
+        help="Experiment ID(s). Use comma to run multiple (e.g. E2a-B0,E2a-B1,E2a-P1). "
+             "Batch mode loads the retriever once for all experiments.",
     )
     parser.add_argument("--sample", type=int, default=500, help="Number of queries to evaluate")
     parser.add_argument("--top-k", type=int, default=10, help="Top-K for retrieval")
@@ -821,24 +1035,47 @@ def main():
             print(f"  {eid:12s}  strategy={cfg['strategy']:12s}  {cfg['name']}")
         return 0
 
-    if args.experiment not in REGISTRY:
-        print(f"ERROR: Unknown experiment '{args.experiment}'")
-        print(f"Available: {list_experiments()}")
-        return 1
+    experiment_ids = [eid.strip() for eid in args.experiment.split(",")]
+
+    for eid in experiment_ids:
+        if eid not in REGISTRY:
+            print(f"ERROR: Unknown experiment '{eid}'")
+            print(f"Available: {list_experiments()}")
+            return 1
 
     if args.load:
         load_and_print(args.load, top_k=args.top_k)
         return 0
 
+    if len(experiment_ids) > 1:
+        print(f"Batch mode: {len(experiment_ids)} experiments, "
+              f"retriever loaded once for all")
+        run_experiments_batch(
+            experiment_ids=experiment_ids,
+            sample_size=args.sample,
+            top_k=args.top_k,
+            device=args.device,
+            vector_db_dir=args.vector_db,
+            collection_name=args.collection_name,
+            dense_search_type=args.dense_strategy,
+            model_id=args.embedding_model,
+            llm_concurrency=args.llm_concurrency,
+            use_bm25=args.bm25,
+            bm25_index_dir=args.bm25_index,
+        )
+        return 0
+
+    experiment_id = experiment_ids[0]
+
     save_path = args.save
     if not save_path:
         mode_tag = "bm25" if args.bm25 else args.dense_strategy
         save_path = str(
-            RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{mode_tag}.jsonl"
+            RESULTS_DIR / f"exp002_{experiment_id}_s{args.sample}_{mode_tag}.jsonl"
         )
 
     output = run_experiment(
-        experiment_id=args.experiment,
+        experiment_id=experiment_id,
         sample_size=args.sample,
         top_k=args.top_k,
         device=args.device,
@@ -854,7 +1091,7 @@ def main():
 
     print()
     print(f"Results saved to: {save_path}")
-    print(f"LLM cache: {RESULTS_DIR}/rewrite_cache/{args.experiment}.jsonl")
+    print(f"LLM cache: {RESULTS_DIR}/rewrite_cache/{experiment_id}.jsonl")
 
     if output is not None and output[0] is not None:
         results, meta = output
@@ -871,7 +1108,7 @@ def main():
         print_comparison(metrics_map, metric_names=metric_names)
 
         metrics_path = str(
-            RESULTS_DIR / f"exp002_{args.experiment}_s{args.sample}_{args.dense_strategy}_metrics.json"
+            RESULTS_DIR / f"exp002_{experiment_id}_s{args.sample}_{args.dense_strategy}_metrics.json"
         )
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump({

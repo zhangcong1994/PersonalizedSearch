@@ -591,6 +591,155 @@ def _run_bm25_strategy_multi_query(
     return results
 
 
+def _run_bm25_strategy_hyde(
+    bm25,
+    tokenized_corpus=None,
+    llm_outputs: dict[str, str | list[str]] = None,
+    pool_queries: list[tuple[str, str]] = None,
+    pids: list[str] = None,
+    qrels: dict[str, set[str]] = None,
+    top_k: int = 10,
+    rrf_k: int = None,
+    with_original: bool = False,
+) -> list[dict]:
+    from src.retrieval.bm25_store import tokenize_query
+
+    results = []
+    total_time = 0.0
+
+    for i, (qid, original_text) in enumerate(pool_queries):
+        fake_answer = llm_outputs.get(qid, original_text)
+        if isinstance(fake_answer, list):
+            fake_answer = fake_answer[0] if fake_answer else original_text
+
+        relevant = qrels.get(qid, set())
+        entry = {"qid": qid, "query": original_text, "relevant_pids": relevant, "retrievals": {}}
+
+        t0 = time.time()
+        if with_original:
+            hyde_tokens = tokenize_query(fake_answer)
+            hyde_scores = bm25.get_scores(hyde_tokens)
+            hyde_top = _topk_indices(hyde_scores, top_k * 2)
+
+            orig_tokens = tokenize_query(original_text)
+            orig_scores = bm25.get_scores(orig_tokens)
+            orig_top = _topk_indices(orig_scores, top_k * 2)
+
+            from collections import defaultdict
+            rrf_score_map: dict[str, float] = defaultdict(float)
+            for rank, j in enumerate(hyde_top):
+                rrf_score_map[pids[j]] += 1.0 / (rrf_k + rank + 1)
+            for rank, j in enumerate(orig_top):
+                rrf_score_map[pids[j]] += 1.0 / (rrf_k + rank + 1)
+            merged = sorted(rrf_score_map.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            key = "hyde_rrf"
+            entry["retrievals"][key] = [pid for pid, _ in merged]
+        else:
+            hyde_tokens = tokenize_query(fake_answer)
+            hyde_scores = bm25.get_scores(hyde_tokens)
+            hyde_top = _topk_indices(hyde_scores, top_k)
+            key = "hyde"
+            entry["retrievals"][key] = [pids[j] for j in hyde_top]
+
+        elapsed = time.time() - t0
+        total_time += elapsed
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Progress: {i+1}/{len(pool_queries)} | "
+                        f"BM25-HyDE {total_time/(i+1)*1000:.0f}ms/q")
+
+        results.append(entry)
+
+    logger.info(f"BM25 HyDE total search time: {total_time:.1f}s "
+                f"({total_time/len(pool_queries)*1000:.0f}ms/q)")
+    return results
+
+
+def _run_bm25_strategy_prf(
+    bm25,
+    texts: list[str],
+    pids: list[str],
+    pool_queries: list[tuple[str, str]] = None,
+    qrels: dict[str, set[str]] = None,
+    top_k: int = 10,
+    cfg: dict = None,
+) -> list[dict]:
+    import math
+    from collections import Counter
+    from src.retrieval.bm25_store import tokenize_query
+
+    prf_feedback_k = cfg.get("prf_top_k", 20)
+    num_terms = cfg.get("prf_num_terms", 5)
+    weighted = cfg.get("prf_weighted", False)
+
+    results = []
+    total_time = 0.0
+
+    for i, (qid, query_text) in enumerate(pool_queries):
+        relevant = qrels.get(qid, set())
+        entry = {"qid": qid, "query": query_text, "relevant_pids": relevant, "retrievals": {}}
+
+        t0 = time.time()
+
+        query_tokens = tokenize_query(query_text)
+        first_scores = bm25.get_scores(query_tokens)
+        first_top = _topk_indices(first_scores, prf_feedback_k)
+
+        feedback_texts = [texts[j] for j in first_top]
+
+        query_terms = set(query_tokens)
+        term_doc_counts: dict[str, Counter] = {}
+        for ft in feedback_texts:
+            ft_tokens = tokenize_query(ft)
+            for term in ft_tokens:
+                if term in query_terms or len(term) < 2:
+                    continue
+                term_doc_counts.setdefault(term, Counter())[ft] += 1
+
+        idf_cache = {}
+        for term in term_doc_counts:
+            df = sum(1 for t in feedback_texts if term in t)
+            idf_cache[term] = math.log((len(feedback_texts) - df + 0.5) / (df + 0.5) + 1.0)
+
+        if weighted:
+            term_scores = {}
+            for term, counter in term_doc_counts.items():
+                tf_sum = sum(counter.values())
+                term_scores[term] = tf_sum / len(feedback_texts) * idf_cache[term]
+        else:
+            term_scores = {}
+            for term, counter in term_doc_counts.items():
+                term_scores[term] = len(counter) * idf_cache[term]
+
+        sorted_terms = sorted(term_scores.items(), key=lambda x: x[1], reverse=True)
+        expansion_terms = [t for t, _ in sorted_terms[:num_terms]]
+
+        if expansion_terms:
+            expanded_tokens = query_tokens + expansion_terms
+        else:
+            expanded_tokens = query_tokens
+
+        second_scores = bm25.get_scores(expanded_tokens)
+        second_top = _topk_indices(second_scores, top_k)
+
+        elapsed = time.time() - t0
+        total_time += elapsed
+
+        key = f"prf_t{num_terms}"
+        if weighted:
+            key += "_w"
+        entry["retrievals"][key] = [pids[j] for j in second_top]
+        results.append(entry)
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Progress: {i+1}/{len(pool_queries)} | "
+                        f"BM25-PRF {total_time/(i+1)*1000:.0f}ms/q")
+
+    logger.info(f"BM25 PRF total search time: {total_time:.1f}s "
+                f"({total_time/len(pool_queries)*1000:.0f}ms/q)")
+    return results
+
+
 # ── main pipeline ────────────────────────────────────────
 
 
@@ -694,9 +843,23 @@ def run_experiment(
             results = _run_bm25_strategy_multi_query(
                 bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
             )
+        elif strategy == "hyde":
+            results = _run_bm25_strategy_hyde(
+                bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+                with_original=False,
+            )
+        elif strategy == "hyde_rrf":
+            rrf_k = cfg.get("rrf_k", 60)
+            results = _run_bm25_strategy_hyde(
+                bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+                rrf_k=rrf_k, with_original=True,
+            )
+        elif strategy == "prf":
+            results = _run_bm25_strategy_prf(
+                bm25, texts, pids, pool_queries, qrels, top_k, cfg,
+            )
         else:
-            raise ValueError(f"BM25 mode does not support strategy: {strategy} "
-                             f"(use none/single/multi_query)")
+            raise ValueError(f"Unknown strategy: {strategy}")
     else:
         print()
         print("=" * 60)
@@ -868,11 +1031,23 @@ def run_experiments_batch(
                 results = _run_bm25_strategy_multi_query(
                     bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
                 )
-            else:
-                raise ValueError(
-                    f"BM25 mode does not support strategy: {strategy} "
-                    f"(use none/single/multi_query)"
+            elif strategy == "hyde":
+                results = _run_bm25_strategy_hyde(
+                    bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+                    with_original=False,
                 )
+            elif strategy == "hyde_rrf":
+                rrf_k = cfg.get("rrf_k", 60)
+                results = _run_bm25_strategy_hyde(
+                    bm25, tokenized_corpus, llm_outputs, pool_queries, pids, qrels, top_k,
+                    rrf_k=rrf_k, with_original=True,
+                )
+            elif strategy == "prf":
+                results = _run_bm25_strategy_prf(
+                    bm25, texts, pids, pool_queries, qrels, top_k, cfg,
+                )
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
         else:
             if strategy == "none":
                 results = _run_strategy_none(
@@ -978,6 +1153,9 @@ def _print_batch_summary(
         row = f"  {metric_name:<16}"
         for eid in experiment_ids:
             mm = all_metrics[eid]
+            if not mm:
+                row += f" {'--':>{col_width}}"
+                continue
             primary = list(mm.keys())[0]
             val = mm[primary].get(metric_name, float("nan"))
             row += f" {val:>{col_width}.4f}"

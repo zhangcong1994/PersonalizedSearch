@@ -28,7 +28,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.utils.config import RAW_DATA_DIR
+from src.utils.config import RAW_DATA_DIR, DATA_ROOT
 from src.evaluation.data_loader import load_qrels, load_qrels_graded, clean_text
 from src.evaluation.result_cache import load_results
 
@@ -39,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_ROOT / "results"
+RESULTS_DIR = DATA_ROOT / "results"
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QRELS_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
 QRELS_GRADED_FILE = T2RANKING_DIR / "qrels.dev.tsv"

@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.utils.config import MODEL_CACHE_DIR
+from src.utils.config import MODEL_CACHE_DIR, DATA_ROOT
 from src.evaluation.metrics import compute_reranker_metrics
 
 logging.basicConfig(
@@ -37,8 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_ROOT / "results"
+RESULTS_DIR = DATA_ROOT / "results"
 DEFAULT_DATA_FILE = RESULTS_DIR / "exp004" / "exp004_prepared_data.jsonl"
 
 MODELS = {

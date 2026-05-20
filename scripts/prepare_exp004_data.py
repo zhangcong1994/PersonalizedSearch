@@ -38,7 +38,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = DATA_ROOT / "results"
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QRELS_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
@@ -69,7 +68,7 @@ OUTPUT_TOP_K = 50
 
 
 def load_route_data(route_id: str, file_relpath: str) -> dict[str, dict]:
-    filepath = PROJECT_ROOT / file_relpath
+    filepath = DATA_ROOT / file_relpath
     results, meta = load_results(str(filepath))
     route_data = {}
     for r in results:

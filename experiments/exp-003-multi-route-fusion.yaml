@@ -1,0 +1,303 @@
+# 实验计划：V0 多路召回粗排（RRF 融合）
+# exp-003: 多路召回路由组合 + 每路纳入条数消融 + RRF k 优化
+# 创建日期: 2026-05-20
+# 最后更新: 2026-05-20（修正文件路径 + per-route K 上限）
+
+meta:
+  experiment_id: exp-003
+  phase: V0
+  objective: "在不增加 LLM API 调用成本的前提下，通过多路召回 + RRF 融合提升 Recall@50，找到一个成本可控（3~5 路）的最优粗排方案"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-002 各路检索结果已保存（Dense + BM25 双后端，JSONL 格式）"
+  design_principle: "纯后处理实验——从 exp-002 已保存的各路检索排名中读取 pid/rank，做 RRF 融合。不需要重新跑检索或 LLM API 调用"
+  constraint_per_route_k: "每条路由最多保存了 50 条记录（exp-002 全部实验固定 top_k=50）。per-route K 的消融范围因此限制在 [20, 30, 50]"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么 exp-002 不够
+# =============================================================================
+
+motivation:
+  exp002_ceiling:
+    best_dense_single: 0.6531  # E2a-P2, 领域 few-shot 单查询改写
+    best_dense_fusion: 0.6819  # E2c-H2, HyDE + 原查询 RRF (2 路)
+    best_bm25_fusion:  0.1944  # E2c-H2, HyDE + 原查询 RRF (BM25)
+    theoretical_upper: ~1.0     # 91.5% 查询 ≤10 个 qrels
+    remaining_gap:     "~32%"
+
+  why_exp003:
+    reason: "exp-002 验证了各条独立路由的上限，但所有 RRF 融合都限定在后端内部（Dense-Dense 或 BM25-BM25）。以下问题未回答："
+    unanswered:
+      - "Q1: 跨后端 RRF（Dense + BM25 异质检索器）能否带来互补增益？"
+      - "Q2: 每路纳入多少条（per-route K）对 RRF 融合效果影响多大？"
+      - "Q3: 3~5 路融合能否超越 exp-002 已知最优的 2 路融合？"
+      - "Q4: RRF 的 k 参数在真实多路场景下的最优值是多少？"
+      - "Q5: 在成本可控的前提下（≤2 次 LLM API 调用），哪组路由组合性价比最高？"
+
+  core_hypothesis:
+    main: "Dense 和 BM25 召回的 passage 集合重叠度低——前者靠语义相似度，后者靠精确 term 匹配。跨后端 RRF 融合能覆盖更多互补的相关 passage"
+    secondary: "每路纳入条数（per-route K）存在甜蜜点——太少会截断有用信号，太多会引入噪声稀释 RRF 分数"
+    cost_aware: "D-P2（改写）和 D-HyDE（假答案）各有 1 次 LLM 调用成本。最优方案应在 ≤2 次 LLM 调用的约束下最大化 R@50"
+
+  future_extension:
+    per_route_differentiated_k:
+      description: "当前实验中所有路由使用统一的 per-route K。但在实际系统中，不同路由的质量差异很大（如 Dense 路 R@50 ~60% vs BM25 路 R@50 ~17%），可能应对高质量路取更多条、低质量路取更少条"
+      status: "暂不纳入 exp-003，作为后续延伸方向"
+
+
+# =============================================================================
+# 第二部分：评估数据与指标
+# =============================================================================
+
+evaluation:
+  source: "T2Ranking dev（复用 exp-001 / exp-002）"
+  queries_file: "data/raw/t2ranking/queries.dev.tsv"
+  qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+
+  data_split:
+    total_sampled: 2000
+    queries_with_qrels: 1824
+    split_method: "随机分割（固定 seed=42，按 qid 去重保证不泄漏）"
+    validation:
+      size: 912
+      purpose: "调参——选择最优路由组合、per-route K、RRF k"
+    test:
+      size: 912
+      purpose: "最终评估——用验证集选出的最优配置出最终指标"
+
+  input_sources:
+    description: "所有路由的检索排名来自 exp-002 已保存的 JSONL 文件（存放在 results/exp002_bm25_details/ 和 results/exp002_dense_details/），不需要重新检索"
+    data_format:
+      note: "每条 JSONL 第一行为 __meta__ 元数据，后续每行为一个 query 的检索结果。每条路由最多 50 条 (pid, score, rank) 记录"
+    routes:
+      D-B0:
+        file: "results/exp002_dense_details/exp002_E2a-B0_s2000_similarity.jsonl"
+        backend: "Dense (moka-ai/m3e-base, 768-dim)"
+        retrievals_key: "similarity"
+        max_entries: 50
+        description: "原始查询向量检索"
+      D-P2:
+        file: "results/exp002_dense_details/exp002_E2a-P2_s2000_similarity.jsonl"
+        backend: "Dense (moka-ai/m3e-base, 768-dim)"
+        retrievals_key: "similarity"
+        max_entries: 50
+        description: "领域 few-shot 改写后向量检索"
+      D-HyDE:
+        file: "results/exp002_dense_details/exp002_E2c-H2_s2000_similarity.jsonl"
+        backend: "Dense (moka-ai/m3e-base, 768-dim)"
+        retrievals_key: "hyde_sub"
+        max_entries: 50
+        description: "HyDE 假答案向量检索（来自 E2c-H2 的 hyde_sub 路）"
+      B-B0:
+        file: "results/exp002_bm25_details/exp002_E2a-B0_s2000_bm25.jsonl"
+        backend: "BM25 (BM25Okapi, jieba 分词)"
+        retrievals_key: "bm25"
+        max_entries: 50
+        description: "原始查询 BM25 检索"
+      B-P2:
+        file: "results/exp002_bm25_details/exp002_E2a-P2_s2000_bm25.jsonl"
+        backend: "BM25 (BM25Okapi, jieba 分词)"
+        retrievals_key: "bm25"
+        max_entries: 50
+        description: "领域 few-shot 改写后 BM25 检索"
+
+  llm_cost:
+    rewrite:
+      api: "deepseek-chat"
+      tokens: "~200 input + ~80 output"
+      cost_per_call: "¥0.00036"
+    hyde:
+      api: "deepseek-chat"
+      tokens: "~200 input + ~150 output"
+      cost_per_call: "¥0.00050"
+    scheme_costs:
+      S0: "0 调用（纯原始查询，基线）"
+      S1: "1 调用（仅改写）"
+      S2: "2 调用（改写 + HyDE）"
+      S3: "2 调用（改写 + HyDE + 原查询复用）"
+      S4: "2 调用（S3 + BM25 原查询，无额外 LLM 成本）"
+      S5: "2 调用（S4 + BM25 改写，复用改写结果）"
+
+  metrics:
+    core:
+      - Recall@10
+      - Recall@20
+      - Recall@50
+      - MRR
+    supplementary:
+      - Hit@10 / Hit@20 / Hit@50
+      - Precision@10 / Precision@20 / Precision@50
+    primary_metric: Recall@50
+    note: "Recall@50 是粗排阶段的核心指标——给 Reranker 提供充足的候选池。由于不涉及 LLM 生成，不需要 BLEU/ROUGE 等生成指标"
+
+
+# =============================================================================
+# 第三部分：实验分组
+# =============================================================================
+
+experiment_groups:
+
+  # ========== Group A：纯 Dense 路由消融 ==========
+  dense_only:
+    objective: "在 Pure Dense 后端内，消融路由数量和类型对 RRF 融合效果的影响。不引入 BM25，作为干净的 Dense 多路融合基线"
+    fixed:
+      backend: "Dense (moka-ai/m3e-base, 768-dim)"
+      fusion: "RRF (k=60，阶段一固定)"
+      output_top_k: 50
+      passage_pool: "全量 230 万"
+    variables:
+      route_combination: "见下方各组"
+      per_route_k: [20, 30, 50]
+      note: "per-route K 上限为 50，因为 exp-002 所有实验固定 top_k=50，每路最多只保存了 50 条记录"
+
+    groups:
+      - id: "S0"
+        name: "baseline: Dense 原查询"
+        routes: ["D-B0"]
+        route_count: 1
+        api_calls: 0
+        rationale: "基线——如果任何多路方案不能显著超越 S0，则多路融合在 Dense 端无意义"
+
+      - id: "S1"
+        name: "Dense 原查询 + 改写 (2路)"
+        routes: ["D-B0", "D-P2"]
+        route_count: 2
+        api_calls: 1
+        rationale: "原查询保留精确语义，改写注入扩展术语。验证改写能否与原查询互补（而非替代）"
+
+      - id: "S2"
+        name: "Dense 最优改写 + HyDE (2路)"
+        routes: ["D-P2", "D-HyDE"]
+        route_count: 2
+        api_calls: 2
+        rationale: "去掉原查询，只用质量最高的两条扩展路由。验证原查询是否冗余——如果 S2 ≥ S1，说明改写+HyDE 已覆盖原查询的语义空间"
+
+      - id: "S3"
+        name: "Dense 三路全上"
+        routes: ["D-B0", "D-P2", "D-HyDE"]
+        route_count: 3
+        api_calls: 2
+        rationale: "三路全部参与 RRF。验证三条 Dense 路由是否有边际增益（S3 vs S1）——如果 S3 ≈ S1，说明多余的路只贡献噪声"
+
+  # ========== Group B：Dense + BM25 跨后端融合 ==========
+  cross_backend:
+    objective: "在 Dense 三路基础上加入 BM25 路由，验证异质检索器的互补增益"
+    fixed:
+      dense_backend: "Dense (moka-ai/m3e-base, 768-dim)"
+      bm25_backend: "BM25 (BM25Okapi, jieba 分词)"
+      fusion: "RRF (k=60，阶段一固定)"
+      output_top_k: 50
+      passage_pool: "全量 230 万"
+    variables:
+      bm25_routes: "见下方各组"
+      per_route_k: [20, 30, 50]
+
+    groups:
+      - id: "S4"
+        name: "Dense 三路 + BM25 原查询 (4路)"
+        routes: ["D-B0", "D-P2", "D-HyDE", "B-B0"]
+        route_count: 4
+        api_calls: 2
+        rationale: "在 Dense 三路基础上加入 BM25 原查询。BM25 靠精确 term 匹配，召回的 passage 集合与 Dense 重叠度预期较低。如果 S4 > S3，证明异质检索器有互补价值"
+
+      - id: "S5"
+        name: "Dense 三路 + BM25 双路 (5路)"
+        routes: ["D-B0", "D-P2", "D-HyDE", "B-B0", "B-P2"]
+        route_count: 5
+        api_calls: 2
+        rationale: "BM25 也加入改写版本。验证 BM25 改写是否有额外的 term 层面互补。如果 S5 ≈ S4，说明 BM25 改写不贡献额外增益"
+
+  # ========== 阶段一消融矩阵 ==========
+  phase1_ablation:
+    description: "验证集上，固定 RRF k=60，所有 6 组 × 3 个 per-route K = 18 个实验点"
+    design_matrix:
+      rows: ["S0", "S1", "S2", "S3", "S4", "S5"]
+      columns: ["K=20", "K=30", "K=50"]
+      total_experiments: 18
+    note: "K 上限为 50（exp-002 各路最大保存条数）。K=20 用于测试「少取能否降噪」，K=30 为中间档"
+    output: "选出 Recall@50 最高的 3 个 (方案, K) 组合进入阶段二 RRF k 消融"
+
+  # ========== 阶段二 RRF k 消融 ==========
+  phase2_rrf_k:
+    description: "对验证集上 Recall@50 top-3 的 (方案, K) 组合，消融 RRF k 参数"
+    variable:
+      rrf_k: [30, 60, 90]
+    total_experiments: 9
+    output: "确定最终最优配置（路由组合 + per-route K + RRF k）"
+
+  # ========== 阶段三最终评估 ==========
+  phase3_test:
+    description: "用验证集选出的最优配置在测试集上跑最终指标"
+    experiments: "top-3 配置（主要关注第 1 名）"
+    output:
+      - "最终 Recall@10/20/50, MRR"
+      - "各路独立指标（便于分析哪路的贡献最大）"
+      - "各路召回重叠度分析（Jaccard overlap of retrieved pid sets）"
+
+
+# =============================================================================
+# 第四部分：分析问题
+# =============================================================================
+
+analysis_questions:
+
+  route_combination:
+    - "Q1: Dense 三路（S3）是否显著超越 Dense 二路（S1）？如果增益 < 1%，说明 2 路是甜蜜点"
+    - "Q2: 去掉原查询（S2 vs S1）后 R@50 是否下降？如果是，说明原查询在 Dense 端仍不可替代"
+    - "Q3: BM25 的加入（S4 vs S3）是否带来统计显著的增益？如有，跨后端路线值得深入"
+
+  per_route_k:
+    - "Q4: per-route K 的最优值是多少？K=20 是否因截断丢失了有用信号？K=50 是否引入了过多噪声？"
+    - "Q5: per-route K 的最优值是否因路由组合不同而变化？（如 BM25 路是否需要更大的 K 才能发挥作用——但 K 上限为 50）"
+
+  rrf_k:
+    - "Q6: RRF k 的最优值是多少？是否偏离文献常用的 k=60？"
+
+  overlap_analysis:
+    - "Q7: Dense 和 BM25 各路召回的 passage 集合 Jaccard 重叠度是多少？重叠度越低，互补潜力越大"
+    - "Q8: 最优方案中，哪些相关 passage 是「仅被某一条路召回」的？各路独有贡献占比如何？"
+
+  cost_efficiency:
+    - "Q9: 在 ≤2 次 LLM API 调用的约束下，最优方案的 R@50 是多少？比 S0 基线提升了多少？"
+
+
+# =============================================================================
+# 第五部分：实现说明
+# =============================================================================
+
+implementation:
+
+  script: "scripts/evaluate_exp003.py"
+  description: "纯后处理脚本——从 exp-002 JSONL 文件中读取各路的 (qid, pid, rank)、按 split 分配 qid 到验证集/测试集、对每组实验做 RRF 融合、计算指标"
+
+  input_files:
+    - "results/exp002_dense_details/exp002_E2a-B0_s2000_similarity.jsonl"     # D-B0: similarity key
+    - "results/exp002_dense_details/exp002_E2a-P2_s2000_similarity.jsonl"     # D-P2: similarity key
+    - "results/exp002_dense_details/exp002_E2c-H2_s2000_similarity.jsonl"     # D-HyDE: hyde_sub key
+    - "results/exp002_bm25_details/exp002_E2a-B0_s2000_bm25.jsonl"           # B-B0: bm25 key
+    - "results/exp002_bm25_details/exp002_E2a-P2_s2000_bm25.jsonl"           # B-P2: bm25 key
+
+  data_flow: |
+    1. 加载 5 个 JSONL 文件（跳过首行 __meta__），按 qid 对齐各路检索结果
+    2. 固定 seed=42，随机 split qid → validation (50%) + test (50%)
+    3. 对每个 split：
+       a. 对每组实验 (S0-S5)，按指定 per-route K 截断各路 → RRF(k=60) 融合 → top-50
+       b. 计算 Recall@k / MRR / Hit@k / Precision@k
+    4. 验证集：选出 Recall@50 top-3 的 (方案, K) → RRF k 消融
+    5. 测试集：用最优配置出最终指标
+
+  rrf_formula: "RRF_score(pid) = Σ_i 1 / (k + rank_i(pid))，其中 rank_i 是 pid 在第 i 路中的排名"
+
+  qid_alignment:
+    note: "不同实验的 JSONL 文件中 qid 顺序可能不同，需要按 qid 对齐而非按行号对齐。qid 在各文件中一致（都是从 queries.dev.tsv 相同顺序采样的 2000 条）"
+
+  data_constraint:
+    max_per_route: 50
+    note: "exp-002 所有实验固定 top_k=50，每路最多保存 50 条 (pid, score, rank)。per-route K 的消融上限因此为 50，无法测试 K=100 等更大值"
+
+  validation_considerations:
+    - "验证集用于调参（路由组合 + per-route K + RRF k），测试集仅用于最终报告"
+    - "验证集和测试集的 R@50 绝对值会不同（因为子集上的 qrels 分布不同），这是正常的"
+    - "最优配置的选择标准：验证集 Recall@50（主指标），MRR 为辅助"
+    - "固定 seed=42 保证可复现"

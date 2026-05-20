@@ -1,5 +1,13 @@
-DEFAULT_K_VALUES = [1, 3, 5, 10]
-DEFAULT_METRIC_NAMES = ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+DEFAULT_K_VALUES = [10, 20, 50]
+DEFAULT_METRIC_NAMES = ["Recall@10", "Recall@20", "Recall@50", "MRR"]
+
+
+def _extract_pids(retrieved_items: list) -> list[str]:
+    if not retrieved_items:
+        return []
+    if isinstance(retrieved_items[0], dict):
+        return [item["pid"] for item in retrieved_items]
+    return retrieved_items
 
 
 def get_metric_params(top_k: int):
@@ -12,6 +20,8 @@ def compute_metrics(results: list[dict], method_key: str, k_values: list[int] = 
     if k_values is None:
         k_values = DEFAULT_K_VALUES
 
+    max_k = max(k_values)
+
     metrics = {}
     for k in k_values:
         recalls = []
@@ -20,7 +30,8 @@ def compute_metrics(results: list[dict], method_key: str, k_values: list[int] = 
         hits = 0
 
         for r in results:
-            retrieved_pids = r["retrievals"].get(method_key, [])[:k]
+            retrieved_items = r["retrievals"].get(method_key, [])[:max_k]
+            retrieved_pids = _extract_pids(retrieved_items)[:k]
             relevant = r["relevant_pids"]
 
             hits_in_k = sum(1 for pid in retrieved_pids if pid in relevant)

@@ -194,14 +194,14 @@ def _load_dense_retriever(vector_db_dir: str, collection_name: str, device: str,
         search_kwargs["fetch_k"] = max(top_k * 2, 20)
         search_kwargs["lambda_mult"] = 0.5
 
-    return vs.as_retriever(search_type=search_type, search_kwargs=search_kwargs), count
+    return vs.as_retriever(search_type=search_type, search_kwargs=search_kwargs), vs, count
 
 
 # ── strategy handlers ────────────────────────────────────
 
 
 def _run_strategy_none(
-    dense_retriever,
+    vs,
     pool_queries: list[tuple[str, str]],
     pids: list[str],
     qrels: dict[str, set[str]],
@@ -216,12 +216,15 @@ def _run_strategy_none(
         entry = {"qid": qid, "query": query_text, "relevant_pids": relevant, "retrievals": {}}
 
         t0 = time.time()
-        docs = dense_retriever.invoke(query_text)
+        docs_with_scores = vs.similarity_search_with_score(query_text, k=top_k)
         dense_elapsed = time.time() - t0
         dense_total_time += dense_elapsed
 
         entry["retrievals"][dense_search_type] = [
-            doc.metadata.get("pid", "?") for doc in docs[:top_k]
+            {"pid": doc.metadata.get("pid", "?"),
+             "score": round(1.0 - float(score), 6),
+             "rank": rank}
+            for rank, (doc, score) in enumerate(docs_with_scores, 1)
         ]
         results.append(entry)
 
@@ -237,7 +240,7 @@ def _run_strategy_none(
 
 
 def _run_strategy_single(
-    dense_retriever,
+    vs,
     llm_outputs: dict[str, str | list[str]],
     pool_queries: list[tuple[str, str]],
     pids: list[str],
@@ -257,12 +260,15 @@ def _run_strategy_single(
         entry = {"qid": qid, "query": rewritten, "relevant_pids": relevant, "retrievals": {}}
 
         t0 = time.time()
-        docs = dense_retriever.invoke(rewritten)
+        docs_with_scores = vs.similarity_search_with_score(rewritten, k=top_k)
         dense_elapsed = time.time() - t0
         dense_total_time += dense_elapsed
 
         entry["retrievals"][dense_search_type] = [
-            doc.metadata.get("pid", "?") for doc in docs[:top_k]
+            {"pid": doc.metadata.get("pid", "?"),
+             "score": round(1.0 - float(score), 6),
+             "rank": rank}
+            for rank, (doc, score) in enumerate(docs_with_scores, 1)
         ]
         results.append(entry)
 
@@ -278,7 +284,7 @@ def _run_strategy_single(
 
 
 def _run_strategy_multi_query(
-    dense_retriever,
+    vs,
     llm_outputs: dict[str, str | list[str]],
     pool_queries: list[tuple[str, str]],
     pids: list[str],
@@ -286,9 +292,8 @@ def _run_strategy_multi_query(
     top_k: int,
     rrf_k: int,
 ) -> list[dict]:
-    from src.retrieval.multi_query import MultiQueryRetriever
+    from collections import defaultdict
 
-    mqr = MultiQueryRetriever(dense_retriever, pids, rrf_k=rrf_k)
     results = []
     total_time = 0.0
 
@@ -306,12 +311,29 @@ def _run_strategy_multi_query(
         }
 
         t0 = time.time()
-        merged = mqr.retrieve(sub_queries, top_k=top_k, original_query=original_text)
+        rrf_scores: dict[str, float] = defaultdict(float)
+        sub_query_top_k = top_k * 2
+
+        for si, sq in enumerate(sub_queries):
+            docs_with_scores = vs.similarity_search_with_score(sq, k=sub_query_top_k)
+            sub_results = []
+            for rank, (doc, dist) in enumerate(docs_with_scores, 1):
+                pid = doc.metadata.get("pid", "?")
+                score = round(1.0 - float(dist), 6)
+                sub_results.append({"pid": pid, "score": score, "rank": rank})
+                if rank <= sub_query_top_k:
+                    rrf_scores[pid] += 1.0 / (rrf_k + rank)
+            entry["retrievals"][f"sub_query_{si}"] = sub_results
+
+        merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         elapsed = time.time() - t0
         total_time += elapsed
 
         key = f"multi_query_rrf@k{rrf_k}"
-        entry["retrievals"][key] = merged
+        entry["retrievals"][key] = [
+            {"pid": pid, "score": round(score, 6), "rank": rank}
+            for rank, (pid, score) in enumerate(merged, 1)
+        ]
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -326,7 +348,7 @@ def _run_strategy_multi_query(
 
 
 def _run_strategy_hyde(
-    dense_retriever,
+    vs,
     llm_outputs: dict[str, str | list[str]],
     pool_queries: list[tuple[str, str]],
     qrels: dict[str, set[str]],
@@ -334,9 +356,9 @@ def _run_strategy_hyde(
     rrf_k: int = None,
     with_original: bool = False,
 ) -> list[dict]:
-    from src.retrieval.hyde import HyDERetriever
+    from collections import defaultdict
 
-    hyde = HyDERetriever(dense_retriever, rrf_k=rrf_k or 60)
+    rrf_k = rrf_k or 60
     results = []
     total_time = 0.0
 
@@ -355,15 +377,51 @@ def _run_strategy_hyde(
 
         t0 = time.time()
         if with_original:
-            merged = hyde.retrieve_hyde_with_query(original_text, fake_answer, top_k=top_k)
+            sub_query_top_k = top_k * 2
+
+            hyde_docs = vs.similarity_search_with_score(fake_answer, k=sub_query_top_k)
+            entry["retrievals"]["hyde_sub"] = [
+                {"pid": doc.metadata.get("pid", "?"),
+                 "score": round(1.0 - float(dist), 6),
+                 "rank": rank}
+                for rank, (doc, dist) in enumerate(hyde_docs, 1)
+            ]
+
+            orig_docs = vs.similarity_search_with_score(original_text, k=sub_query_top_k)
+            entry["retrievals"]["original_sub"] = [
+                {"pid": doc.metadata.get("pid", "?"),
+                 "score": round(1.0 - float(dist), 6),
+                 "rank": rank}
+                for rank, (doc, dist) in enumerate(orig_docs, 1)
+            ]
+
+            rrf_scores: dict[str, float] = defaultdict(float)
+            for rank, (doc, _) in enumerate(hyde_docs, 1):
+                pid = doc.metadata.get("pid", "?")
+                rrf_scores[pid] += 1.0 / (rrf_k + rank)
+            for rank, (doc, _) in enumerate(orig_docs, 1):
+                pid = doc.metadata.get("pid", "?")
+                rrf_scores[pid] += 1.0 / (rrf_k + rank)
+
+            merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
             key = "hyde_rrf"
+            entry["retrievals"][key] = [
+                {"pid": pid, "score": round(score, 6), "rank": rank}
+                for rank, (pid, score) in enumerate(merged, 1)
+            ]
         else:
-            merged = hyde.retrieve_hyde_only(fake_answer, top_k=top_k)
+            hyde_docs = vs.similarity_search_with_score(fake_answer, k=top_k)
             key = "hyde"
+            entry["retrievals"][key] = [
+                {"pid": doc.metadata.get("pid", "?"),
+                 "score": round(1.0 - float(dist), 6),
+                 "rank": rank}
+                for rank, (doc, dist) in enumerate(hyde_docs, 1)
+            ]
+
         elapsed = time.time() - t0
         total_time += elapsed
 
-        entry["retrievals"][key] = merged
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -378,7 +436,7 @@ def _run_strategy_hyde(
 
 
 def _run_strategy_prf(
-    dense_retriever,
+    vs,
     pool_queries: list[tuple[str, str]],
     passages: list[str],
     pids: list[str],
@@ -386,35 +444,82 @@ def _run_strategy_prf(
     top_k: int,
     cfg: dict,
 ) -> list[dict]:
-    from src.retrieval.prf import PRFRetriever
+    import math
+    from collections import Counter
 
-    prf = PRFRetriever(
-        dense_retriever,
-        prf_top_k=cfg.get("prf_top_k", 20),
-        num_terms=cfg.get("prf_num_terms", 5),
-        weighted=cfg.get("prf_weighted", False),
-    )
+    prf_feedback_k = cfg.get("prf_top_k", 50)
+    num_terms = cfg.get("prf_num_terms", 5)
+    weighted = cfg.get("prf_weighted", False)
+
     results = []
     total_time = 0.0
 
-    for i, (qid, original_text) in enumerate(pool_queries):
+    for i, (qid, query_text) in enumerate(pool_queries):
         relevant = qrels.get(qid, set())
         entry = {
             "qid": qid,
-            "query": original_text,
+            "query": query_text,
             "relevant_pids": relevant,
             "retrievals": {},
         }
 
         t0 = time.time()
-        retrieved = prf.retrieve(original_text, passages, pids, top_k=top_k)
+
+        first_docs = vs.similarity_search_with_score(query_text, k=prf_feedback_k)
+        first_pass = [
+            {"pid": doc.metadata.get("pid", "?"),
+             "score": round(1.0 - float(dist), 6),
+             "rank": rank}
+            for rank, (doc, dist) in enumerate(first_docs, 1)
+        ]
+        entry["retrievals"]["prf_first_pass"] = first_pass
+
+        feedback_pids = [item["pid"] for item in first_pass]
+        feedback_indices = [pids.index(pid) for pid in feedback_pids if pid in pids]
+        feedback_texts = [passages[j] for j in feedback_indices]
+
+        query_terms = set(query_text)
+        term_doc_counts: dict[str, Counter] = {}
+        for ft in feedback_texts:
+            for term in ft:
+                if term in query_terms:
+                    continue
+                term_doc_counts.setdefault(term, Counter())[ft] += 1
+
+        idf_cache = {}
+        for term in term_doc_counts:
+            df = sum(1 for t in feedback_texts if term in t)
+            idf_cache[term] = math.log((len(feedback_texts) - df + 0.5) / (df + 0.5) + 1.0)
+
+        if weighted:
+            term_scores = {}
+            for term, counter in term_doc_counts.items():
+                tf_sum = sum(counter.values())
+                term_scores[term] = tf_sum / len(feedback_texts) * idf_cache[term]
+        else:
+            term_scores = {}
+            for term, counter in term_doc_counts.items():
+                term_scores[term] = len(counter) * idf_cache[term]
+
+        sorted_terms = sorted(term_scores.items(), key=lambda x: x[1], reverse=True)
+        expansion_terms = [t for t, _ in sorted_terms[:num_terms]]
+
+        expanded_query = query_text + " " + " ".join(expansion_terms) if expansion_terms else query_text
+
+        second_docs = vs.similarity_search_with_score(expanded_query, k=top_k)
+        key = f"prf_t{num_terms}"
+        if weighted:
+            key += "_w"
+        entry["retrievals"][key] = [
+            {"pid": doc.metadata.get("pid", "?"),
+             "score": round(1.0 - float(dist), 6),
+             "rank": rank}
+            for rank, (doc, dist) in enumerate(second_docs, 1)
+        ]
+
         elapsed = time.time() - t0
         total_time += elapsed
 
-        key = f"prf_t{cfg.get('prf_num_terms', 5)}"
-        if cfg.get("prf_weighted"):
-            key += "_w"
-        entry["retrievals"][key] = retrieved
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -490,7 +595,10 @@ def _run_bm25_strategy_none(
         elapsed = time.time() - t0
         total_time += elapsed
 
-        entry["retrievals"]["bm25"] = [pids[j] for j in top_idx]
+        entry["retrievals"]["bm25"] = [
+            {"pid": pids[j], "score": round(float(scores[j]), 6), "rank": rank}
+            for rank, j in enumerate(top_idx, 1)
+        ]
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -530,7 +638,10 @@ def _run_bm25_strategy_single(
         elapsed = time.time() - t0
         total_time += elapsed
 
-        entry["retrievals"]["bm25"] = [pids[j] for j in top_idx]
+        entry["retrievals"]["bm25"] = [
+            {"pid": pids[j], "score": round(float(scores[j]), 6), "rank": rank}
+            for rank, j in enumerate(top_idx, 1)
+        ]
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -548,7 +659,7 @@ def _run_bm25_strategy_multi_query(
     pool_queries: list[tuple[str, str]] = None,
     pids: list[str] = None,
     qrels: dict[str, set[str]] = None,
-    top_k: int = 10,
+    top_k: int = 50,
     rrf_k: int = 60,
 ) -> list[dict]:
     from collections import defaultdict
@@ -567,20 +678,31 @@ def _run_bm25_strategy_multi_query(
 
         t0 = time.time()
         rrf_scores: dict[str, float] = defaultdict(float)
-        for rank, sq in enumerate(sub_queries):
+        sub_query_top_k = top_k * 2
+        for si, sq in enumerate(sub_queries):
             tokenized_sq = tokenize_query(sq)
             sq_scores = bm25.get_scores(tokenized_sq)
-            top_idx = _topk_indices(sq_scores, top_k * 2)
+            top_idx = _topk_indices(sq_scores, sub_query_top_k)
+            sub_results = []
             for local_rank, j in enumerate(top_idx):
                 pid = pids[j]
                 rrf_scores[pid] += 1.0 / (rrf_k + local_rank + 1)
+                sub_results.append({
+                    "pid": pid,
+                    "score": round(float(sq_scores[j]), 6),
+                    "rank": local_rank + 1,
+                })
+            entry["retrievals"][f"bm25_sub_{si}"] = sub_results
 
         merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         elapsed = time.time() - t0
         total_time += elapsed
 
         key = f"bm25_multi_query_rrf@k{rrf_k}"
-        entry["retrievals"][key] = [pid for pid, _ in merged]
+        entry["retrievals"][key] = [
+            {"pid": pid, "score": round(score, 6), "rank": rank}
+            for rank, (pid, score) in enumerate(merged, 1)
+        ]
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -598,12 +720,14 @@ def _run_bm25_strategy_hyde(
     pool_queries: list[tuple[str, str]] = None,
     pids: list[str] = None,
     qrels: dict[str, set[str]] = None,
-    top_k: int = 10,
+    top_k: int = 50,
     rrf_k: int = None,
     with_original: bool = False,
 ) -> list[dict]:
+    from collections import defaultdict
     from src.retrieval.bm25_store import tokenize_query
 
+    rrf_k = rrf_k or 60
     results = []
     total_time = 0.0
 
@@ -617,15 +741,24 @@ def _run_bm25_strategy_hyde(
 
         t0 = time.time()
         if with_original:
+            sub_query_top_k = top_k * 2
+
             hyde_tokens = tokenize_query(fake_answer)
             hyde_scores = bm25.get_scores(hyde_tokens)
-            hyde_top = _topk_indices(hyde_scores, top_k * 2)
+            hyde_top = _topk_indices(hyde_scores, sub_query_top_k)
+            entry["retrievals"]["hyde_sub"] = [
+                {"pid": pids[j], "score": round(float(hyde_scores[j]), 6), "rank": rank}
+                for rank, j in enumerate(hyde_top, 1)
+            ]
 
             orig_tokens = tokenize_query(original_text)
             orig_scores = bm25.get_scores(orig_tokens)
-            orig_top = _topk_indices(orig_scores, top_k * 2)
+            orig_top = _topk_indices(orig_scores, sub_query_top_k)
+            entry["retrievals"]["original_sub"] = [
+                {"pid": pids[j], "score": round(float(orig_scores[j]), 6), "rank": rank}
+                for rank, j in enumerate(orig_top, 1)
+            ]
 
-            from collections import defaultdict
             rrf_score_map: dict[str, float] = defaultdict(float)
             for rank, j in enumerate(hyde_top):
                 rrf_score_map[pids[j]] += 1.0 / (rrf_k + rank + 1)
@@ -633,13 +766,19 @@ def _run_bm25_strategy_hyde(
                 rrf_score_map[pids[j]] += 1.0 / (rrf_k + rank + 1)
             merged = sorted(rrf_score_map.items(), key=lambda x: x[1], reverse=True)[:top_k]
             key = "hyde_rrf"
-            entry["retrievals"][key] = [pid for pid, _ in merged]
+            entry["retrievals"][key] = [
+                {"pid": pid, "score": round(score, 6), "rank": rank}
+                for rank, (pid, score) in enumerate(merged, 1)
+            ]
         else:
             hyde_tokens = tokenize_query(fake_answer)
             hyde_scores = bm25.get_scores(hyde_tokens)
             hyde_top = _topk_indices(hyde_scores, top_k)
             key = "hyde"
-            entry["retrievals"][key] = [pids[j] for j in hyde_top]
+            entry["retrievals"][key] = [
+                {"pid": pids[j], "score": round(float(hyde_scores[j]), 6), "rank": rank}
+                for rank, j in enumerate(hyde_top, 1)
+            ]
 
         elapsed = time.time() - t0
         total_time += elapsed
@@ -661,14 +800,14 @@ def _run_bm25_strategy_prf(
     pids: list[str],
     pool_queries: list[tuple[str, str]] = None,
     qrels: dict[str, set[str]] = None,
-    top_k: int = 10,
+    top_k: int = 50,
     cfg: dict = None,
 ) -> list[dict]:
     import math
     from collections import Counter
     from src.retrieval.bm25_store import tokenize_query
 
-    prf_feedback_k = cfg.get("prf_top_k", 20)
+    prf_feedback_k = cfg.get("prf_top_k", 50)
     num_terms = cfg.get("prf_num_terms", 5)
     weighted = cfg.get("prf_weighted", False)
 
@@ -684,6 +823,11 @@ def _run_bm25_strategy_prf(
         query_tokens = tokenize_query(query_text)
         first_scores = bm25.get_scores(query_tokens)
         first_top = _topk_indices(first_scores, prf_feedback_k)
+
+        entry["retrievals"]["prf_first_pass"] = [
+            {"pid": pids[j], "score": round(float(first_scores[j]), 6), "rank": rank}
+            for rank, j in enumerate(first_top, 1)
+        ]
 
         feedback_texts = [texts[j] for j in first_top]
 
@@ -728,7 +872,10 @@ def _run_bm25_strategy_prf(
         key = f"prf_t{num_terms}"
         if weighted:
             key += "_w"
-        entry["retrievals"][key] = [pids[j] for j in second_top]
+        entry["retrievals"][key] = [
+            {"pid": pids[j], "score": round(float(second_scores[j]), 6), "rank": rank}
+            for rank, j in enumerate(second_top, 1)
+        ]
         results.append(entry)
 
         if (i + 1) % 100 == 0:
@@ -868,7 +1015,7 @@ def run_experiment(
         t0 = time.time()
         if vector_db_dir is None:
             vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
-        dense_retriever, dense_count = _load_dense_retriever(
+        dense_retriever, vs, dense_count = _load_dense_retriever(
             vector_db_dir, collection_name, device,
             search_type=dense_search_type, model_id=model_id, top_k=top_k,
         )
@@ -882,30 +1029,30 @@ def run_experiment(
 
         if strategy == "none":
             results = _run_strategy_none(
-                dense_retriever, pool_queries, pids, qrels, top_k, dense_search_type,
+                vs, pool_queries, pids, qrels, top_k, dense_search_type,
             )
         elif strategy == "single":
             results = _run_strategy_single(
-                dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
+                vs, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
             )
         elif strategy == "multi_query":
             rrf_k = cfg.get("rrf_k", 60)
             results = _run_strategy_multi_query(
-                dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+                vs, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
             )
         elif strategy == "hyde":
             results = _run_strategy_hyde(
-                dense_retriever, llm_outputs, pool_queries, qrels, top_k, with_original=False,
+                vs, llm_outputs, pool_queries, qrels, top_k, with_original=False,
             )
         elif strategy == "hyde_rrf":
             rrf_k = cfg.get("rrf_k", 60)
             results = _run_strategy_hyde(
-                dense_retriever, llm_outputs, pool_queries, qrels, top_k,
+                vs, llm_outputs, pool_queries, qrels, top_k,
                 rrf_k=rrf_k, with_original=True,
             )
         elif strategy == "prf":
             results = _run_strategy_prf(
-                dense_retriever, pool_queries, texts, pids, qrels, top_k, cfg,
+                vs, pool_queries, texts, pids, qrels, top_k, cfg,
             )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -994,7 +1141,7 @@ def run_experiments_batch(
         t0 = time.time()
         if vector_db_dir is None:
             vector_db_dir = str(VECTOR_DB_DIR / "t2ranking" / "bge-small-zh-v1.5")
-        dense_retriever, dense_count = _load_dense_retriever(
+        dense_retriever, vs, dense_count = _load_dense_retriever(
             vector_db_dir, collection_name, device,
             search_type=dense_search_type, model_id=model_id, top_k=top_k,
         )
@@ -1051,30 +1198,30 @@ def run_experiments_batch(
         else:
             if strategy == "none":
                 results = _run_strategy_none(
-                    dense_retriever, pool_queries, pids, qrels, top_k, dense_search_type,
+                    vs, pool_queries, pids, qrels, top_k, dense_search_type,
                 )
             elif strategy == "single":
                 results = _run_strategy_single(
-                    dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
+                    vs, llm_outputs, pool_queries, pids, qrels, top_k, dense_search_type,
                 )
             elif strategy == "multi_query":
                 rrf_k = cfg.get("rrf_k", 60)
                 results = _run_strategy_multi_query(
-                    dense_retriever, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
+                    vs, llm_outputs, pool_queries, pids, qrels, top_k, rrf_k,
                 )
             elif strategy == "hyde":
                 results = _run_strategy_hyde(
-                    dense_retriever, llm_outputs, pool_queries, qrels, top_k, with_original=False,
+                    vs, llm_outputs, pool_queries, qrels, top_k, with_original=False,
                 )
             elif strategy == "hyde_rrf":
                 rrf_k = cfg.get("rrf_k", 60)
                 results = _run_strategy_hyde(
-                    dense_retriever, llm_outputs, pool_queries, qrels, top_k,
+                    vs, llm_outputs, pool_queries, qrels, top_k,
                     rrf_k=rrf_k, with_original=True,
                 )
             elif strategy == "prf":
                 results = _run_strategy_prf(
-                    dense_retriever, pool_queries, texts, pids, qrels, top_k, cfg,
+                    vs, pool_queries, texts, pids, qrels, top_k, cfg,
                 )
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
@@ -1212,7 +1359,7 @@ def main():
              "Batch mode loads the retriever once for all experiments.",
     )
     parser.add_argument("--sample", type=int, default=500, help="Number of queries to evaluate")
-    parser.add_argument("--top-k", type=int, default=10, help="Top-K for retrieval")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-K for retrieval")
     parser.add_argument("--device", default="cpu", help="Device for embedding model")
     parser.add_argument(
         "--vector-db", default=None,

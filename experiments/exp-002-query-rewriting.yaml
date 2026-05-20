@@ -66,15 +66,25 @@ evaluation:
 
   metrics:
     core:
-      - Recall@1
-      - Recall@3
-      - Recall@5
       - Recall@10
-      - MRR
-    supplementary:
       - Recall@20
-    note: "NDCG@5/10 暂不计算——T2Ranking 的 4 级标注（0/1/2/3）需要 qrels 文件中的 label 列，当前脚本只读取了 qid-pid 二元关系"
-    note_recall20: "Recall@20 作为 E2b（multi-query RRF 融合）和 E2d（PRF 二次检索）的补充指标。multi-query RRF 从多路子查询的候选池（每路 top_k×2）中合并排序，Recall@10 vs Recall@20 的差距能反映 RRF 排序是否将相关 passage 压到了 11-20 位——若 gap > 5%，说明增大 RRF 输出 K 有实质收益。对 E2d 而言，PRF 第一轮取 top-20 提词，Recall@20 可检测第一轮是否漏掉了关键信号。"
+      - Recall@50
+      - MRR
+    note: "核心指标聚焦召回阶段能力。Recall@1/3/5 已移除——在引入精排模型之前，极端截断点的指标意义有限。Recall@50 是召回阶段的真实能力度量：给 Reranker 提供充足的候选池，并在宽松截断点下验证 Multi-Query 等多路召回策略的互补增益。NDCG 暂不计算——T2Ranking 的 4 级标注（0/1/2/3）需要 qrels 文件中的 label 列，当前脚本只读取了 qid-pid 二元关系。"
+    output_format:
+      description: "每条查询的检索结果需保存完整的 (pid, score, rank) 三元组，便于后续分析召回曲线和 Reranker 精排。"
+      schema: |
+        {
+          "qid": "...",
+          "query": "...",
+          "relevant_pids": [...],
+          "retrievals": {
+            "similarity": [
+              {"pid": "...", "score": 0.892, "rank": 1},
+              ...
+            ]
+          }
+        }
 
   cost:
     deepseek_pricing:
@@ -104,10 +114,10 @@ experiment_groups:
     objective: "在不引入多路检索和预回答的前提下，纯靠 Prompt 工程提升单条查询的检索召回。5 个变体从规则密度、示例来源、输出格式三个维度消融。检索后端为 BM25，避免 Dense 模型训练数据污染问题。"
     fixed:
       retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
-      top_k: 10
+      top_k: 50
       passage_pool: "全量 230 万"
       llm: "deepseek-chat (temperature=0.1, max_tokens=128)"
-      note: "每组均只做单条查询改写（1 API 调用 → 1 条改写文本），不涉及多路检索。BM25 天然对改写友好——新增的每个 term 都是独立的正向匹配信号，不存在 Dense 模型的'向量偏移'问题。"
+      note: "每组均只做单条查询改写（1 API 调用 → 1 条改写文本），不涉及多路检索。每路检索取 top-50 并保存 (pid, score, rank)。BM25 天然对改写友好——新增的每个 term 都是独立的正向匹配信号，不存在 Dense 模型的'向量偏移'问题。"
 
     design_rationale:
       core_principle: "Prompt 优化的本质是让 LLM 往查询里注入'正确的额外 token'，缩小短查询（5-15 字）与长 passage（中位数 368 字）之间的词面鸿沟。BM25 对改写友好——新增 term 直接参与词袋匹配，不存在向量偏移问题。"
@@ -170,7 +180,7 @@ experiment_groups:
         api_calls_per_query: 1
 
     comparison_matrix:
-      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      rows: ["Recall@10", "Recall@20", "Recall@50", "MRR"]
       columns:
         - "B0 (no rewrite)"
         - "B1 (v1 unified)"
@@ -193,11 +203,12 @@ experiment_groups:
     objective: "验证多路查询扩展 → 各自 BM25 检索 → RRF 融合能否提高召回。三组实验按失败模式定义改写角度，做干净的单变量消融：M1 vs B0（多角度是否有增益）、M2 vs M1（step-back 的边际贡献）、M3 vs M1（类型感知 vs 统一策略）。"
     fixed:
       retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
-      top_k: 10
+      sub_query_top_k: 50
+      rrf_output_top_k: 50
       passage_pool: "全量 230 万"
       fusion: "RRF (k=60)"
       single_query_prompt: "使用 E2a 中最优的 single-query Prompt 方案（B0/B1/P1-P5 之一）作为每条子查询的基础改写策略"
-      note: "每组均一次 LLM API 调用（prompt 内输出多条子查询），子查询各自 BM25 检索后 RRF 合并，不涉及多轮调用"
+      note: "每组均一次 LLM API 调用（prompt 内输出多条子查询）。每路子查询各自检索 top-50 并保存 (pid, score, rank)，RRF 融合后输出 top-50。保存所有子查询的独立检索结果，便于分析子查询间互补率和 R@50 增益来源。"
 
     design_rationale:
       core_principle: "单条查询的语义向量只能锚定一个方向。多条覆盖不同侧面和抽象层次的查询，通过 RRF 融合能互补覆盖 passage 的不同区域。"
@@ -262,7 +273,7 @@ experiment_groups:
       M3_example: "{\"query_type\": \"comparison\", \"sub_queries\": [\"子查询1\", \"子查询2\", \"子查询3\", ...]}"
 
     comparison_matrix:
-      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "Recall@20 (supp.)", "MRR"]
+      rows: ["Recall@10", "Recall@20", "Recall@50", "MRR"]
       columns: ["B0 (no rewrite)", "M1 (multi-angle)", "M2 (+step-back)", "M3 (type-diff)"]
 
     analysis_questions:
@@ -270,18 +281,17 @@ experiment_groups:
       - "Q2: M2 的 step-back 在全部类型上都有增益，还是只在 factual 上？如果只在 factual 上有增益，M3 的方案就找到了正确的分配方式。"
       - "Q3: M3 的类型差异化策略能否超过 M1 的统一多角度？如果不能，说明 Prompt 工程中的 query type 分发收益不如预期。"
       - "Q4: 子查询数量（M1 的 3 路 → M2 的 4 路 → M3 的 4-7 路）与召回增益是否线性？多少条子查询后收益递减？"
-      - "Q5 (Recall@20): Recall@10 到 Recall@20 的增量是多少？如果 delta > 5%，说明 RRF 排序将部分相关 passage 压到了 11-20 位——增大 RRF 融合后的输出 K（如 top-20）可显著提升下游 RAG 的可用文档量。"
+      - "Q5 (Recall@50): Recall@20 到 Recall@50 的增益是多少？如果 delta > 5%，说明大量相关 passage 被 RRF 排到了 21-50 位——增大 RRF 输出 K 有实质收益，并为 Reranker 提供更多有效候选。"
 
   # ========== E2c：HyDE 预回答扩展 ==========
   hyde_pretend_answer:
     objective: "验证 HyDE（生成假答案 → 用答案文本做 BM25 检索）相比原查询检索的增益。各组均用原始不加改写的 query，确保干净地衡量 HyDE 本身的贡献。HyDE × 最优改写的交叉组合留给 Phase 3。"
     fixed:
       retrieval_backend: "BM25 (jieba 分词, rank_bm25.BM25Okapi, 停用词过滤)"
-      top_k: 10
+      top_k: 50
       passage_pool: "全量 230 万"
       base_query: "原查询，不经任何改写（B0 版本）"
-      note: "BM25 版 HyDE：LLM 生成假答案文本 → jieba 分词 → BM25 term 匹配。假答案比短 query 术语更丰富、信息密度更高，预期能命中更多相关 passage。"
-      key_difference_from_dense_hyde: "Dense 版 HyDE 靠假答案的语义向量匹配；BM25 版靠假答案的 term 直接命中。两者机制不同但理念相同。"
+      note: "BM25 版 HyDE：LLM 生成假答案文本 → jieba 分词 → BM25 term 匹配。假答案比短 query 术语更丰富、信息密度更高，预期能命中更多相关 passage。H2/H3 的 RRF 融合每路取 top-50。保存每路独立检索结果 (pid, score, rank)。"
 
     groups:
       - id: "E2c-H1"
@@ -303,7 +313,7 @@ experiment_groups:
         rationale: "确定最优答案长度。过长可能引入过多高频噪声词，BM25 的 IDF 会自动压制但仍有稀释风险"
 
     comparison_matrix:
-      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "MRR"]
+      rows: ["Recall@10", "Recall@20", "Recall@50", "MRR"]
       columns: ["B0 (no rewrite)", "H1 (HyDE only)", "H2 (HyDE+original)", "H3 (length optimal)"]
 
     analysis_questions:
@@ -321,9 +331,9 @@ experiment_groups:
       note: "PRF 完全不调用 LLM API，成本为零。非常适合作为检索增强的 baseline 下限。"
 
     method:
-      step1: "Dense similarity 检索 top-20（扩大 pool 利于提词）"
-      step2: "从 top-20 文本中提取 TF-IDF 最高频的 5-10 个词（排除停用词）"
-      step3: "原查询 + 扩展词拼接 → 重新 Dense 检索 → 取 top-10"
+      step1: "第一轮检索 top-50（扩大 pool 利于提词）"
+      step2: "从 top-50 文本中提取 TF-IDF 最高频的 5-10 个词（排除停用词）"
+      step3: "原查询 + 扩展词拼接 → 重新检索 → 取 top-50"
       variants:
         - "PRF-TFIDF: 标准 TF-IDF 提词"
         - "PRF-TFIDF-weighted: 提词后按 TF-IDF 分数加权拼入原查询（如原 query 重复 3 次，扩展词重复 1 次）"
@@ -333,24 +343,24 @@ experiment_groups:
         name: "no rewrite (baseline)"
         method: "原查询直接检索"
         expected_results:
-          Recall@10: 0.4548
-          MRR: 0.5097
+          Recall@50: 0.65
+          MRR: 0.51
         rationale: "复用 E2a-B0"
 
       - id: "E2d-P1"
         name: "PRF (TF-IDF, 5 terms)"
-        method: "top-20 TF-IDF 提取 5 词 → 拼入原查询 → 重搜"
+        method: "top-50 TF-IDF 提取 5 词 → 拼入原查询 → 重搜"
         api_calls_per_query: 0
         rationale: "最简 PRF"
 
       - id: "E2d-P2"
         name: "PRF (TF-IDF, 10 terms, weighted)"
-        method: "top-20 TF-IDF 提取 10 词 → 按权重拼入原查询 → 重搜"
+        method: "top-50 TF-IDF 提取 10 词 → 按权重拼入原查询 → 重搜"
         api_calls_per_query: 0
         rationale: "更多扩展词 + 加权"
 
     comparison_matrix:
-      rows: ["Recall@1", "Recall@3", "Recall@5", "Recall@10", "Recall@20 (supp.)", "MRR"]
+      rows: ["Recall@10", "Recall@20", "Recall@50", "MRR"]
       columns: ["B0 (no rewrite)", "P1 (PRF 5 terms)", "P2 (PRF 10 terms weighted)"]
 
 
@@ -420,12 +430,12 @@ deliverables:
 
 risks:
 
-  - risk: "Prompt/Multi-Query 在 BM25 上增益不显著（Recall@10 < +0.05）"
+  - risk: "Prompt/Multi-Query 在 BM25 上增益不显著（Recall@50 < +0.05）"
     probability: medium
     impact: "LLM 查询改写本身可能对 T2Ranking 无效——补充的 term 无法命中相关 passage 中的词"
     mitigation: "1) 分析改写失败 case，看 LLM 输出是否合理；2) 若 BM25 也无增益，则表明短查询语义鸿沟无法靠简单的 term 扩充弥合——需转向 HyDE 或混合检索方案"
 
   - risk: "BM25 基线过低，改写增益有天花板"
     probability: medium
-    impact: "BM25 短查询 Recall@10 可能本身就远低于 Dense，即使改写有相对增益，绝对分数仍不够"
+    impact: "BM25 短查询 Recall@50 可能本身就远低于 Dense，即使改写有相对增益，绝对分数仍不够"
     mitigation: "exp-001 中同步运行 BM25 基线，若过低则加速 M3E migration"

@@ -4,7 +4,7 @@
 set -e
 
 SAMPLE=2000
-TOP_K=20
+TOP_K=50
 EMBEDDING="moka-ai/m3e-base"
 VECTOR_DB="/root/autodl-tmp/data/vector_db/t2ranking/m3e-base"
 

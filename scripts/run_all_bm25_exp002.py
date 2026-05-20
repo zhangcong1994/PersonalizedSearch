@@ -2,7 +2,7 @@
 Run all exp-002 experiments with BM25 backend.
 
 Usage:
-    python scripts/run_all_bm25_exp002.py                # 2000 queries, top-20
+    python scripts/run_all_bm25_exp002.py                # 2000 queries, top-50
     python scripts/run_all_bm25_exp002.py --sample 500   # quick test
     python scripts/run_all_bm25_exp002.py --top-k 10     # top-10 only
     python scripts/run_all_bm25_exp002.py --bm25-index /path/to/index
@@ -15,7 +15,7 @@ from pathlib import Path
 
 def main():
     sample = 2000
-    top_k = 20
+    top_k = 50
     bm25_index = None
 
     args = sys.argv[1:]

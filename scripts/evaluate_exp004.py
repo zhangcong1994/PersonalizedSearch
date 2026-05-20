@@ -146,13 +146,15 @@ def load_transformers_reranker(model_info: dict, device: str):
     logger.info(f"Loading Transformers reranker: {model_info['hf_id']} from {model_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     model = AutoModelForSequenceClassification.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
         trust_remote_code=True,
     )
+    model.config.pad_token_id = tokenizer.pad_token_id
     model = model.to(device)
     model.eval()
 

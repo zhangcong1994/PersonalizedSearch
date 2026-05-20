@@ -14,6 +14,13 @@ Usage:
   python scripts/evaluate_exp004.py --data results/exp004/exp004_prepared_data.jsonl
   python scripts/evaluate_exp004.py --model bge-v2-m3 --split val  # single model quick test
   python scripts/evaluate_exp004.py --batch-size 64
+  python scripts/evaluate_exp004.py --force  # re-run, ignore cache
+  python scripts/evaluate_exp004.py --skip-phase2  # skip depth ablation
+
+Caching:
+  Phase 1 results are cached to results/exp004/phase1_cache/<model>.jsonl
+  Phase 3 results are cached to results/exp004/phase3_cache/<model>.jsonl
+  Re-running the script skips models with cached results (use --force to override).
 """
 
 import os
@@ -205,6 +212,40 @@ def build_metrics_entry(
     return compute_reranker_metrics(filtered, method_key, k_values, qrels_graded)
 
 
+def _results_to_json(results: list[dict]) -> list[dict]:
+    out = []
+    for r in results:
+        r_copy = dict(r)
+        r_copy["relevant_pids"] = list(r["relevant_pids"])
+        out.append(r_copy)
+    return out
+
+
+def _results_from_json(data: list[dict]) -> list[dict]:
+    out = []
+    for r in data:
+        r_copy = dict(r)
+        r_copy["relevant_pids"] = set(r["relevant_pids"])
+        out.append(r_copy)
+    return out
+
+
+def _save_cache(cache_file: Path, results: list[dict]):
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_file, "w", encoding="utf-8") as f:
+        for r in _results_to_json(results):
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def _load_cache(cache_file: Path) -> list[dict]:
+    results = []
+    with open(cache_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                results.append(json.loads(line))
+    return _results_from_json(results)
+
+
 def print_results_table(
     metrics_map: dict[str, dict],
     metric_names: list[str],
@@ -277,6 +318,11 @@ def main():
         action="store_true",
         help="Skip depth ablation (Phase 2)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force recomputation, ignore cached results",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -310,6 +356,9 @@ def main():
     graded_qrels_val = {d["qid"]: d["graded_qrels"] for d in val_data if d["graded_qrels"]}
     graded_qrels_test = {d["qid"]: d["graded_qrels"] for d in test_data if d["graded_qrels"]}
 
+    phase1_cache_dir = output_dir / "phase1_cache"
+    phase3_cache_dir = output_dir / "phase3_cache"
+
     # =========================================================================
     # PHASE 1: Full Model Comparison
     # =========================================================================
@@ -323,21 +372,29 @@ def main():
     model_ids = list(MODELS.keys())
 
     phase1_metrics = {}
+    phase1_results = {}
     for model_id in model_ids:
-        logger.info(f"[{model_id}] Running on validation set ({len(val_data)} queries) ...")
-        score_fn, cleanup_fn = load_reranker(model_id, args.device)
-
-        t0 = time.time()
-        results = run_reranker_on_split(val_data, score_fn, args.batch_size, model_id)
-        elapsed = time.time() - t0
+        cache_file = phase1_cache_dir / f"{model_id}.jsonl"
+        if cache_file.exists() and not args.force:
+            logger.info(f"[{model_id}] Loading cached results ...")
+            results = _load_cache(cache_file)
+        else:
+            logger.info(f"[{model_id}] Running on validation set ({len(val_data)} queries) ...")
+            score_fn, cleanup_fn = load_reranker(model_id, args.device)
+            t0 = time.time()
+            results = run_reranker_on_split(val_data, score_fn, args.batch_size, model_id)
+            elapsed = time.time() - t0
+            logger.info(f"[{model_id}] Scoring done in {elapsed:.1f}s")
+            cleanup_fn()
+            _save_cache(cache_file, results)
+            logger.info(f"[{model_id}] Cached to {cache_file}")
 
         metrics = build_metrics_entry(
             results, model_id, EVAL_K_VALUES, graded_qrels_val
         )
         phase1_metrics[model_id] = metrics
-        logger.info(f"[{model_id}] Done in {elapsed:.1f}s. NDCG@10={metrics.get('NDCG@10', 0):.4f}")
-
-        cleanup_fn()
+        phase1_results[model_id] = results
+        logger.info(f"[{model_id}] NDCG@10={metrics.get('NDCG@10', 0):.4f}")
 
     # ── Phase 1 table ──
     p1_metric_names = [
@@ -376,16 +433,11 @@ def main():
         print("  PHASE 2: Output Depth Ablation (Validation Set)")
         print("=" * 70)
         print(f"  Top-3 models x {len(OUTPUT_DEPTHS)} depths = {len(top3) * len(OUTPUT_DEPTHS)} configs")
+        print(f"  (Derived from Phase 1 results, no model loading needed)")
 
         phase2_metrics = {}
         for model_id in top3:
-            logger.info(f"[{model_id}] Depth ablation ...")
-            score_fn, cleanup_fn = load_reranker(model_id, args.device)
-
-            t0 = time.time()
-            results_full = run_reranker_on_split(val_data, score_fn, args.batch_size, model_id)
-            elapsed = time.time() - t0
-
+            results_full = phase1_results[model_id]
             for depth in OUTPUT_DEPTHS:
                 config_key = f"{model_id}_K{depth}"
                 truncated = truncate_results(results_full, depth)
@@ -394,9 +446,6 @@ def main():
                 )
                 ndcg10 = phase2_metrics[config_key].get("NDCG@10", 0)
                 logger.info(f"  [{config_key}] NDCG@10={ndcg10:.4f}")
-
-            logger.info(f"[{model_id}] Depth ablation done in {elapsed:.1f}s")
-            cleanup_fn()
 
         # ── Phase 2 table ──
         p2_cols = ["NDCG@5", "NDCG@10", "NDCG@20", "NDCG@10_graded", "MRR", "Recall@10", "Precision@5"]
@@ -428,15 +477,25 @@ def main():
     print(f"  Best config: {best_model_id}_K{best_depth}")
     print(f"  Test set: {len(test_data)} queries")
 
-    score_fn, cleanup_fn = load_reranker(best_model_id, args.device)
-    t0 = time.time()
-    test_results = run_reranker_on_split(test_data, score_fn, args.batch_size, best_model_id)
-    test_results = truncate_results(test_results, best_depth)
+    test_cache_file = phase3_cache_dir / f"{best_model_id}.jsonl"
+    if test_cache_file.exists() and not args.force:
+        logger.info(f"[{best_model_id}] Loading cached test results ...")
+        test_results = _load_cache(test_cache_file)
+        test_results = truncate_results(test_results, best_depth)
+    else:
+        score_fn, cleanup_fn = load_reranker(best_model_id, args.device)
+        t0 = time.time()
+        test_results = run_reranker_on_split(test_data, score_fn, args.batch_size, best_model_id)
+        elapsed = time.time() - t0
+        logger.info(f"Test inference done in {elapsed:.1f}s")
+        cleanup_fn()
+        _save_cache(test_cache_file, test_results)
+        logger.info(f"[{best_model_id}] Test results cached to {test_cache_file}")
+        test_results = truncate_results(test_results, best_depth)
+
     test_metrics = build_metrics_entry(
         test_results, best_model_id, EVAL_K_VALUES, graded_qrels_test
     )
-    elapsed = time.time() - t0
-    logger.info(f"Test inference done in {elapsed:.1f}s")
 
     # ── Also compute coarse-ranking (RRF) baseline on test set ──
     rrf_test_results = build_rrf_baseline(test_data)
@@ -501,7 +560,6 @@ def main():
     print(f"  Results saved to:    {output_dir}")
     print("=" * 70)
 
-    cleanup_fn()
     return 0
 
 
@@ -612,8 +670,17 @@ def run_single_model(args) -> int:
 
     logger.info(f"Loaded {len(data)} entries for {split}")
 
-    score_fn, cleanup_fn = load_reranker(args.model, args.device)
-    results = run_reranker_on_split(data, score_fn, args.batch_size, args.model)
+    cache_subdir = "phase1_cache" if split == "val" else "phase3_cache"
+    cache_file = Path(args.output_dir) / cache_subdir / f"{args.model}.jsonl"
+    if cache_file.exists() and not args.force:
+        logger.info(f"Loading cached results from {cache_file}")
+        results = _load_cache(cache_file)
+    else:
+        score_fn, cleanup_fn = load_reranker(args.model, args.device)
+        results = run_reranker_on_split(data, score_fn, args.batch_size, args.model)
+        cleanup_fn()
+        _save_cache(cache_file, results)
+        logger.info(f"Cached to {cache_file}")
 
     graded = {d["qid"]: d["graded_qrels"] for d in data if d["graded_qrels"]}
     metrics = build_metrics_entry(results, args.model, EVAL_K_VALUES, graded)
@@ -628,7 +695,6 @@ def run_single_model(args) -> int:
         val = metrics.get(mn, float("nan"))
         print(f"  {mn:<20} {val:.4f}")
 
-    cleanup_fn()
     return 0
 
 

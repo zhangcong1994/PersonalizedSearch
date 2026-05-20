@@ -64,15 +64,16 @@ def load_qrels(path: Path) -> dict[str, set[str]]:
 def load_qrels_graded(path: Path) -> dict[str, dict[str, int]]:
     qrels = {}
     with open(path, "r", encoding="utf-8") as f:
+        f.readline()
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line:
                 continue
             parts = line.split()
-            if len(parts) == 3:
-                qid, pid, label = parts[0], parts[1], int(parts[2])
-            elif len(parts) == 4:
+            if len(parts) == 4:
                 qid, _, pid, label = parts[0], parts[1], parts[2], int(parts[3])
+            elif len(parts) == 3:
+                qid, pid, label = parts[0], parts[1], int(parts[2])
             else:
                 continue
             if label > 0:

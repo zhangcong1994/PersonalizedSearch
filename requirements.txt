@@ -27,3 +27,4 @@ opencc-python-reimplemented
 jieba
 tqdm
 rank-bm25
+FlagEmbedding

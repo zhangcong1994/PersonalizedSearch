@@ -25,6 +25,7 @@ import logging
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -92,7 +93,13 @@ def resolve_model_dir(hf_id: str) -> str:
 
 
 def load_flagembedding_reranker(model_info: dict, device: str):
-    from FlagEmbedding import FlagReranker
+    try:
+        from FlagEmbedding import FlagReranker
+    except ImportError:
+        raise ImportError(
+            "FlagEmbedding is required for BGE reranker models. "
+            "Install it with: pip install FlagEmbedding"
+        )
 
     model_path = resolve_model_dir(model_info["hf_id"])
     logger.info(f"Loading FlagReranker: {model_info['hf_id']} from {model_path}")
@@ -104,13 +111,22 @@ def load_flagembedding_reranker(model_info: dict, device: str):
 
     def score_pairs(pairs: list[tuple[str, str]], batch_size: int) -> list[float]:
         scores = []
+        pbar = tqdm(total=len(pairs), desc="  Scoring", unit="pair", leave=False)
         for i in range(0, len(pairs), batch_size):
             batch = pairs[i:i + batch_size]
             scores.extend(reranker.compute_score(batch, normalize=True))
+            pbar.update(len(batch))
+        pbar.close()
         return scores
 
     def cleanup():
-        del reranker
+        nonlocal reranker
+        try:
+            local_reranker = reranker
+        except NameError:
+            pass
+        else:
+            del local_reranker
         torch.cuda.empty_cache()
 
     return score_pairs, cleanup
@@ -133,6 +149,7 @@ def load_transformers_reranker(model_info: dict, device: str):
 
     def score_pairs(pairs: list[tuple[str, str]], batch_size: int) -> list[float]:
         scores = []
+        pbar = tqdm(total=len(pairs), desc="  Scoring", unit="pair", leave=False)
         for i in range(0, len(pairs), batch_size):
             batch = pairs[i:i + batch_size]
             with torch.no_grad():
@@ -147,11 +164,24 @@ def load_transformers_reranker(model_info: dict, device: str):
                 logits = outputs.logits.view(-1).float()
                 batch_scores = torch.sigmoid(logits).cpu().tolist()
                 scores.extend(batch_scores)
+            pbar.update(len(batch))
+        pbar.close()
         return scores
 
     def cleanup():
-        del model
-        del tokenizer
+        nonlocal model, tokenizer
+        try:
+            _model = model
+        except NameError:
+            pass
+        else:
+            del _model
+        try:
+            _tokenizer = tokenizer
+        except NameError:
+            pass
+        else:
+            del _tokenizer
         torch.cuda.empty_cache()
 
     return score_pairs, cleanup

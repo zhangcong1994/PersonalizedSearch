@@ -18,7 +18,8 @@ FILES = {
     "collection.tsv":           ("2,303,643 条 passage", "~3.5 GB"),
     "queries.dev.tsv":          ("24,832 条查询（V0 评估主力）", "~1 MB"),
     "queries.test.tsv":         ("24,832 条查询（V1 最终评估）", "~1 MB"),
-    "qrels.retrieval.dev.tsv":  ("118,933 条检索 qrels", "~1.5 MB"),
+    "qrels.retrieval.dev.tsv":  ("118,933 条检索 qrels（二元相关）", "~1.5 MB"),
+    "qrels.dev.tsv":            ("400,536 条精排 qrels（TREC 格式，4 级标注 0-3）", "~6 MB"),
 }
 
 CHUNK_SIZE = 128 * 1024

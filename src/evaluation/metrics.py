@@ -58,6 +58,64 @@ def compute_metrics(results: list[dict], method_key: str, k_values: list[int] = 
     return metrics
 
 
+def _compute_dcg(gains: list[int], k: int) -> float:
+    import math
+    dcg = 0.0
+    for i, g in enumerate(gains[:k]):
+        dcg += g / math.log2(i + 2)
+    return dcg
+
+
+def compute_reranker_metrics(
+    results: list[dict],
+    method_key: str,
+    k_values: list[int] = None,
+    qrels_graded: dict[str, dict[str, int]] = None,
+):
+    if k_values is None:
+        k_values = DEFAULT_K_VALUES
+
+    max_k = max(k_values)
+
+    metrics = {}
+    ndcg_sums_binary = {k: 0.0 for k in k_values}
+    ndcg_sums_graded = {k: 0.0 for k in k_values}
+
+    for r in results:
+        qid = r["qid"]
+        retrieved_items = r["retrievals"].get(method_key, [])[:max_k]
+        retrieved_pids = _extract_pids(retrieved_items)
+        relevant = r["relevant_pids"]
+
+        binary_gains = [1 if pid in relevant else 0 for pid in retrieved_pids]
+
+        for k in k_values:
+            dcg = _compute_dcg(binary_gains, k)
+            ideal_gains = sorted([1] * min(len(relevant), k), reverse=True)
+            ideal_gains += [0] * max(0, k - len(ideal_gains))
+            idcg = _compute_dcg(ideal_gains, k)
+            ndcg_sums_binary[k] += dcg / idcg if idcg > 0 else 0.0
+
+            if qrels_graded and qid in qrels_graded:
+                graded_rel = qrels_graded[qid]
+                graded_gains = [graded_rel.get(pid, 0) for pid in retrieved_pids]
+                dcg_graded = _compute_dcg(graded_gains, k)
+                ideal_graded = sorted(graded_rel.values(), reverse=True)[:k]
+                idcg_graded = _compute_dcg(ideal_graded, k)
+                ndcg_sums_graded[k] += dcg_graded / idcg_graded if idcg_graded > 0 else 0.0
+
+    n = len(results) if results else 1
+    for k in k_values:
+        metrics[f"NDCG@{k}"] = ndcg_sums_binary[k] / n
+        if qrels_graded:
+            metrics[f"NDCG@{k}_graded"] = ndcg_sums_graded[k] / n
+
+    base_metrics = compute_metrics(results, method_key, k_values=k_values)
+    metrics.update(base_metrics)
+
+    return metrics
+
+
 def print_comparison(metrics_map: dict[str, dict], metric_names: list[str] = None):
     if not metric_names:
         metric_names = DEFAULT_METRIC_NAMES

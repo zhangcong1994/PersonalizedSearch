@@ -61,6 +61,27 @@ def load_qrels(path: Path) -> dict[str, set[str]]:
     return qrels
 
 
+def load_qrels_graded(path: Path) -> dict[str, dict[str, int]]:
+    qrels = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 3:
+                qid, pid, label = parts[0], parts[1], int(parts[2])
+            elif len(parts) == 4:
+                qid, _, pid, label = parts[0], parts[1], parts[2], int(parts[3])
+            else:
+                continue
+            if label > 0:
+                qrels.setdefault(qid, {})[pid] = label
+    logger.info(f"Loaded graded qrels: {len(qrels)} queries, "
+                f"{sum(len(v) for v in qrels.values())} pairs")
+    return qrels
+
+
 def load_passages(path: Path, max_passages: int = 0, show_progress: bool = False) -> tuple[list[str], list[str]]:
     pids, texts = [], []
     with open(path, "r", encoding="utf-8") as f:

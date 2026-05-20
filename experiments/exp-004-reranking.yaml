@@ -1,0 +1,441 @@
+# 实验计划：V0 开源 Cross-Encoder 精排模型对比
+# exp-004: 开源 Reranker 候选池精排 —— 模型选型 + 深度消融 + 指标对照
+# 创建日期: 2026-05-20
+# 最后更新: 2026-05-20
+
+meta:
+  experiment_id: exp-004
+  phase: V0
+  objective: "对比多个开源 Cross-Encoder Reranker 在 exp-003 最优粗排候选池上的精排效果，选择一个最适合本项目的精排模型，确定最优输出深度"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-003 已完成（有 S4 最优方案的 top-50 融合结果和 split 分配）"
+  design_principle: "零微调——直接加载各模型预训练权重做推理，纯模型选型实验。输入为 exp-003 S4 配置产出的 top-50 候选 passages + 原始 query text"
+  key_difference_from_previous: "exp-002/003 只评检索质量（Recall/MRR），exp-004 首次引入 NDCG 作为精排核心指标，衡量排序质量的提升"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么需要精排
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    exp003_best:
+      config: "S4 (D-B0 + D-P2 + D-HyDE + B-B0), per-route K=50, RRF k=60"
+      recall_at_50_test: 0.6912
+      mrr_test: 0.4965
+      hit_at_50: 0.8991
+    gap:
+      description: "粗排阶段 Recall@50 = 0.6912 意味着约 31% 的相关 passage 不在 top-50 中。但在 top-50 之内的 passage，排序质量很差——MRR 只有 0.4965。如果直接把 top-10 喂给 LLM 生成答案，第一个相关 passage 平均排在第 2 位，大量不相关的内容排在前面"
+      concrete_problem: "假设取 top-5 做 RAG 上下文：如果第 1-3 名都是不相关的（因为粗排没有区分度），LLM 拿到的上下文就是噪声，生成的答案要么胡编、要么遗漏关键信息"
+
+  why_reranking:
+    core_reason: "粗排（RRF 融合）只做了召回，没有做排序。RRF 的分数仅来自各路的 rank 倒数之和，缺乏对 query-passage 语义深层次匹配的判断——它不知道哪个 passage 真正回答了查询"
+    what_reranker_does: "Cross-Encoder 精排模型同时编码 query + passage，输出一个精确的语义相关性分数。它能区分：表面相似但不相关的 passage vs 表面不太相似但真正回答查询的 passage"
+    industry_standard: "两阶段检索（粗排召回 + 精排重排）是 RAG 的标准架构。Google、Bing、Cohere 都使用这一范式——第一阶段用 Bi-Encoder/BM25 拉取 50-100 个候选，第二阶段用 Cross-Encoder Reranker 精排到 top-3~top-10"
+
+  why_not_train:
+    reason: "训练 Cross-Encoder 需要大量标注数据（query-passage-label 三元组）、GPU 时间（数小时到数天）和调参经验。V0 阶段优先验证开源模型在 T2Ranking 上的直接可用性。如果已有模型效果满意，无需额外训练成本"
+    fallback: "如果所有开源模型在 T2Ranking 上效果都不理想，V1 阶段考虑用 T2Ranking 的 qrels + hard negatives 做轻量微调"
+
+  why_not_llm_reranker:
+    reason: "LLM-based Reranker（如 RankGPT、RankLLaMA）虽然效果好，但每次推理需要调用 LLM API 或加载 7B+ 模型，成本和延迟远高于 Cross-Encoder（0.3B~0.6B 参数）。V0 阶段优先验证轻量 Cross-Encoder 的上限。如果不够，V1 再考虑 LLM-based"
+
+  core_hypothesis:
+    main: "Cross-Encoder Reranker 能把 MRR 从 0.50 提升到 0.55+，NDCG@10 达到 0.65+，大幅改善 top-10 排序质量"
+    secondary: "不同的开源 Reranker 在中文检索上可能有显著性能差异——阿里系（gte/Qwen）和 BAAI 系（bge）的预训练数据分布不同，对中文 query-passage 匹配的敏感度不同"
+
+  data_contamination_risk:
+    severity: high
+    description: "BGE 系列模型（embedding + reranker）的训练数据（C-MTP labeled）包含 T2Ranking 的 query-passage 对。这是 exp-002 中排除 BGE 作为检索后端的原因。同样的风险适用于 BGE Reranker：如果 bge-reranker-base 或 bge-reranker-v2-m3 在精排中得分异常高，不能排除是模型在训练时见过 T2Ranking 的 query-passage 配对所致——这不是真正的泛化排序能力，而是'考试作弊'"
+    exp002_precedent: "exp-002 明确排除 BGE 系列作为检索后端（见 exp-002-query-rewriting.yaml meta.retrieval_backend.excluded），理由：BGE 的 C-MTP labeled 训练数据包含 T2Ranking query-passage 对，模型已在评估集上见过原始 query 分布"
+    affected_models:
+      - "bge-reranker-base: 基于 BGE embedding 微调，共享相同的预训练数据，存在泄露风险"
+      - "bge-reranker-v2-m3: 基于 BGE-M3 训练，BGE-M3 的训练数据同样包含 C-MTP labeled 数据集"
+    unaffected_models:
+      - "gte-multilingual-reranker-base: 阿里独立训练，训练数据不含 T2Ranking"
+      - "Qwen3-Reranker-0.6B: 基于 Qwen3 基础模型 + LoRA 微调，训练数据不含 T2Ranking"
+      - "mxbai-rerank-base-v2: 基于 Qwen-2.5 + RL 训练，英文检索为主，训练数据不含 T2Ranking"
+    mitigation: "如果 BGE 模型显著优于非 BGE 模型（如 NDCG@10 差距 > 5%），数据泄露是最可能的解释。在此情况下，最优模型选择应优先考虑非 BGE 模型中的第一名。BGE 模型的分数仅在分析数据泄露幅度时具有参考价值，不应作为最终推荐方案的依据"
+    note: "这个风险不能通过实验消除（无法让模型'忘记'训练数据），只能通过模型选型规避。计划书中保留 BGE 模型作为'泄露上界参照'——如果非 BGE 模型能接近甚至超过 BGE 模型，说明精排方案在没有泄露的情况下也足够有效"
+
+
+# =============================================================================
+# 第二部分：候选模型
+# =============================================================================
+
+candidate_models:
+
+  # ========== 模型 1：bge-reranker-base ==========
+  - id: "bge-base"
+    name: "BAAI/bge-reranker-base"
+    hf_repo: "BAAI/bge-reranker-base"
+    params: "278M"
+    disk_size: "~280MB"
+    architecture: "Cross-Encoder (XLM-RoBERTa-Base)"
+    languages: "中文 + 英文"
+    max_length: 512
+    library: "FlagEmbedding (FlagReranker)"
+    license: "MIT"
+    cmteb_r_score: null
+    notes: "BGE 第一代 Reranker，中英文双语言，学术界广泛使用的基线。轻量、稳定、易部署"
+    selection_rationale: "BAAI 基准线——如果更复杂的模型不能显著超过它，说明额外复杂度无价值"
+    contamination_risk: "⚠️ 高危 —— BGE embedding 模型的 C-MTP labeled 训练数据包含 T2Ranking query-passage 对（exp-002 已验证）。bge-reranker-base 基于同一批 embedding 模型微调，存在数据泄露风险。分数可能反映'背诵'而非真正的泛化排序能力"
+
+  # ========== 模型 2：gte-multilingual-reranker-base ==========
+  - id: "gte-mul"
+    name: "Alibaba-NLP/gte-multilingual-reranker-base"
+    hf_repo: "Alibaba-NLP/gte-multilingual-reranker-base"
+    params: "306M"
+    disk_size: "~0.6GB"
+    architecture: "Cross-Encoder (XLM-RoBERTa-like, 8192 context)"
+    languages: "多语言（含中文）"
+    max_length: 8192
+    library: "transformers / sentence-transformers"
+    license: "Apache 2.0"
+    cmteb_r_score: 74.08
+    notes: "阿里通义实验室 GTE 系列的第一个多语言 Reranker，CMTEB-R（中文检索重排）得分 74.08，在同级别模型中中文表现最高。长上下文（8192 tokens）适合 T2Ranking 的长 passage（中位 368 字）"
+    selection_rationale: "中文 CMTEB-R 小模型最高分 + 阿里出品（国内场景天然优势）——预期是中文精排的强候选"
+
+  # ========== 模型 3：bge-reranker-v2-m3 ==========
+  - id: "bge-v2-m3"
+    name: "BAAI/bge-reranker-v2-m3"
+    hf_repo: "BAAI/bge-reranker-v2-m3"
+    params: "568M"
+    disk_size: "~560MB"
+    architecture: "Cross-Encoder (XLM-RoBERTa-Large, 8192 context)"
+    languages: "多语言（100+ 种）"
+    max_length: 8192
+    library: "FlagEmbedding (FlagReranker)"
+    license: "MIT"
+    cmteb_r_score: 72.16
+    notes: "BGE 第二代 Reranker，基于 bge-m3 训练。多语言能力强，社区广泛使用、文档完善。在多个 RAG 评测中被推荐为「生产中文字检索的首选 Reranker」"
+    selection_rationale: "社区事实标准——是当前中文 RAG 精排最常见的推荐方案，必须纳入对比"
+    contamination_risk: "⚠️ 高危 —— BGE-M3 的训练数据包含 C-MTP labeled 数据集，其中含有 T2Ranking query-passage 对。分数可能反映数据泄露而非真实的零样本排序能力"
+
+  # ========== 模型 4：Qwen3-Reranker-0.6B ==========
+  - id: "qwen3-rerank"
+    name: "Qwen/Qwen3-Reranker-0.6B"
+    hf_repo: "Qwen/Qwen3-Reranker-0.6B"
+    params: "0.6B"
+    disk_size: "~1.2GB"
+    architecture: "Cross-Encoder (Qwen3 decoder-only backbone, LoRA fine-tuned)"
+    languages: "多语言（119 种）"
+    max_length: 32768
+    library: "transformers / vLLM"
+    license: "Apache 2.0"
+    cmteb_r_score: 71.31
+    notes: "2025 年 6 月最新发布的 Qwen3 Embedding 系列中的 Reranker。基于 Qwen3 基础模型（decoder-only），通过 LoRA 微调获得 Cross-Encoder 能力。32K 超长上下文，指令感知（可通过 prompt 优化特定领域检索）。MTEB-R 英语得分 65.80，领先同级。0.6B 版本适合 RTX 4090 24GB 顺畅运行"
+    selection_rationale: "最新 SOTA 架构——decoder-only + LoRA、指令感知能力、32K 上下文，代表精排模型的最新方向，必须纳入以了解技术前沿"
+
+  # ========== 模型 5：mxbai-rerank-base-v2 ==========
+  - id: "mxbai-v2"
+    name: "mixedbread-ai/mxbai-rerank-base-v2"
+    hf_repo: "mixedbread-ai/mxbai-rerank-base-v2"
+    params: "0.5B"
+    disk_size: "~1GB"
+    architecture: "Cross-Encoder (Qwen-2.5 backbone, RL-optimized)"
+    languages: "多语言（100+ 种）"
+    max_length: 8192 (32K compatible)
+    library: "transformers"
+    license: "Apache 2.0"
+    cmteb_r_score: null
+    notes: "MixedBread 2025 年 3 月发布的第二代 Reranker。BEIR 得分 58.40（开源最高之一），采用强化学习优化排序质量。基础模型为 Qwen-2.5，天然具有良好的中文理解能力。在英文 benchmark 上表现顶级，但中文/多语言独立评测数据较少——恰好是本次实验要检验的"
+    selection_rationale: "英文最强开源 Reranker + Qwen 基座——如果它在中文上也表现好，将是「中英文兼顾」的最佳方案"
+
+  # ========== 模型汇总对比表 ==========
+  summary_table:
+    columns: ["ID", "参数量", "盘大小", "最大长度", "CMTEB-R", "基座架构", "来源", "泄露风险"]
+    rows:
+      - ["bge-base", "278M", "~280MB", "512", "—", "XLM-RoBERTa", "BAAI", "⚠️ 高危"]
+      - ["gte-mul", "306M", "~0.6GB", "8192", "74.08", "XLM-RoBERTa-like", "Alibaba", "✅ 无"]
+      - ["bge-v2-m3", "568M", "~560MB", "8192", "72.16", "XLM-RoBERTa-Large", "BAAI", "⚠️ 高危"]
+      - ["qwen3-rerank", "0.6B", "~1.2GB", "32K", "71.31", "Qwen3 (decoder)", "Alibaba", "✅ 无"]
+      - ["mxbai-v2", "0.5B", "~1GB", "8K", "—", "Qwen-2.5 (RL)", "MixedBread", "✅ 无"]
+
+  exclusions:
+    - model: "Cohere Rerank / Voyage Rerank"
+      reason: "商业 API，不符合「开源可自部署」的精排选型需求"
+    - model: "BGE-Reranker-v2-gemma (2.5B) / Qwen3-Reranker-4B / Qwen3-Reranker-8B"
+      reason: "参数量太大（>2B），RTX 4090 24GB 跑 batch 推理时 OOM 风险高。V1 阶段如需要更高精度可引入"
+    - model: "ms-marco-MiniLM-L-6-v2"
+      reason: "仅支持英文，T2Ranking 是中文数据集"
+    - model: "jina-reranker-v2-base-multilingual / jina-reranker-v3"
+      reason: "Jina V2 CMTEB-R 仅 63.37（远低于 gte-mul 的 74.08）；Jina V3 论文自述 CMTEB 落后 bge-v2-m3 约 2.8 分。在中文场景上性价比不如已选模型"
+    - model: "RankGPT / RankLLaMA 等 LLM-based Reranker"
+      reason: "推理成本高（API 调用或 7B+ 模型），V0 阶段优先验证轻量方案"
+
+
+# =============================================================================
+# 第三部分：评估数据与指标
+# =============================================================================
+
+evaluation:
+  source: "T2Ranking dev（复用 exp-001 / exp-002 / exp-003）"
+  queries_file: "data/raw/t2ranking/queries.dev.tsv"
+  qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+  collection_file: "data/raw/t2ranking/collection.tsv"
+
+  data_split:
+    description: "直接复用 exp-003 的 split 分配（seed=42, 50/50），保证粗排和精排使用相同的验证集/测试集，避免数据泄漏"
+    validation:
+      size: 912
+      purpose: "模型选型（5 个模型对比）+ 输出深度消融（top-3 模型）"
+    test:
+      size: 912
+      purpose: "用最优模型 + 最优配置出最终指标，与 exp-003 粗排结果直接对比"
+
+  input_source:
+    description: "使用 exp-003 S4 最优配置（D-B0+D-P2+D-HyDE+B-B0, per-route K=50, RRF k=60）产出的 top-50 融合结果作为精排候选池"
+    candidate_pool_size: 50
+    candidate_source: "exp-003 S4 RRF 融合输出，每条 query 最多 50 条 (pid, score, rank)"
+    passage_text: "通过 pid 从 collection.tsv 中查找对应 passage 原文，与 query 原文拼接成 (query, passage) pair 送入 Reranker"
+    note: "精排是对粗排结果的重排，不涉及从全量 230 万池中重新检索。因此精排的 Recall@k 上限被粗排的 Recall@50 锁死（0.6912）。精排的目标是提升排序质量（NDCG/MRR），而非扩大召回"
+
+  qrels_format:
+    note: "T2Ranking 的 qrels 文件包含 4 级标注（0/1/2/3），exp-002/003 只用了二元相关性（relevant or not）。精排阶段建议同时计算二元和分级 NDCG"
+    binary_relevance: "label > 0 → relevant (沿用 exp-002/003 标准)"
+    graded_relevance: "label ∈ {0, 1, 2, 3} → 直接作为 NDCG 的 gain 值（能更精细地区分'部分相关'和'高度相关'）"
+
+  metrics:
+    primary:
+      - NDCG@10
+      - NDCG@10_graded
+      note: "NDCG 是精排评估的核心指标——它同时衡量'相关文档是否排在前面'和'高相关文档是否比低相关文档排得更前'。二元 NDCG 与之前实验可比，分级 NDCG 利用 T2Ranking 的 4 级标注提供更细粒度的排序质量度量"
+    secondary:
+      - MRR
+      - Recall@10
+      - Recall@20
+      note: "延续 exp-002/003 的指标，便于直接对比精排 vs 粗排的 MRR/Recall 增益"
+    supplementary:
+      - Precision@5
+      - Precision@10
+      - Hit@5
+      - Hit@10
+      note: "精排阶段更关注小 K 值（5/10），因为这些是最终喂给 LLM 做 RAG 生成的上下文量"
+
+  metric_definitions:
+    ndcg:
+      formula: "NDCG@k = DCG@k / IDCG@k"
+      dcg: "DCG@k = Σ_i=1^k rel_i / log2(i+1)"
+      binary: "rel ∈ {0, 1}"
+      graded: "rel ∈ {0, 1, 2, 3}（直接使用 T2Ranking 的 label 值作为 gain）"
+    mrr:
+      formula: "MRR = (1/N) * Σ 1/rank_of_first_relevant"
+    recall:
+      formula: "Recall@k = |relevant_docs_in_top_k| / |all_relevant_docs|"
+
+
+# =============================================================================
+# 第四部分：实验分组
+# =============================================================================
+
+experiment_groups:
+
+  # ========== Group A：所有 5 个模型的完整排名 ==========
+  model_comparison:
+    objective: "在验证集上对比 5 个开源 Reranker 的表现，选出精排效果最好的 3 个模型进入深度消融"
+    fixed:
+      candidate_pool: "exp-003 S4 RRF top-50"
+      rerank_output_k: 50
+      eval_k_values: [5, 10, 20, 50]
+      split: "validation (912 queries)"
+      device: "cuda:0 (RTX 4090 24GB)"
+      batch_size: "根据模型大小自适应（预期 16~64 pairs/batch），需在脚本中实测"
+      fp16: true
+    variables:
+      model: ["bge-base", "gte-mul", "bge-v2-m3", "qwen3-rerank", "mxbai-v2"]
+    total_experiments: 5
+    output:
+      - "5 个模型的 NDCG@5/10/20、MRR、Recall@5/10/20、Precision@5/10"
+      - "按 NDCG@10 排名，选 top-3 进入 Group B"
+    design_note: "每个模型只跑一次（无消融变量），纯模型对比阶段"
+
+  # ========== Group B：输出深度消融 ==========
+  output_depth_ablation:
+    objective: "对 Group A 选出的 top-3 模型，消融精排输出深度（rerank_output_k）对最终指标的影响"
+    rationale: "精排后的结果最终会截断到 top-5 或 top-10 喂给 LLM。但 Reranker 在对更多候选（如 50 个）做重排时，可能因为看到了更多上下文而产出更好的 top-5 排序。消融验证：给 Reranker 看 20 个候选 vs 50 个候选，最终截断到 top-5 的质量是否有差异"
+    fixed:
+      candidate_pool: "exp-003 S4 RRF top-50（始终给 Reranker 完整的 50 个候选）"
+      eval_k_values: [5, 10, 20]
+      split: "validation (912 queries)"
+      device: "cuda:0 (RTX 4090 24GB)"
+      fp16: true
+    variables:
+      model: "Group A top-3 模型"
+      rerank_output_k: [10, 20, 50]
+      note: "rerank_output_k 是 Reranker 处理后保留的文档数。Reranker 始终对全部 50 个候选打分并按分排序，然后取 top-K 计算指标"
+    total_experiments: 9
+    output: "每个 (model × K) 组合的 NDCG@10、MRR、Recall@10"
+    note: "如果 K=10 和 K=50 的 NDCG@10 几乎无差异，说明 Reranker 对 top-10 排序已经足够稳定，输出 K=10 就够了（节省后续 LLM 生成成本）"
+
+  # ========== Group C：测试集最终评估 ==========
+  final_test:
+    objective: "用验证集选出的最优模型 + 最优配置在测试集上跑最终指标"
+    experiments:
+      description: "最优模型 + 最优 rerank_output_k + 次优模型（作为对照），共 2~3 个配置"
+    split: "test (912 queries)"
+    output:
+      - "最终 NDCG@5/10/20、NDCG@10_graded、MRR、Recall@5/10/20、Precision@5/10、Hit@5/10"
+      - "对比表：粗排（exp-003 S4）vs 精排（exp-004 最优）在同一测试集上的各项指标"
+
+  # ========== Group D（可选）：指令感知消融（仅 Qwen3-Reranker）==========
+  instruction_ablation:
+    objective: "如果 Qwen3-Reranker-0.6B 入选 top-3，消融其指令感知能力——对比有 instruction prompt 和无 instruction prompt 的效果差异"
+    status: "可选——取决于 Group A 中 qwen3-rerank 是否入选 top-3"
+    fixed:
+      candidate_pool: "exp-003 S4 RRF top-50"
+      rerank_output_k: 50
+    variables:
+      instruction:
+        - "none（query 直接与 passage 拼接）"
+        - "Chinese retrieval（指定检索任务为中文文档检索）"
+        - "Domain-specific（定制领域 prompt）"
+    note: "Qwen3-Reranker 论文提出通过 <Instruct>:<Query>:<Document> 格式可提升 1%-5%。但在中文检索场景下是否有效需要实际验证"
+
+
+# =============================================================================
+# 第五部分：分析问题
+# =============================================================================
+
+analysis_questions:
+
+  model_selection:
+    - "Q1: 5 个候选模型中，哪个在 T2Ranking 验证集上 NDCG@10 最高？是否与 CMTEB-R 公开排名一致？"
+    - "Q2: 阿里系模型（gte-mul + qwen3-rerank）在中文精排上是否系统性地优于 BAAI 系（bge-base + bge-v2-m3）？如果是，可能因为阿里系预训练数据中中文占比更大"
+    - "Q3: mxbai-rerank-base-v2（英文 BEIR 最强，Qwen 基座）在中文上能打吗？如果能，它就是「中英文兼顾」的最佳方案"
+    - "⚠️ Q3.5（数据泄露）: BGE 模型（base + v2-m3）是否显著优于非 BGE 模型（gte-mul / qwen3-rerank / mxbai-v2）？如果 NDCG@10 差距 > 5%，数据集泄露是最可能的解释。在存在泄露风险的情况下，应选择非 BGE 模型中 NDCG@10 最高的模型作为最终推荐"
+
+  ranking_quality:
+    - "Q4: 精排后的 MRR 比粗排提升多少？目标：从 ~0.50 提升到 0.55+"
+    - "Q5: 精排后的 NDCG@10 是多少？目标：0.65+（如能达到，意味着 top-10 的排序质量可以支撑高质量 RAG 生成）"
+    - "Q6: 分级 NDCG（利用 4 级标注）vs 二元 NDCG 的差异有多大？分级 NDCG 高说明 Reranker 能把「高度相关」的 passage 排在「部分相关」前面——这对最终答案质量很重要"
+    - "Q7: Precision@5 / Precision@10 是多少？目标：P@10 > 0.25（意味着 top-10 中平均有 2.5 个相关 passage）"
+
+  depth_ablation:
+    - "Q8: Reranker 输出 K 对 NDCG@10 有影响吗？如果 K=10 和 K=50 的 NDCG@10 相同，说明 Reranker 在 top-10 排序上已收敛，输出截断到 10 就够了"
+    - "Q9: 最优输出深度是多少？这直接影响后续 RAG 生成的 token 消耗——K=5 成本最低但可能牺牲精度，K=20 更安全但成本高"
+
+  model_efficiency:
+    - "Q10: 5 个模型的推理速度如何？在 RTX 4090 24GB 上，912 条 query × 50 候选 = 45,600 对，各模型需要多长时间？"
+    - "Q11: 模型参数量和精排效果是否成正比？如果不，小模型性价比更高"
+    - "Q12: 最优模型的 GPU 内存占用是多少？是否留有足够空间与 Embedding 模型同时部署？"
+
+  cross_experiment_comparison:
+    - "Q13: 精排后的 Recall@10 比粗排高还是低？注意：精排不扩大召回（候选池受限于粗排 top-50），Recall@10 理论上只会持平或略低。但如果 Recall@10 反而高了，说明 Reranker 在 50 个候选中把被 RRF 排到 11-50 位的相关 passage 提升到了 top-10"
+    - "Q14: 精排的 Recall@50 是否等于粗排？如果是，确认 Reranker 不丢失任何相关 passage"
+
+
+# =============================================================================
+# 第六部分：实现说明
+# =============================================================================
+
+implementation:
+
+  script: "scripts/evaluate_exp004.py"
+  description: "纯推理脚本——加载候选模型权重 → 读取 exp-003 的 split 分配 → 对每条 query 的 top-50 候选用 Reranker 重打分 → 排序 → 计算指标。不需要额外训练或 API 调用"
+
+  input_files:
+    - "data/raw/t2ranking/queries.dev.tsv"                                     # 查询文本（用于与 passage 文本拼接）
+    - "data/raw/t2ranking/qrels.retrieval.dev.tsv"                             # 相关性标注
+    - "data/raw/t2ranking/collection.tsv"                                      # Passage 全文（用 pid 查找）
+    - "results/exp002_dense_details/exp002_E2a-B0_s2000_similarity.jsonl"     # D-B0 检索结果
+    - "results/exp002_dense_details/exp002_E2a-P2_s2000_similarity.jsonl"     # D-P2 检索结果
+    - "results/exp002_dense_details/exp002_E2c-H2_s2000_similarity.jsonl"     # D-HyDE 检索结果
+    - "results/exp002_bm25_details/exp002_E2a-B0_s2000_bm25.jsonl"           # B-B0 检索结果
+
+  reranker_input_format:
+    description: "对每条 query，从 RRF 融合输出的 top-50 中取 pid → 查 collection.tsv 获取 passage 原文 → 拼接为 (query_text, passage_text) 对 → 送入 Reranker 获取相关性分数"
+    example: |
+      query: "蜂巢快递柜验证码摁错怎么办"
+      passage: "蜂巢快递柜是国内常见的智能快递柜品牌..."
+
+  reranker_scoring:
+    description: "所有 5 个候选模型均以 Cross-Encoder 方式工作：同时编码 query 和 passage，输出一个标量相关性分数。分数越高代表 passage 越相关"
+    normalization:
+      bge_models: "FlagReranker.compute_score() 支持 normalize=True（sigmoid 归一化到 [0, 1]），建议开启以便跨模型对比"
+      others: "transformers 原生的 logit 输出。如需归一化，可在后处理中统一做 min-max 或 sigmoid"
+
+  inference_pipeline: |
+    1. 加载 exp-003 的 split 分配文件（或重新执行 split, seed=42）→ validation_qids + test_qids
+    2. 加载 RRF 融合结果（复用 exp-003 S4 K=50 RRF k=60 的融合输出）
+    3. 对验证集：
+       a. 加载 collection.tsv → pid_to_text 映射（只加载用到的 pid，节省内存）
+       b. 对每条 query：RRF top-50 候选 → 查 passage 原文 → 构造 (query, passage) pairs
+       c. Batch 推理 → 获取相关性分数 → 按分降序重排
+       d. 计算 NDCG@k / MRR / Recall@k / Precision@k / Hit@k
+    4. 全部 5 个模型跑完（Group A）→ 选 top-3 做深度消融（Group B）
+    5. 验证集选最优配置 → 测试集最终评估（Group C）
+
+  collection_loading_optimization:
+    description: "collection.tsv 有 230 万行、~3.5GB。但 exp-003 只涉及 2000 条 query 和少量 pid，不需要加载全部"
+    approach: "先扫描所有需要的 pid → 只加载这些 pid 对应的 passage 文本（预期最多 ~100K 条，内存占用 < 1GB）"
+
+  hardware_considerations:
+    gpu: "RTX 4090 24GB"
+    memory_estimate:
+      bge_base: "~280MB (FP16)"
+      gte_mul: "~600MB (FP16)"
+      bge_v2_m3: "~1.1GB (FP16)"
+      qwen3_rerank: "~1.2GB (FP16)"
+      mxbai_v2: "~1.0GB (FP16)"
+    batch_size_estimate:
+      note: "Cross-Encoder 推理内存与 batch_size × max_seq_len² 成正比。512 token 限制下 batch_size=32 约需 2-4GB 额外内存。全部 5 个模型在 RTX 4090 24GB 上均无 OOM 风险"
+    expected_throughput:
+      per_model: "45,600 pairs (912 query × 50 candidate) ÷ batch 推理，预期每模型耗时 2-5 分钟"
+      total_estimate: "5 个模型约 15-25 分钟"
+
+  candidate_passage_count_check:
+    description: "RRF 融合输出在某些 query 上可能不足 50 条（如果各路召回的总 pid 数不足 50）。脚本需要处理这种情况——不足 50 条时，对所有可用候选做精排"
+    expected: "绝大部分 query 应该有完整的 50 条（每路 50 条且多路 fusion 极大缓解稀疏性）"
+
+  evaluation_note:
+    ndcg_implementation: "NDCG 需要在 evaluation/metrics.py 中新增实现。当前 metrics.py 只支持 Recall/Precision/Hit/MRR，没有 NDCG"
+    graded_ndcg: "T2Ranking qrels 的 label 列（第 3 列）包含 0/1/2/3 四级标注，可在 data_loader.py 中新增加载逻辑"
+    cache: "考虑复用 result_cache.py 的缓存逻辑，避免每次重新计算"
+
+
+# =============================================================================
+# 第七部分：预期时间与成本
+# =============================================================================
+
+time_and_cost:
+
+  model_download:
+    total_size: "~4.5GB (5 个模型)"
+    download_time: "~10 分钟（取决于 AutoDL 网络速度）"
+
+  inference:
+    total_pairs_per_model: "~45,600 (912 validation × 50 candidates)"
+    per_model_time: "~2-5 分钟（batch_size=32, FP16, RTX 4090）"
+    group_a_time: "~15-25 分钟（5 个模型）"
+    group_b_time: "~6-15 分钟（3 个模型 × 3 输出深度，注意不同输出深度不需要重新推理——只需截断后重新计算指标）"
+    group_c_time: "~2-5 分钟（1-2 个模型，测试集）"
+    total_inference: "~20-40 分钟"
+
+  llm_api_cost:
+    note: "本实验无 LLM API 调用，纯开源模型本地推理。零 API 费用"
+
+  total_cost: "¥0（仅 GPU 租赁费用，已由 AutoDL 按小时计费覆盖）"
+
+
+# =============================================================================
+# 第八部分：后续方向
+# =============================================================================
+
+future_directions:
+
+  immediate:
+    - "exp-004 最优模型 + 最优输出 K 确定后 → 将精排结果接入 RAG 生成管道，评估端到端答案质量（Faithfulness / Correctness）"
+    - "与 exp-003 粗排直接对比：精排后 top-5/top-10 喂给 LLM，观察答案质量提升"
+
+  short_term:
+    - "如果所有开源模型 NDCG@10 < 0.60：说明 T2Ranking 需要领域微调 → 用 qrels + hard negatives 微调最优模型（V1 阶段）"
+    - "如果 Qwen3-Reranker 指令感知有显著增益：为项目定制中文检索 instruction，最大化领域匹配"
+    - "多路粗排召回的最佳候选数量（top-30 vs top-50 vs top-100）对精排效果的影响——需要扩大粗排输出 K 再消融"
+
+  medium_term:
+    - "LLM-based Reranker 对比（如 RankLLaMA-7B）：如果 Cross-Encoder 精排后仍有瓶颈，考虑 LLM-based"
+    - "精排 + RAG 生成的端到端 pipeline 搭建：粗排(RRF) → 精排(Cross-Encoder) → LLM 生成 → 评估"
+    - "自适应输出深度：简单 query 只取 top-3，复杂 query 取 top-10，用分类器动态决定"

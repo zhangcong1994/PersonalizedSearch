@@ -11,8 +11,10 @@ if sys.platform == "win32":
 
 import requests
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SAVE_DIR = PROJECT_ROOT / "data" / "raw" / "t2ranking"
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.utils.config import RAW_DATA_DIR
+
+SAVE_DIR = RAW_DATA_DIR / "t2ranking"
 
 FILES = {
     "collection.tsv":           ("2,303,643 条 passage", "~3.5 GB"),

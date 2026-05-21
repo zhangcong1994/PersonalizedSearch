@@ -408,6 +408,28 @@ def main():
     ]
     print_results_table(phase1_metrics, p1_metric_names, "Phase 1: Model Comparison (Val, K=50)")
 
+    # ── Sanity: detect identical results (possible cache collision / model loading bug) ──
+    import hashlib
+    model_fingerprints = {}
+    for mid in model_ids:
+        r = phase1_results[mid]
+        if not r:
+            continue
+        first = r[0]
+        scores_str = json.dumps(
+            first.get("retrievals", {}).get(mid, [])[:5], sort_keys=True
+        )
+        fp = hashlib.md5(scores_str.encode()).hexdigest()
+        model_fingerprints[mid] = fp
+    for i in range(len(model_ids)):
+        for j in range(i + 1, len(model_ids)):
+            a, b = model_ids[i], model_ids[j]
+            if model_fingerprints[a] == model_fingerprints[b]:
+                logger.error(
+                    f"[SANITY FAIL] {a} and {b} produced IDENTICAL top-5 rankings! "
+                    f"Check cache files in {phase1_cache_dir} and model downloads."
+                )
+
     # ── Select top-3 ──
     ranking = sorted(
         model_ids,
@@ -448,8 +470,9 @@ def main():
                 phase2_metrics[config_key] = build_metrics_entry(
                     truncated, model_id, EVAL_K_VALUES, graded_qrels_val
                 )
-                ndcg10 = phase2_metrics[config_key].get("NDCG@10", 0)
-                logger.info(f"  [{config_key}] NDCG@10={ndcg10:.4f}")
+                ndcg20 = phase2_metrics[config_key].get("NDCG@20", 0)
+                mrr = phase2_metrics[config_key].get("MRR", 0)
+                logger.info(f"  [{config_key}] NDCG@20={ndcg20:.4f}  MRR={mrr:.4f}")
 
         # ── Phase 2 table ──
         p2_cols = ["NDCG@5", "NDCG@10", "NDCG@20", "NDCG@10_graded", "MRR", "Recall@10", "Precision@5"]
@@ -464,15 +487,12 @@ def main():
     best_depth = 50
 
     if not args.skip_phase2 and phase2_metrics:
-        best_ndcg = -1.0
+        best_score = -1.0
         for mid in top3:
-            for depth in OUTPUT_DEPTHS:
-                ck = f"{mid}_K{depth}"
-                val = phase2_metrics.get(ck, {}).get("NDCG@10", -1.0)
-                if val > best_ndcg:
-                    best_ndcg = val
-                    best_model_id = mid
-                    best_depth = depth
+            val = phase2_metrics.get(f"{mid}_K50", {}).get("NDCG@10", -1.0)
+            if val > best_score:
+                best_score = val
+                best_model_id = mid
 
     print()
     print("=" * 70)

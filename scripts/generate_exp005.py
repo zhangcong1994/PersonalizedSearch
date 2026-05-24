@@ -64,6 +64,14 @@ MODEL_CONFIGS = {
         "max_tokens": 1024,
         "temperature": 0.3,
     },
+    "qwen3-4b-nothink": {
+        "hf_id": "Qwen/Qwen3-4B",
+        "backend": "local",
+        "params": "4B",
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
     "qwen2.5-7b": {
         "hf_id": "Qwen/Qwen2.5-7B-Instruct",
         "backend": "local",
@@ -72,6 +80,20 @@ MODEL_CONFIGS = {
         "temperature": 0.3,
         "quantization": "int4",
         "alt_hf_id": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
+    },
+    "glm4-9b": {
+        "hf_id": "THUDM/glm-4-9b-chat",
+        "backend": "local",
+        "params": "9B",
+        "max_tokens": 1024,
+        "temperature": 0.3,
+    },
+    "llama3.1-8b": {
+        "hf_id": "meta-llama/Llama-3.1-8B-Instruct",
+        "backend": "local",
+        "params": "8B",
+        "max_tokens": 1024,
+        "temperature": 0.3,
     },
     "deepseek-chat": {
         "hf_id": None,
@@ -175,13 +197,18 @@ def generate_local_vllm(
     from src.intent.api_client import LangChainLLMClient
     from langchain_openai import ChatOpenAI
 
-    llm = ChatOpenAI(
+    llm_kwargs = dict(
         model=model_config["hf_id"],
         api_key="not-needed",
         base_url=vllm_url,
         max_tokens=model_config.get("max_tokens", 1024),
         temperature=model_config.get("temperature", 0.3),
     )
+    extra_body = model_config.get("extra_body")
+    if extra_body:
+        llm_kwargs["model_kwargs"] = {"extra_body": extra_body}
+
+    llm = ChatOpenAI(**llm_kwargs)
     client = LangChainLLMClient(llm)
     _run_generation(client, model_config, query_data, prompt_manager, output_file, "vllm")
 

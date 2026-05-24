@@ -1,0 +1,661 @@
+# 实验计划：V0 LLM 生成阶段 —— 生成模型对比 + 评估标准实现 + 人机校准
+# exp-005: 多开源生成模型在 AI 搜索场景下的生成质量对比
+# 创建日期：2026-05-24
+# 最后更新：2026-05-24
+
+meta:
+  experiment_id: exp-005
+  phase: V0
+  objective: "实现 AI 搜索生成质量评估标准，通过人机校准验证 LLM-as-a-Judge 的有效性，对比多个开源生成模型在固定检索输入下的答案质量"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-004 精排已完成（有最优 Reranker + top-K 排序结果）"
+  design_principle: "固定检索-精排 pipeline 输出不变，仅更换生成模型。评估采用 LLM-as-a-Judge 范式，Judge 评估前先经过人机校准验证一致性"
+  parallel_tracks:
+    - "Track A: 实现评估标准代码（6 维核心生成阶段评估，分两批，后续可扩展至 11 维 + 6 层系统级整体报告）"
+    - "Track B: 人机校准（人工标注 → Judge 一致性检验 → 校准 Judge Prompt）"
+    - "Track C: 多模型生成对比（小模型部署 + 强 API 模型上限 → 统一评估）"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么 exp-005 是实验链的最后一环
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    exp001_baseline: "单路检索基线 Recall@50 = 0.6531"
+    exp003_best: "多路 RRF 融合 Recall@50 = 0.6912"
+    exp004_best: "精排后 NDCG@10 提升（待 exp-004 完成后确定）"
+    remaining_question: "最好的检索 + 最好的精排 → 喂给 LLM 生成答案，答案质量到底如何？哪个 LLM 最适合这个任务？"
+
+  why_now:
+    reason: "exp-001 到 exp-004 完成了检索链的全部优化，但最终用户看到的是 LLM 生成的答案。前面的优化都是为这一环节服务的——如果生成环节塌方，前面的努力都白费"
+    urgency: "这是实验链的最后一环，决定了整个系统的最终用户体验"
+
+  why_multiple_models:
+    core_reason: "不同 LLM 在「阅读检索文档 → 综合信息 → 生成答案」这个任务上的表现差异巨大。需要量化对比才能做出有依据的选型决策"
+    key_questions:
+      - "Q1: 1.5B-4B 的小模型能否胜任 AI 搜索的生成任务？质量与 7B 差距多大？"
+      - "Q2: Qwen3-4B 新一代小模型是否如官方宣称的「媲美大得多的模型」？"
+      - "Q3: 本地部署模型与 DeepSeek API 的质量差距有多大？这个差距值得花钱吗？"
+      - "Q4: 不同模型的短板分别在哪里？（准确性？综合质量？引文？拒答判断？）"
+
+  why_human_calibration:
+    core_reason: "LLM-as-a-Judge 不能自说自话。需要先证明 Judge 的评分与人类标注者一致，评估结果才有说服力"
+    specific_needs:
+      - "验证 6 维核心评估标准的可操作性（人类能否一致地按 Rubric 打分？后续扩展至 11 维）"
+      - "确定 Judge LLM 在哪些维度上与人类一致，哪些维度需要特殊处理"
+      - "校准 Judge Prompt（通过人机差异分析优化评分指令）"
+
+  why_ideal_ranking:
+    reason: "精排后的 top-10 仍可能包含不相关的 passage。用「理想排序」（qrels 中已知相关的 passage 排在最前）测试生成模型，可以测量生成质量的理论上限——排除检索噪声后 LLM 本身的极限在哪儿？"
+    use_case: "如果某个模型在精排输入下表现差但在理想输入下表现好 → 问题在检索端。如果两个输入下都差 → 问题在生成端"
+
+
+# =============================================================================
+# 第二部分：候选生成模型
+# =============================================================================
+
+candidate_models:
+
+  # ========== Group A：本地可部署模型（小模型，RTX 4090 24GB）==========
+
+  - id: "qwen2.5-1.5b"
+    name: "Qwen2.5-1.5B-Instruct"
+    hf_id: "Qwen/Qwen2.5-1.5B-Instruct"
+    series: "Qwen2.5"
+    params: "1.5B"
+    vram_fp16: "~3GB"
+    vram_int4: "~1GB"
+    context_len: 32768
+    license: "Apache 2.0"
+    chat_template: "qwen"
+    selection_rationale: "最轻量基线——验证 AI 搜索生成任务的最小可行模型规模"
+    expected_role: "质量下界参照"
+
+  - id: "qwen2.5-3b"
+    name: "Qwen2.5-3B-Instruct"
+    hf_id: "Qwen/Qwen2.5-3B-Instruct"
+    series: "Qwen2.5"
+    params: "3B"
+    vram_fp16: "~6GB"
+    vram_int4: "~2GB"
+    context_len: 32768
+    license: "Apache 2.0"
+    chat_template: "qwen"
+    selection_rationale: "轻量但有一定生成质量——如果它与 7B 差距不大，3B 是生产部署的甜蜜点"
+    expected_role: "性价比参照"
+
+  - id: "qwen3-4b"
+    name: "Qwen3-4B"
+    hf_id: "Qwen/Qwen3-4B"
+    series: "Qwen3"
+    params: "4B"
+    vram_fp16: "~8GB"
+    vram_int4: "~2.5GB"
+    context_len: 32768
+    license: "Apache 2.0"
+    chat_template: "qwen3"
+    notes: "2025 年 4 月发布。官方宣称在多项 benchmark 上媲美 Qwen2.5-72B-Instruct。支持 thinking/non-thinking 模式切换（本实验使用 non-thinking 模式以控制变量）"
+    selection_rationale: "新一代小模型 SOTA 代表——验证 Qwen3 的「小模型大能力」宣言在 AI 搜索任务上是否成立"
+    expected_role: "小模型质量上限参照"
+
+  # ========== Group B：本地中等模型 ==========
+
+  - id: "qwen2.5-7b"
+    name: "Qwen2.5-7B-Instruct"
+    hf_id: "Qwen/Qwen2.5-7B-Instruct"
+    series: "Qwen2.5"
+    params: "7B"
+    vram_fp16: "~14GB"
+    vram_int4: "~4GB"
+    context_len: 131072
+    license: "Apache 2.0"
+    chat_template: "qwen"
+    notes: "中文社区最广泛使用的开源 7B 模型。如果 RTX 4090 FP16 显存紧张，使用 INT4 量化（GPTQ/AWQ）"
+    selection_rationale: "本地部署的质量基准——7B 是目前「能用且能自己部署」的共识上限。如果 Qwen3-4B 能接近甚至超越它，部署成本将大幅下降"
+    expected_role: "本地部署质量基准"
+
+  # ========== Group C：API 强模型（生成质量上界）==========
+
+  - id: "deepseek-chat"
+    name: "DeepSeek-V3 (deepseek-chat)"
+    provider: "DeepSeek API"
+    backend: "api"
+    params: "671B (MoE, 37B activated)"
+    context_len: 131072
+    cost_1k_input: "¥0.002"
+    cost_1k_output: "¥0.008"
+    notes: "项目已集成（config.yaml generation.api_client）。中文能力顶级，是理想的「生成质量上界」参照"
+    selection_rationale: "最强中文 API 模型之一——代表「如果预算无限，生成质量最高能达到多少」"
+    expected_role: "生成质量上界参照"
+
+  - id: "gpt-4o-mini"
+    name: "GPT-4o-mini"
+    provider: "OpenAI API"
+    backend: "api"
+    params: "未公开"
+    context_len: 128000
+    cost_1k_input: "¥0.0011"
+    cost_1k_output: "¥0.0044"
+    notes: "成本可控的强模型。纳入对比以观察不同模型家族的生成风格差异（阿里系 vs DeepSeek vs OpenAI）"
+    selection_rationale: "OpenAI 系的参照点——如果 Qwen 模型表现接近 GPT-4o-mini，说明开源模型已达到商用水平"
+    expected_role: "跨家族质量参照"
+    optional: true
+
+  # ========== 模型汇总 ==========
+  summary_table:
+    columns: ["ID", "参数量", "VRAM FP16", "上下文", "部署方式", "角色"]
+    rows:
+      - ["qwen2.5-1.5b", "1.5B", "~3GB", "32K", "本地", "质量下界"]
+      - ["qwen2.5-3b", "3B", "~6GB", "32K", "本地", "性价比参照"]
+      - ["qwen3-4b", "4B", "~8GB", "32K", "本地", "小模型上限"]
+      - ["qwen2.5-7b", "7B", "~14GB", "128K", "本地(INT4备选)", "本地质量基准"]
+      - ["deepseek-chat", "671B MoE", "API", "128K", "API", "质量上界"]
+      - ["gpt-4o-mini", "未公开", "API", "128K", "API (可选)", "跨家族参照"]
+
+  exclusions:
+    - model: "Qwen3-8B / Qwen3-14B / Qwen3-32B"
+      reason: "8B FP16 约 16GB VRAM，RTX 4090 勉强可跑但余量紧张；14B+ 超出单卡能力。V1 阶段如需更高精度可引入 INT4 版本"
+    - model: "MiniCPM3-4B"
+      reason: "Qwen3-4B 发布后，MiniCPM3-4B 在大部分 benchmark 上被超越。保留 Qwen3-4B 作为小模型代表即可。如果想增加模型多样性可在后续补充"
+    - model: "GLM-4-9B-Chat"
+      reason: "9B FP16 需要 ~18GB VRAM，超出 RTX 4090 舒适区。INT4 版本可在 V1 补充"
+    - model: "DeepSeek-R1"
+      reason: "推理模型（thinking mode），与本次实验的 non-thinking 模式不可比。后续可作为专项实验对比 reasoning vs non-reasoning"
+    - model: "Qwen3-0.6B"
+      reason: "0.6B 太小，生成质量预期极差，对选型决策没有参考价值"
+
+
+# =============================================================================
+# 第三部分：评估框架
+# =============================================================================
+
+evaluation:
+
+  # ── 两套评估体系的角色分工 ──
+  framework_roles:
+    system_level:
+      file: "exp-005-ai-search-eval-rubric.md"
+      dimensions: 6
+      rubric: "L1准确性 | L2整合质量 | L3引文质量 | L4相关性 | L5用户体验 | L6安全合规"
+      usage: "整体结果报告——最终对外展示各模型的系统级表现"
+      score_handler: "aggregate_scores()（门槛法 + 加权求和，见 improvement-suggestions.md）"
+
+    generation_stage:
+      file: "exp-005-generation-stage-eval-rubric.md"
+      dimensions: 6
+      note: "首轮评估使用 6 个核心维度（分两批：Batch1 准确性+安全性+相关性，Batch2 整合质量+引文质量+用户体验）。完整 11 维（+指令遵循、上下文利用、拒答判断、结构适配、内部一致性）留待后续扩展。"
+      rubric: |
+        继承组: G-L1准确性 | G-L2综合质量 | G-L3引文质量 | G-L4相关性 | G-L5用户体验 | G-L6安全合规
+      usage: "模型对比的主要依据——干净地衡量 LLM 生成模块本身的能力"
+      score_handler: "aggregate_gen_stage_scores()（见下文实现）"
+
+  # ── Judge LLM 配置 ──
+  judge:
+    primary:
+      model: "deepseek-chat"
+      reason: "项目已集成；中文能力强；成本低（¥0.002/1K input）"
+      temperature: 0.0
+    fallback:
+      model: "gpt-4o-mini"
+      reason: "交叉验证 Judge 一致性（用于分析 deepseek-chat 作为 Judge 是否有系统性偏差）"
+      temperature: 0.0
+      usage: "仅在人机校准阶段和最终报告的关键结论验证中使用（控制成本）"
+
+  # ── 评分聚合（生成阶段 6 维核心）──
+  aggregation_gen_stage:
+    description: "生成阶段 6 维核心加权聚合。G-L6 安全为一票否决维度。完整 11 维权重（含 G-A~G-E）见下方扩展计划。"
+
+    weights:
+      G_L1_veracity: 0.25
+      G_L2_synthesis: 0.25
+      G_L3_citation: 0.15
+      G_L4_relevance: 0.15
+      G_L5_ux: 0.10
+      G_L6_safety: "gate"
+
+    # 扩展至 11 维时的权重（后续迭代使用）
+    extended_11dim_weights:
+      G_L1_veracity: 0.22
+      G_L2_synthesis: 0.20
+      G_L3_citation: 0.12
+      G_L4_relevance: 0.12
+      G_L5_ux: 0.08
+      G_L6_safety: "gate"
+      G_A_instruction: 0.10
+      G_B_context_util: 0.08
+      G_C_refusal: 0.05
+      G_D_structuring: 0.03
+      G_E_consistency: 0.00  # 短答案参考价值有限，权重为 0（仅记录不参与计分）
+
+    gate_rules:
+      - dimension: "G_L6_safety"
+        threshold: 2
+        action: "score < 2 → 一票否决，total_score = 0, grade = 'F'"
+      - dimension: "G_L1_veracity"
+        threshold: 2
+        action: "score < 2 → 一票否决（答案事实严重错误，不可用）"
+
+    grade_mapping:
+      S: "≥ 90: 所有维度优秀，可作为产品答案直接使用"
+      A: "≥ 80: 核心维度优秀，支撑维度有微小瑕疵"
+      B: "≥ 70: 合格，无明显短板"
+      C: "≥ 60: 勉强可用，有明显需改进之处"
+      D: "< 60: 不可用"
+
+  # ── 系统级 6 层聚合（用于整体报告）──
+  aggregation_system_level:
+    description: "生成阶段 6 维与系统级 6 层 1:1 映射。扩展至 11 维时，特有组（G-A~G-E）按语义合并或单独列为附录指标。"
+
+    mapping:
+      L1_veracity: "G-L1"
+      L2_synthesis: "G-L2"
+      L3_citation: "G-L3"
+      L4_relevance: "G-L4"
+      L5_ux: "G-L5"
+      L6_safety: "G-L6"
+
+    future_appendix_metrics:
+      - "G-A 指令遵循（扩展至 11 维后启用）"
+      - "G-B 上下文利用效率（扩展至 11 维后启用）"
+      - "G-C 拒答与边界判断（扩展至 11 维后启用）"
+      - "G-D 答案结构适配（扩展至 11 维后启用）"
+      - "G-E 内部一致性（扩展至 11 维后启用）"
+
+  # ── 度量指标 ──
+  metrics:
+    primary:
+      - "generation_quality_score (0-100, 6维核心加权；后续扩展至 11 维)"
+      - "system_level_score (0-100, 6层加权)"
+      - "per_dimension_scores (每个维度 1-4 分 + reason)"
+    secondary:
+      - "gate_failure_rate (门槛不通过比例)"
+      - "grade_distribution (S/A/B/C/D 分布)"
+      - "avg_answer_length (平均答案长度，辅助分析 verbosity bias)"
+      - "avg_generation_time (平均生成耗时)"
+    analysis:
+      - "dimension_correlation_matrix (6 维之间的评分相关性)"
+      - "model_weakness_profile (每个模型的短板维度雷达图)"
+      - "query_type_breakdown (按查询类型分组的各维度分数)"
+
+
+# =============================================================================
+# 第四部分：实验数据
+# =============================================================================
+
+data:
+  source: "T2Ranking dev（复用 exp-001 ~ exp-004）"
+  queries_file: "data/raw/t2ranking/queries.dev.tsv"
+  qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+  collection_file: "data/raw/t2ranking/collection.tsv"
+
+  # ── 查询采样 ──
+  query_sampling:
+    total_available: 1824
+    methodology: "分层采样（stratified sampling by query type），确保各查询类型均有充分代表性"
+    target_sample_size: 200
+    strata:
+      factoid: { target: 40, description: "事实型查询（如：X的Y是多少）" }
+      concept: { target: 40, description: "概念解释型（如：什么是X）" }
+      comparison: { target: 40, description: "对比型（如：X和Y的区别）" }
+      how_to: { target: 40, description: "操作指导型（如：如何做X）" }
+      open_ended: { target: 40, description: "开放讨论型（如：X对Y的影响）" }
+    note: "如果某类型在数据集中不足 40 条，则全取该类型。总样本量在 150-200 之间"
+    human_calibration_subsample: 50
+    human_calibration_method: "从 200 条中随机抽取 50 条（保证各类型 ≥5 条），用于人机校准"
+
+  # ── 生成输入（两种模式）──
+  generation_inputs:
+    reranker_top10:
+      description: "exp-004 最优 Reranker 的 top-10 排序结果"
+      source: "exp-004 最终评估输出（Reranker 精排后的 top-10 passage 列表）"
+      top_k: 10
+      usage: "主实验——所有模型使用相同的检索上下文生成答案"
+      note: "10 条 passage 按 exp-004 精排分数从高到低排列"
+
+    ideal_top10:
+      description: "理想排序（oracle）：qrels 中标记为相关的 passage 排在最前面"
+      source: "T2Ranking qrels + collection.tsv"
+      top_k: 10
+      generation: "查找每个 query 在 qrels 中所有相关 passage，按 label 降序排列，取 top-10"
+      usage: "上限测试——排除检索噪声后，测量 LLM 本身的生成质量上限"
+      note: "可选：仅在核心模型上测试（deepseek-chat + qwen3-4b + qwen2.5-7b）"
+
+
+# =============================================================================
+# 第五部分：实验分组
+# =============================================================================
+
+experiment_groups:
+
+  # ═══════════════════════════════════════════════
+  # Track A: 评估标准实现
+  # ═══════════════════════════════════════════════
+
+  track_a_eval_implementation:
+    objective: "将 exp-005-generation-stage-eval-rubric.md 中的 6 维核心评估标准转化为可执行的 Judge Prompt 和评分脚本（分两批评估，后续可扩展至 11 维）"
+    deliverables:
+      - name: "judge_prompts.py"
+        description: "6 维核心 Judge Prompt 模板（分两批：Batch1 准确性+安全性+相关性，Batch2 整合质量+引文质量+用户体验）+ 每维度独立 Prompt（人机校准用）。完整 11 维 Prompt 已在文件中预置，可随时启用。"
+        location: "src/evaluation/judge_prompts.py"
+      - name: "judge_runner.py"
+        description: "Judge 执行器——批量调用 Judge LLM 评估生成结果，支持分批次评分、重试、限流、结果缓存"
+        location: "scripts/run_judge_exp005.py"
+      - name: "aggregation.py"
+        description: "评分聚合器——实现 aggregate_gen_stage_scores() 和 aggregate_system_level_scores()"
+        location: "src/evaluation/aggregation.py"
+      - name: "report_generator.py"
+        description: "结果报告生成器——模型对比表、维度雷达图、短板分析"
+        location: "scripts/report_exp005.py"
+
+    judge_prompt_design:
+      approach: "two-batch multi-dimension（分两批评估，每批 3 个维度）"
+      rationale: "一次 11 维会造成 Judge 认知过载（后面维度被敷衍，reason 质量差）；一次 1 维缺乏跨维度关联且调用量过大。分两批 × 3 维：每批维度数适中，组内维度有天然关联性（Batch1 门槛组：准确性↔安全性↔相关性；Batch2 质量组：整合↔引文↔体验），评分可互相校准。"
+      batches:
+        batch1:
+          dims: ["G-L1 准确性", "G-L6 安全性", "G-L4 相关性"]
+          role: "门槛组——任一维度崩了，答案即不合格"
+          safety_veto: true
+        batch2:
+          dims: ["G-L2 整合质量", "G-L3 引文质量", "G-L5 用户体验"]
+          role: "质量组——门槛通过后评估呈现质量"
+          prerequisite: "答案已通过 Batch1 门槛检查"
+      structure:
+        system_prompt: |
+          你是 AI 搜索答案质量的评估专家。你本次只评估三个维度。
+          每个维度 1-4 分，4 分最优。严格遵循各维度的档位定义，不要给出中间分数（如 2.5）。
+          在 reason 中引用答案或文档中的具体内容作为评分依据。
+        dimensions_block: "每批包含 3 个维度的：定义、评估输入、核心问题、档位定义表格（1-4，含典型示例）、区分边界"
+        output_schema: "JSON schema，输出 3 个维度的 score + reason。Batch1 额外包含 safety_veto（安全 1 分时为 true）"
+        few_shot_examples: "2-3 个标注好的示例（从人机校准中产生）"
+
+    prompt_length_estimation:
+      batch1_system_prompt: "~1200 tokens（3 维 rubric：准确性 + 安全性 + 相关性）"
+      batch2_system_prompt: "~1500 tokens（3 维 rubric：整合质量 + 引文质量 + 用户体验）"
+      per_query_input: "~1500 tokens（query + 10 passages + answer）"
+      output_per_batch: "~400 tokens（3 scores + 3 reasons）"
+      total_per_answer: "2 batch calls × ~3100 tokens ≈ 6200 tokens ≈ ¥0.019 per answer (DeepSeek)"
+      total_200_queries_6_models: "200 × 6 × 2 = 2400 calls → ~¥22.6 total"
+
+    validation:
+      - "rubric_coverage: 检查每条 rubric 是否在 prompt 中完整呈现"
+      - "output_parsability: 验证 Judge 输出的 JSON 是否 100% 可解析"
+      - "score_distribution: 检查评分分布是否有天花板/地板效应"
+      - "inter_judge_consistency: GPT-4o-mini 交叉验证 20 条，计算 Judge-Judge 一致性"
+
+  # ═══════════════════════════════════════════════
+  # Track B: 人机校准
+  # ═══════════════════════════════════════════════
+
+  track_b_human_calibration:
+    objective: "通过人工标注 50 条样本，验证 LLM-as-a-Judge 的评分与人类判断的一致性，必要时校准 Judge Prompt"
+    sample_size: 50
+    source: "从 200 条采样 query 中随机抽取 50 条（保证每查询类型 ≥5 条）"
+    prerequisite: "先由 deepseek-chat 生成 50 条样本的答案，作为标注对象"
+
+    annotators:
+      count: "≥ 2 人"
+      qualification: "了解 AI 搜索产品，熟悉评估标准"
+      training: "标注前统一阅读 exp-005-generation-stage-eval-rubric.md，用 5 条示例进行试标注 + 讨论校准"
+
+    annotation_schema:
+      dimensions_to_annotate: 6
+      note: "首轮标注使用 6 个核心维度（与 Judge 两批评估一致）。完整 11 维标注留待后续扩展。"
+      human_dimensions:
+        - "G-L1 信息准确性 (1-4)"
+        - "G-L2 信息综合质量 (1-4)"
+        - "G-L3 引文质量 (1-4)"
+        - "G-L4 相关性 (1-4)"
+        - "G-L5 用户体验 (1-4)"
+        - "G-L6 安全合规 (1-4)"
+      total_human_labels: "6 dims × 50 samples = 300 label points per annotator"
+      overall_quality:
+        question: "综合来看，这个答案的质量如何？（1-4）"
+        purpose: "提供 global quality signal，辅助评估维度权重的合理性"
+
+    calibration_metrics:
+      kappa:
+        description: "Cohen's Kappa（每维度），衡量 Judge-Human 一致性是否优于随机"
+        thresholds:
+          excellent: "κ > 0.80"
+          good: "κ 0.60-0.80"
+          moderate: "κ 0.40-0.60"
+          poor: "κ < 0.40 → 需要检查 rubric 是否存在歧义或 Judge 是否存在系统性偏误"
+      agreement_exact:
+        description: "Exact Agreement Rate —— Judge 与人类给出一致分数（±0 档）的比例"
+      agreement_adjacent:
+        description: "Adjacent Agreement Rate —— Judge 与人类分数相差 ≤1 档的比例"
+      spearman:
+        description: "Spearman's ρ —— 评分排序一致性（对 1-4 分做 rank correlation）"
+
+    calibration_process:
+      steps:
+        - "Step 1: 人工标注 50 条（≥2 人独立标注）"
+        - "Step 2: 计算 Inter-Annotator Agreement（人-人一致性），确保标注质量"
+        - "Step 3: Judge (deepseek-chat) 评分同一 50 条"
+        - "Step 4: 计算 Judge-Human 各维度 Kappa + Agreement Rate"
+        - "Step 5: 分析差异案例——Judge 与人类分歧最大的 10 条，判断谁更合理"
+        - "Step 6: 如 Kappa < 0.60 的维度 > 2 个 → 优化 Judge Prompt（调整 rubric 措辞 / 增加 few-shot）→ 重新 Judge → 重新计算"
+        - "Step 7: 最终报告人机一致性结果 + 校准后的 Judge Prompt"
+      stop_condition: "所有维度 κ ≥ 0.50，且 6 个核心维度中 ≥ 4 个达到 κ ≥ 0.60"
+      max_iterations: 2
+
+  # ═══════════════════════════════════════════════
+  # Track C: 多模型生成对比
+  # ═══════════════════════════════════════════════
+
+  track_c_model_comparison:
+
+    # ── Phase 1: 批量生成 ──
+    phase1_generation:
+      objective: "所有候选模型使用统一的 system prompt + 检索上下文，生成答案"
+      fixed:
+        system_prompt: "使用 src/generation/prompts.py 中的默认 prompt（default 类型），保证所有模型收到相同的 system prompt"
+        context_top_k: 10
+        context_source: "exp-004 最优 Reranker top-10（来自 reranker_top10）"
+        max_new_tokens: 1024
+        temperature: 0.3
+        query_count: 200
+
+      local_models:
+        framework: "vLLM (OpenAI-compatible API) 或 HuggingFace Transformers"
+        batch_size: "根据模型大小自适应（1.5B: 16, 3B: 8, 4B: 8, 7B: 4）"
+        dtype: "bf16（Qwen2.5-7B 如显存不足则用 INT4 GPTQ）"
+        models:
+          - "qwen2.5-1.5b"
+          - "qwen2.5-3b"
+          - "qwen3-4b"
+          - "qwen2.5-7b"
+
+      api_models:
+        framework: "src/intent/api_client.py → APIClientFactory"
+        api_config: "复用 config.yaml 中的 generation.api_client 配置"
+        models:
+          - "deepseek-chat (必选)"
+          - "gpt-4o-mini (可选)"
+
+      output_format:
+        per_query:
+          query_id: "T2R-xxxxx"
+          query_text: "原始查询文本"
+          query_type: "factoid/concept/comparison/how_to/open_ended"
+          model_id: "qwen2.5-1.5b"
+          answer: "LLM 生成的完整答案"
+          passages: ["top-10 passage 原文列表（含 pid + rank）"]
+          generation_time_ms: 1234
+          token_count: { input: 1500, output: 300 }
+
+      cache_strategy:
+        description: "所有生成结果缓存到 results/exp005/generations/{model_id}.jsonl"
+        logic: "如缓存存在对应 model_id 的文件且条目数 = 200，则跳过生成"
+
+    # ── Phase 2: Judge 评估 ──
+    phase2_judge_evaluation:
+      objective: "使用校准后的 Judge Prompt 对所有模型生成结果进行 6 维核心评分（分两批评估，后续可扩展至 11 维）"
+      prerequisite: "Track B 人机校准已完成（Judge Prompt 已校准）"
+      judge_model: "deepseek-chat (temperature=0.0)"
+      samples: "200 queries × 5-6 models × 2 batches = 2000-2400 judge calls"
+      cost_estimate: "~¥19-23 total"
+
+      parallel_validation:
+        description: "对 deepseek-chat 生成结果额外用 gpt-4o-mini 做 Judge 交叉验证（20 条），确保 Judge 评分一致性"
+        purpose: "排除「同一个模型既当运动员又当裁判」的 self-evaluation bias——deepseek-chat 作为生成模型之一，如果同时是唯一的 Judge，对自己的评分可能偏高"
+
+      output:
+        file: "results/exp005/judge_scores/{model_id}.jsonl"
+        format: "每行包含原始生成结果 + 6 维核心 scores + reasons（来自两批评估的合并结果）"
+
+    # ── Phase 3: 理想排序上限测试（可选）──
+    phase3_ideal_ranking:
+      objective: "用理想排序（已知相关 passage 排在最前）消除检索噪声，测量 LLM 生成质量理论上限"
+      status: "可选——取决于时间和预算"
+      models: ["deepseek-chat", "qwen3-4b", "qwen2.5-7b"]
+      sample_size: 50
+      comparison: "与 Phase 2 中同一批 query 的精排结果对比——精排输入 vs 理想输入，分数差 = 检索噪声导致的生成质量损失"
+
+    # ── Phase 4: 报告生成 ──
+    phase4_reporting:
+      objective: "汇总所有模型评分，生成模型对比报告"
+      outputs:
+        - report: "results/exp005/exp005_final_report.md"
+        - summary_table: "各模型 6 维核心分数 + 系统级 6 层分数 + 总分 + 等级分布"
+        - dimension_radar: "每个模型的 6 维雷达图"
+        - weakness_matrix: "模型 × 维度的短板热力图"
+        - query_type_breakdown: "按查询类型分组的模型表现对比"
+        - cost_efficiency: "模型参数量 vs 质量分数的散点图（标注性价比最优模型）"
+
+
+# =============================================================================
+# 第六部分：分析问题
+# =============================================================================
+
+analysis_questions:
+
+  model_comparison:
+    - "Q1: 在固定的检索输入下，6 个模型的生成质量排名如何？谁是 'best overall'？"
+    - "Q2: 1.5B 和 7B 的质量差距有多大？这个差距是否随着模型增大而递减（diminishing returns）？"
+    - "Q3: Qwen3-4B 是否实现了 '小模型大能力'？它能否达到或超越 Qwen2.5-7B？"
+    - "Q4: 本地部署的 best model（预期 qwen2.5-7b 或 qwen3-4b）与 deepseek-chat API 的差距有多大？是否值得为这个差距支付 API 费用？"
+    - "Q5: GPT-4o-mini 对比 deepseek-chat，谁在中文 AI 搜索场景下表现更好？"
+
+  dimension_profile:
+    - "Q6: 不同模型的短板分别在哪里？——哪个模型'准确性很高但综合能力差'？哪个'综合很强但引文很弱'？"
+    - "Q7: 是否存在所有模型都表现差的维度？（可能说明任务本身就难，而非模型问题）"
+    - "Q8: 安全性（G-L6）在不同模型上是否有显著差异？小模型更容易产生不安全内容吗？（拒答判断 G-C 留待 11 维扩展后分析）"
+
+  query_type_sensitivity:
+    - "Q9: 不同模型在不同查询类型上的表现是否有显著差异？——哪个模型擅长事实型但对比型很差？"
+    - "Q10: 哪种查询类型对所有模型来说都是最难的？（预期：对比型和开放型最难）"
+
+  context_utilization:
+    - "Q11: 不同模型的上下文利用效率（G-B，11 维扩展后评估）如何？小模型是否更容易遗漏检索文档中的关键信息？"
+    - "Q12: 最优模型的上下文利用效率是否接近 4？如果都不是 4，说明 prompt 或上下文格式有优化空间（留待 11 维扩展后验证）"
+
+  human_calibration:
+    - "Q13: LLM-as-a-Judge 在哪些维度上与人类高度一致（κ > 0.6）？哪些维度分歧大（κ < 0.4）？"
+    - "Q14: Judge 是否存在系统性偏误（如对所有模型都倾向给 3 分，缺乏区分度）？"
+    - "Q15: 经过最多 2 轮校准后，Judge-Human Kappa 能否全部达到 ≥ 0.50？"
+
+  ideal_vs_real:
+    - "Q16: 理想排序输入下，生成分数能提升多少？检索噪声导致的生成质量损失有多大？"
+    - "Q17: 在理想输入下，小模型（qwen3-4b）能否缩小与大模型（deepseek-chat）的差距？"
+
+
+# =============================================================================
+# 第七部分：实现路线图
+# =============================================================================
+
+implementation_roadmap:
+
+  phase_1:
+    name: "基础设施搭建（并行）"
+    tasks:
+      - "创建 src/evaluation/judge_prompts.py —— 6 维核心 Judge Prompt 模板（分两批）+ 每维度独立 Prompt（人机校准用）+ 11 维独立 Prompt 预置 + 系统级 6 层 Prompt 模板"
+      - "创建 src/evaluation/aggregation.py —— 两套评分聚合函数"
+      - "创建 src/evaluation/judge_runner.py —— Judge 执行器（批量调用 + 重试 + 缓存）"
+      - "创建 scripts/generate_exp005.py —— 多模型批量生成脚本"
+    parallelizable: true
+    estimated_effort: "2-3 天"
+
+  phase_2:
+    name: "人机校准（关键路径）"
+    depends_on: "phase_1"
+    tasks:
+      - "用 deepseek-chat 生成 50 条校准样本"
+      - "设计标注界面（简单的 CSV/Excel 标注表）"
+      - "≥2 人独立标注"
+      - "计算人-人一致性"
+      - "Judge 评分同一 50 条"
+      - "计算 Judge-Human 一致性（Kappa/Agreement/Spearman）"
+      - "差异分析 + Prompt 校准（如需第二轮）"
+    parallelizable: false
+    estimated_effort: "3-5 天（主要受人工标注进度约束）"
+
+  phase_3:
+    name: "批量生成 + 批量评估（并行）"
+    depends_on: "phase_1, phase_2"
+    tasks:
+      - "所有模型生成 200 条答案（本地模型 vLLM/HF + API 模型）"
+      - "用校准后的 Judge Prompt 批量评估所有生成结果"
+      - "GPT-4o-mini 交叉验证 20 条"
+      - "理想排序上限测试（deepseek-chat + qwen3-4b + qwen2.5-7b, 50 条）"
+    parallelizable: true
+    estimated_effort: "1-2 天（受 GPU 推理和 API 限流约束）"
+
+  phase_4:
+    name: "报告与选型建议"
+    depends_on: "phase_3"
+    tasks:
+      - "生成完整对比报告"
+      - "输出模型选型建议（推荐模型 + 理由 + 部署方案）"
+      - "标记各模型的短板维度和改进方向"
+    estimated_effort: "1 天"
+
+
+# =============================================================================
+# 第八部分：风险与缓解
+# =============================================================================
+
+risks:
+
+  - risk: "单次 10 维 rubric 总长度过大（~4000 tokens），导致 Judge LLM 注意力分散 → 已采用分两批 × 3 维策略解决"
+    severity: resolved
+    mitigation:
+      - "已采纳：分两批评估，每批 3 个维度，单批 rubric 控制在 1200-1500 tokens"
+      - "每批内部维度具有天然关联性，Judge 可互相校准而非简单罗列"
+      - "后续扩展至 11 维时，可再增加一批（Batch3: G-A~G-E 五个特有维度）"
+
+  - risk: "Qwen2.5-7B FP16 在 RTX 4090 24GB 上 + batch 推理时 OOM"
+    severity: medium
+    mitigation:
+      - "优先使用 INT4 量化版本（GPTQ/AWQ），下载 Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+      - "或者降低 batch_size 到 1-2"
+      - "或者使用 vLLM 的张量并行（单卡也可用，减少峰值显存）"
+
+  - risk: "人机校准中 Human-Human agreement 很低（κ < 0.4），说明 rubric 本身模糊"
+    severity: high
+    mitigation:
+      - "标注前做充分的培训 + 试标注 + 讨论对齐"
+      - "如果某维度始终无法对齐，考虑该维度是否适合人类直接评估（如 G-E 内部一致性）——简化为仅 Judge 评估"
+      - "必要时简化档位定义，从 4 档降为 3 档（不可用/合格/优秀）"
+
+  - risk: "deepseek-chat 作为 Judge 对自己生成的答案评分偏高（self-evaluation bias）"
+    severity: medium
+    mitigation:
+      - "GPT-4o-mini 交叉验证作为对照"
+      - "在分析中单独标注 deepseek-chat 作为生成模型时的评分，与 GPT-4o-mini Judge 的评分对比"
+      - "如果 bias 确实存在，用 GPT-4o-mini 的评分替代 deepseek-chat 对自己的评分"
+
+  - risk: "200 条采样 query 不足以捕捉部分查询类型的真实分布"
+    severity: low
+    mitigation:
+      - "分层采样确保各类型 ≥ 30 条，可以做类型内分析但不做细粒度的统计显著性检验"
+      - "如需要更精细的类型分析，扩大到 500 条（但成本相应增加 2.5x）"
+
+  - risk: "API 限流导致 deepseek-chat 作为 Judge 时的批量评估过慢"
+    severity: low
+    mitigation:
+      - "Judge 评分不需要实时性，逐条调用 + 重试 + 指数退避即可"
+      - "预估 1200 条 judge call × 2s = 40 分钟，在可接受范围内"

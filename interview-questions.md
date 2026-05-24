@@ -1,468 +1,865 @@
 # 面试题库 —— PersonalizedSearch 项目
 
-> 本文件汇总了该项目在面试中可能被问到的各类问题，
-> 按主题分为 BM25/关键词检索、Dense 语义检索、RAG 系统设计、查询重写、实验评估、LLM/工程实践六大板块。
+> 本文件汇总了该项目在面试中可能被问到的各类问题。
+> 按模块分为：查询重写、多路召回、重排（精排）、LLM 生成、系统设计、开放性问题。
+> 问题不编号，随时可追加新题。
+> 标注 `[用户]` 为用户提供的问题，标注 `[AI]` 为 AI 补充的问题。
+> 所有回答均为 AI 基于项目代码和实验记录生成。
 
 ---
 
-## 一、BM25 / 关键词检索
+## 查询重写
 
-### Q1: BM25 的原理是什么？
+- **[用户] 为什么需要查询重写？**
 
-BM25（Best Matching 25）是 TF-IDF 的改进版，属于概率检索模型。核心公式：
+  **AI 回答**：核心原因是「短查询与长文档之间的语义鸿沟」。T2Ranking 数据集中，查询中位数 5-15 字，passage 中位数 368 字，两者词面重叠极低。具体体现在三个方面：
+  1. **术语不匹配**：用户用口语词（如「摁错」），passage 用正式术语（如「输入错误」），BM25 完全命中不了。
+  2. **隐含上下文缺失**：短查询省略了时间/地点/场景等背景信息（如「生产过后肚子」缺少「产后」这一医学语境词）。
+  3. **语义覆盖不足**：单条查询的向量只锚定一个语义方向，无法覆盖同一信息需求的不同侧面。
+  
+  项目量化证据：Dense 基线（不改写）Recall@10=0.389，Recall@50=0.628，意味着约 37% 的相关 passage 第一轮找不出来。改写后最优方案（HyDE+RRF）将 Recall@50 推至 0.682（+8.6%），说明改写确实在缩小这个鸿沟。
 
-\[
-\text{BM25}(q, d) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{tf(t, d) \cdot (k_1 + 1)}{tf(t, d) + k_1 \cdot (1 - b + b \cdot \frac{|d|}{\text{avgdl}})}
-\]
+- **[用户] 查询重写的提示词如何评估？如何迭代？**
 
-三个关键改进相比 TF-IDF：
+  **AI 回答**：评估采用 T2Ranking dev 集的 1824 条查询（有 qrels），以 BM25 和 Dense(m3e-base) 两个检索后端分别评估，核心指标是 Recall@50（给 Reranker 提供候选池的能力上限），辅以 MRR。迭代采用**单变量消融**策略：
 
-- **TF 饱和**：`k_1`（通常取 1.2~2.0）让词频增长非线性饱和，避免一个词出现 100 次得分就是出现 1 次的 100 倍。
-- **文档长度归一化**：`b`（通常取 0.75）控制长度惩罚强度。长文档天然含有更多单词，`b` 参数抑制这种偏差。
-- **IDF**：\(\text{IDF}(t) = \ln\left(\frac{N - df(t) + 0.5}{df(t) + 0.5} + 1\right)\)，比经典 IDF 更平滑，避免稀有词权重爆炸。
+  | 消融维度 | 变体 | 结论 |
+  |----------|------|------|
+  | 规则密度 | B1(4条规则) → P1(8-10条+硬约束) | 规则增强有 +2.8% 收益 |
+  | 示例来源 | B1(通用7例) → P2(领域10例) → P3(对比好/坏) | 领域 few-shot 最优(+5.0%)，对比教学反而退步 |
+  | 输出格式 | 自然语句 → P5(关键词串) | 自然语句优于关键词串，BM25 的 IDF 自动压低通用词 |
+  | 类型感知 | 统一 prompt → P4(按 query type 分发) | 类型感知退步，分类错误代价 > 差异化收益 |
 
-**本项目实现**：使用 `rank_bm25.BM25Okapi` + jieba 中文分词 + 停用词过滤构建 BM25 索引。
+  详细实验记录见 `experiments/exp-002-results-analysis.md`。迭代流程：先在小规模（2000 条）做消融筛选最优方案，再在验证集上做 RRF k 和 per-route K 超参调优，最后在测试集上出最终指标。
 
-> 面试追问：如果面试官让你在白板上手写 BM25 伪代码，你可以从 "倒排索引查找 → 每条文档累加 BM25 分 → 堆排序取 Top-K" 的流程来描述。
+- **[用户] HyDE 的原理？为什么有提升？**
 
----
+  **AI 回答**：HyDE（Hypothetical Document Embedding，Gao et al., 2022）的核心思路是：用户查询 → LLM 生成一段假答案（100-150 字）→ 用假答案的文本做检索。原理是假答案的**术语丰富度**和**信息密度**远高于短查询（5-15 字 vs 100-150 字），在向量空间中假答案的 embedding 比短查询更接近真实相关文档的分布。
 
-### Q2: BM25 相比 Dense Retrieval（向量检索）的优劣势？
+  本项目同时实现了 BM25 版和 Dense 版 HyDE：
+  - **Dense 版**：假答案 → embedding → 向量检索，靠语义匹配。
+  - **BM25 版**：假答案 → jieba 分词 → BM25 term 匹配，靠 term 直接命中。
 
-| 维度 | BM25 | Dense Retrieval |
-|------|------|-----------------|
-| **匹配方式** | 精确词袋匹配（term-level） | 语义向量相似度（semantic-level） |
-| **同义词/改写** | 不敏感，需要查询重写弥补 | 天然支持语义泛化 |
-| **稀有词/专有名词** | 精确匹配极强 | 可能被 OOV 或欠训练影响 |
-| **长尾查询** | 依赖 term overlap | 依赖嵌入模型泛化能力 |
-| **索引速度** | 极快（只需分词+倒排） | 慢（需 GPU 推理嵌入，本项目 230 万 passages 约 23 小时 CPU） |
-| **存储成本** | 倒排索引 + 原始文本 | 向量存储（768 维 × 230 万 ≈ 7GB 浮点） |
-| **查询延迟** | ~35ms（本项目实测） | ~14ms（本项目实测，ChromaDB HNSW） |
-| **可解释性** | 强（可精确指出命中哪些 term） | 弱（"相似度 0.87" 难以解释） |
+  提升的关键在于 **HyDE + 原查询 RRF 融合**。纯 HyDE（不用原查询）在两个后端上都不如直接用原查询——假答案存在幻觉，LLM 生成的内容可能偏离真实 passage。但当原查询（保留精确实体匹配）和 HyDE 假答案（提供丰富扩展术语）做 RRF 融合后，两者互补：原查询确保不偏，HyDE 确保不窄。实验数据：HyDE+RRF 是 16 组实验中唯一在两个后端上都显著超越基线的方案（BM25 +11.1%，Dense +8.6%）。
 
-**本项目关键发现**：在 T2Ranking 全量 230 万池上，BM25 的 Recall@10 接近 0（因为中文互联网段落同义词/改写极丰富），Dense 能达到 0.45。但 BM25 对改写友好——每一次 Prompt 工程注入的新 term 都是独立的正向匹配信号，不存在 Dense 模型的"向量偏移"问题。
+- **[用户] PRF 的原理？是否有提升？为什么？**
 
----
+  **AI 回答**：PRF（Pseudo-Relevance Feedback，伪相关反馈）的流程是：原始查询 → 第一轮检索 Top-K（假设 top-20 相关）→ 从 top-20 中提取 TF-IDF 最高的 N 个扩展词 → 原始查询 + 扩展词 → 第二轮检索。代码位于 `src/retrieval/prf.py`。
 
-### Q3: BM25 可以分布式构建索引吗？
+  **关键实现**：扩展词选择过滤已在原查询中的词，按 `df × idf`（文档频率 × 逆文档频率）排序取 top-N。支持 weighted 模式（完整 TF-IDF 加权）和 unweighted 模式（仅计数）。最大优势：不需要 LLM API 调用，完全本地计算，成本为零。
 
-可以，三种方式：
+  但本项目实验结果：**PRF 在所有条件下都退化了**。BM25 上 -7.8%（5 terms）~ -29.7%（10 terms），Dense 上 -9.6% ~ -11.4%。根本原因是**低召回场景下 PRF 是毒药**——BM25 第一轮 R@50 仅 0.175（82.5% 是不相关的），Dense 第一轮 R@50 也才 0.628（37% 不相关）。从不相关 passage 中提取的 TF-IDF term 本质上是噪声，扩展词越多退化越严重。PRF 更适合高召回场景（R@50 > 90%），此时 top-k 中绝大多数相关，提取的 term 质量有保证。
 
-- **文档分片（Document Partitioning）**：将语料库按 pid 哈希分到不同机器，每台机器各自构建完整的 BM25 索引（含自己的 IDF 统计）。查询时广播到所有分片，合并结果。**优点**：实现简单，每个分片独立完整。**缺点**：IDF 是局部的，跨分片不一致。
-- **全局统计 + 局部倒排（Global IDF + Local Posting）**：先做一轮 MapReduce 统计全局 DF/IDF，然后各节点各自构建倒排列表 + 用全局 IDF 算分。本项目用 `rank_bm25` 内置的 `corpus_size` 和全局 DF 即可做到。
-- **基于 Elasticsearch**：ES 内置 BM25（5.x 后默认相似度算法），自动分片 + 分布式 IDF + 协调节点合并。这是工业界的工程首选。
+  结论：在引入 Reranker 大幅提升第一轮召回质量之前，PRF 不可行。
 
-**本项目当前状态**：单机 pickle 序列化（`build_bm25_index.py`），但架构上已经封装了 `bm25_store.build()` 和 `bm25_store.load()` 接口，后续可替换为分布式后端。
+- **[用户] 查询重写阶段模型选型？**
 
----
+  **AI 回答**：V0 阶段选择 DeepSeek API（deepseek-chat），理由：
+  - **成本极低**：单条查询改写约 ¥0.00036，全量 22,812 条仅 ¥30 左右。
+  - **迭代速度快**：Prompt 调优只需改文本，无需等 GPU 推理。
+  - **V0 聚焦 Prompt 验证**：核心目标是验证 Prompt/HyDE/PRF 的策略上限，而非模型微调。
+  - **V1 计划**：确认最优策略后，部署本地 Qwen2.5-7B-Instruct 做查询重写，降低 API 依赖和延迟。
 
-### Q4: BM25 可以构建分布式服务吗？
+  技术参数：temperature=0.1（低温度保证改写一致性）、max_tokens=128-384（按实验组别），使用 LangChain 的 BaseLanguageModel 接口封装，支持任意模型替换。
 
-可以，典型方案：
+- **[用户] 查询重写，微调的数据集如何构造？怎样评估微调效果？**
 
-- **轻量级**：FastAPI + 单机加载 pickle 索引（本项目当前可做到），QPS 数百级别，适合评估/V0 演示。
-- **中等规模**：Elasticsearch 集群（自动分片 + 副本 + REST API），开箱即用的 BM25 + 分布式检索。
-- **大规模**：基于 Lucene/ES 的 BM25 检索服务 + Redis 缓存热门查询结果，QPS 万级别。
+  **AI 回答**：本项目 V0 阶段未做微调，但已规划了微调路线，方案如下：
 
-**本项目当前**：评估脚本中 BM25 和 Dense 均在同一进程内调用，未独立部署为服务。
+  **数据集构造**：从 T2Ranking 训练集中采样高质量查询，用 DeepSeek API（现已验证的最优 Prompt 方案如 E2a-P2）批量生成改写结果作为「教师标注」→ 人工抽检过滤低质量改写 → 构建 (原始查询, 改写查询) 的 pair 数据集 → 用于监督微调（SFT）。
 
----
+  **评估微调效果**：
+  - 自动评估：在 T2Ranking dev 上对比微调后模型 vs DeepSeek API 的 Recall@50/MRR，以及推理速度和成本。
+  - 人工评估：随机抽 100 条改写结果，评估改写后的「信息完整性」（是否丢失原查询核心语义）、「扩展合理性」（新增术语是否相关）、「幻觉率」（是否编造了原查询没有的信息）。
+  - A/B 测试：在检索 pipeline 中替换改写模型，对比最终端到端指标。
 
-### Q5: 有哪些文本预处理方法？本项目用了哪些？
+- **[AI] 查询重写中有没有遇到过 LLM 输出格式不稳定的问题？如何解决？**
 
-**通用文本预处理 pipeline**：
+  **AI 回答**：在 E2b Multi-Query 实验中遇到过。E2b 要求 LLM 输出 JSON 格式（包含多条子查询），但 LLM 有时会输出非 JSON 文本（如加了前置说明文字、格式错误、单引号替代双引号等）。解决措施：
+  1. JSON 解析时加了容错逻辑：先尝试 `json.loads()`，失败则用正则提取。
+  2. 限制 temperature=0.1 降低输出随机性。
+  3. 使用 RewriteCache（`src/retrieval/rewrite_cache.py`）缓存 LLM 输出，避免重复 API 调用的同时也避免了同一查询多次输出不一致的问题。
+  4. 在 `output_parser` 配置中区分 `text` / `json_list` / `json_obj` 三种模式（见 `src/intent/query_rewrite_prompts.py` 的 REGISTRY），每种模式对应不同的解析策略。
 
-| 步骤 | 方法 | 目的 |
-|------|------|------|
-| HTML 清洗 | 正则 `<[^>]*>` + `html.unescape` | 去除标签（本项目 63.4% 段落含 HTML） |
-| URL 去除 | 正则 `https?://\S+` | 去除链接噪声 |
-| 控制字符清理 | 正则 `[\x00-\x1f\x7f]` | 去除不可见字符 |
-| 换行/空白规范化 | `replace("\n"," ")` + `\s+ → " "` | 统一空格 |
-| 中文分词 | jieba 精确模式 (`lcut`) | 将连续中文文本切分为词序列 |
-| 停用词过滤 | jieba 内置停用词表 + 自定义补充 | 去除 "的/了/是/在/我/有/和/就/不/..." |
-| 短词过滤 | `len(w) > 1` | 过滤单字（通常信息量低） |
-| 长度截断 | 超过 2000 字符截断 | 避免单 passage 过长（本项目中 4.1% 段落受影响） |
-| 最小长度过滤 | 短于 10 字符丢弃 | 去除空/噪音段落 |
+- **[AI] 查询重写中，为什么不直接用原始查询 + 检索到的 top passage 做多轮迭代改写？**
 
-**本项目代码位置**：
-- HTML 清洗 + 文本规范化：`src/evaluation/data_loader.py` 中的 `clean_text()`
-- 中文分词 + 停用词：`src/retrieval/bm25_store.py` 中的 `_tokenize()`
-- 文档分片：`src/indexing/chunker.py` 中的 `DocumentChunker`（Wikipedia 场景用，T2Ranking 部分片）
-
-**可能追问**：
-- 为什么用 jieba 而不是其他分词器？（轻量、中文社区最成熟、本项目 BM25 场景不需要 subword tokenization）
-- 停用词过滤在 BM25 中的作用？（IDF 已经压低高频词权重，但显式过滤减少索引大小和计算量）
-- 为什么长度截断取 2000？（T2Ranking passage 中位数 368 字符，截断只影响尾部 4.1% 长段落，取舍平衡）
+  **AI 回答**：这本质上是「检索增强改写」或「Agent 多轮重搜」的思路。本项目 V0 阶段未采用，原因是：当前基线 Recall@10=0.389，超过 60% 的相关 passage 在第一轮就找不到。如果第一轮检索拿回的 passage 大部分不相关，用不相关的 passage 做改写参考，LLM 可能被噪声误导，改写方向进一步偏离。实验 PRF 的失败也佐证了这一点——从不相关的 passage 中提取扩展词会严重损害召回。策略是先通过 Prompt 工程和 HyDE 提升单轮检索的上限（R@50 → 0.69），V1 阶段再引入 Agent 多轮。
 
 ---
 
-## 二、Dense Retrieval / 语义检索
+## 多路召回
 
-### Q6: Dense Retrieval（双塔模型）的原理是什么？和 Cross-Encoder 的区别？
+- **[用户] BM25 的原理？如何理解公式？**
 
-**双塔模型（Bi-Encoder）**：
-- Query 和 Document 分别过独立的编码器（通常是共享参数的同一个模型），各自产出向量。
-- 检索时用近似最近邻（ANN）索引（如 HNSW/IVF）做向量相似度搜索。
-- **优点**：文档向量可预先计算并索引，检索极快。
-- **缺点**：Query-Document 交互只在点积/余弦这一步，信息交互晚且弱。
+  **AI 回答**：BM25 是 TF-IDF 的概率检索改进版。公式为：
 
-**Cross-Encoder**：
-- Query 和 Document 拼接后一起输入模型（如 BERT），做全交互注意力。
-- **优点**：精度远高于 Bi-Encoder。
-- **缺点**：每对 (query, doc) 都要过一遍完整模型，无法预先索引，只能用于重排序（Reranker）。
+  \[
+  \text{BM25}(q, d) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{tf(t, d) \cdot (k_1 + 1)}{tf(t, d) + k_1 \cdot \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}
+  \]
 
-**本项目实践**：V0 阶段使用 Bi-Encoder（bge-small-zh-v1.5/m3e-base），V1 阶段计划引入 Cross-Encoder 做重排序。
+  三个关键部分：
+  - **IDF 项**：\(\text{IDF}(t) = \ln\left(\frac{N - df(t) + 0.5}{df(t) + 0.5} + 1\right)\)，比经典 IDF 更平滑，避免稀有词权重爆炸。
+  - **TF 饱和项**：`k_1`（本项目取 1.5）让词频增长非线性饱和。一个词出现 100 次得分不会比出现 1 次高 100 倍，因为信息量递减。
+  - **文档长度归一化**：`b`（本项目取 0.75）控制长度惩罚。长文档天然有更多词，`b` 抑制这种偏差。`|d|/avgdl` 是文档相对长度的比值。
+
+  本项目实现了两个版本：基于 `rank_bm25.BM25Okapi` 的单机版，和基于 `bm25s` 库（C 实现、更快）的分片版。分片版位于 `src/retrieval/bm25s_store.py`，使用 `bm25s.BM25` 的 C 加速，配合 `ShardedBM25S` 做分片加载和并行查询。
+
+- **[用户] BM25 如何实现分布式索引？具体怎么计算？**
+
+  **AI 回答**：本项目的 BM25 实现了**分片索引**（ShardedBM25），见 `src/retrieval/bm25_store.py` 中的 `InvertedIndexShard` 和 `ShardedBM25` 类：
+
+  **构建流程**：
+  1. 将所有文档按固定数量切分为 N 个分片（如每片 50 万文档）。
+  2. 先计算**全局统计**：遍历全部文档统计每个 term 的 DF（文档频率），算出全局 IDF 和全局 avgdl。这一步保证了分片间的 IDF 一致性。
+  3. 每个分片独立构建倒排索引：仅包含该分片内文档的 `(doc_idx, tf)` 倒排列表，但使用全局 IDF 计算得分。
+  4. 记录每个分片的文档偏移量 `shard_offsets`，用于后续得分矩阵的拼接。
+
+  **查询流程**：
+  1. 查询分词后，用 `ThreadPoolExecutor`（最多 12 线程）并行查询所有分片。
+  2. 每个分片返回一个 `n_docs × 1` 的 BM25 分数向量。
+  3. 主进程按 `shard_offsets` 拼接所有分数向量为全局分数数组。
+  4. 用 `np.argpartition` + `np.argsort` 取全局 Top-K。
+
+  **关键设计**：全局 IDF 保证了分片间分数的可比性（消除了局部 IDF 带来的跨分片不一致问题）。线程池而非进程池避免了序列化大索引的开销。
+
+  工业级方案（如 Elasticsearch）则是文档哈希分片 → 全局 IDF → 查询广播 → 协调节点合并，原理一致但工程成熟度更高。
+
+- **[用户] BM25 相对向量检索的优势？性能怎么样？**
+
+  **AI 回答**：
+
+  | 维度 | BM25 | Dense 向量检索 |
+  |------|------|---------------|
+  | 匹配方式 | 精确词袋匹配 | 语义向量相似度 |
+  | 稀有词/专有名词 | 极强，精确命中 | 可能被 OOV 或欠训练影响 |
+  | 索引构建 | 纯 CPU，极快 | 需 GPU 推理 embedding（本项目 230 万 passages 约 23 小时 CPU） |
+  | 查询延迟 | ~35ms（本项目实测） | ~14ms（本项目实测，ChromaDB HNSW） |
+  | 改写友好性 | 每次 Prompt 注入的新 term 都是独立正向信号 | 存在向量偏移问题 |
+  | 可解释性 | 强，可精确指出命中哪些 term | 弱，"相似度 0.87" 难以解释 |
+  | 存储 | 倒排索引 + 原始文本 | 向量存储（768 维 × 230 万 ≈ 7GB） |
+
+  但在 T2Ranking 全量 230 万池上，BM25 的 Recall@50 仅 0.175，Dense 达到 0.628（3.6 倍差距）。核心瓶颈是中文同义词/改写极丰富，纯 term 匹配无法跨越词汇鸿沟。BM25 在本项目中的定位是**补充路**（提供 Dense 覆盖不到的精确 term 命中），而非主路。
+
+- **[用户] BM25 如何构造中文索引？停用词、特殊符号、如何分词？**
+
+  **AI 回答**：见 `src/retrieval/bm25_store.py` 中的 `_tokenize()` 函数：
+
+  1. **分词**：使用 jieba 精确模式（`jieba.lcut`），不启用 HMM 新词发现（保留对已知词的偏好）。
+  2. **停用词过滤**：优先加载 jieba 内置停用词表，若不存在则使用自定义的 80+ 中文停用词（包括「的/了/在/是/我/有/和/就/不」等高频虚词，以及「哦/啊/嗯/呢/吧」等语气词）。
+  3. **短词过滤**：`len(w) > 1`，过滤单字 token。中文单字词单独看信息量极低，且 jieba 分词后仍会产生大量单字（标点、语气词等），显式过滤能显著减少索引大小和计算量。
+  4. **特殊符号**：在 `src/evaluation/data_loader.py` 的 `clean_text()` 中做预处理——正则去除 HTML 标签、URL、控制字符（`[\x00-\x1f\x7f]`）、私有区字符（PUA），`html.unescape` 解码 HTML 实体，多空白规范化。
+
+- **[用户] 文本预处理怎么做的？**
+
+  **AI 回答**：完整的预处理 pipeline 分为两个阶段：
+
+  **阶段一：文本清洗**（`src/evaluation/data_loader.py:clean_text()`）：
+  - HTML 标签去除：正则 `<[^>]*>`（T2Ranking 中 63.4% 段落含 HTML）
+  - HTML 实体解码：`html.unescape`
+  - URL 去除：正则 `https?://\S+`
+  - 控制字符清理：正则 `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`
+  - 私有区字符去除：PUA `[\uE000-\uF8FF...]`
+  - 换行/空白规范化：`\n/\r/\t` → 空格 → `re.sub(r"\s+", " ")`
+  - 长度截断：超过 2000 字符截断（影响 4.1% 段落）
+  - 最小长度过滤：短于 10 字符丢弃
+
+  **阶段二：分词**（`src/retrieval/bm25_store.py:_tokenize()`）：
+  - jieba 精确模式分词
+  - 停用词过滤 + 单字过滤
+
+  两个阶段分离的设计：清洗阶段保证文本质量，分词阶段由各检索后端自行处理（Dense 不需要分词，只需清洗后的文本）。
+
+- **[用户] 还对文档做了哪些数据分析？**
+
+  **AI 回答**：项目在 `scripts/_analyze_collection.py` 和 `scripts/_check_special_chars.py` 中做了详细的语料分析：
+  - **HTML 标签覆盖率**：63.4% 的段落含 HTML 标签，说明清洗是必要的。
+  - **Passage 长度分布**：中位数 368 字符，4.1% 超过 2000 字符被截断。
+  - **特殊字符分布**：`scripts/_check_special_chars.py` 扫描了全量 passage 中的控制字符和私有区字符，确认了需要过滤的字符范围。
+  - **qrels 分析**：平均每查询 5.2 个相关 passage，91.5% 的查询 ≤10 个 qrels——这意味着 Recall@50 的理论上限接近 1.0，当前 Dense 基线才 0.628，有 37% 的绝对提升空间。
+  - **训练数据污染检测**：查阅了 BGE 系列模型的训练数据来源（C-MTP labeled），发现其包含 T2Ranking 的 query-passage 对，排除了 BGE 系列模型。
+
+- **[用户] 如何处理长文档？分片策略如何选择？**
+
+  **AI 回答**：项目中两种策略并存：
+
+  | 场景 | 策略 | 参数 | 原因 |
+  |------|------|------|------|
+  | Wikipedia 文档 | 固定长度分片 + 语义断句 | chunk_size=500, overlap=50 | 文档很长，需要切片才能检索 |
+  | T2Ranking 评估 | **不分片**，passage 即检索单元 | — | qrels 以 passage 粒度标注，分片会破坏 qid→pid 映射 |
+
+  T2Ranking 不分片的理由：passage 中位数 368 字符，本身已接近常见 chunk_size（500），分片收益有限。且 qrels 标注是 passage 级别，分片后需要 chunk→pid 回溯映射，增加工程复杂度。
+
+- **[用户] 向量数据库的原理？增加和查询的内部原理？**
+
+  **AI 回答**：本项目使用 ChromaDB，底层索引算法为 HNSW（Hierarchical Navigable Small World）：
+
+  **增加（索引构建）**：
+  1. 文档 → Embedding 模型编码 → 768 维向量。
+  2. HNSW 构建多层图结构：底层包含所有节点，上层是稀疏的「高速公路」。插入时随机决定节点的最高层（指数衰减概率），从顶层开始贪婪搜索插入位置，连接邻居节点。
+  3. ChromaDB 持久化：向量存为 Parquet 文件，元数据存为 SQLite。
+
+  **查询（ANN 检索）**：
+  1. 查询 → Embedding 模型编码 → 查询向量。
+  2. HNSW 检索：从顶层入口点开始，贪婪地向最近邻移动 → 逐层下降到第 0 层 → 在第 0 层做局部搜索 → 返回 top-k。
+  3. ChromaDB 内部使用 `hnsw:space=cosine` 做余弦相似度计算。
+
+  **HNSW 复杂度**：构建 O(N·log N)，查询 O(log N)。参数 M（每个节点最大连接数）和 ef_construction/ef_search 控制精度-速度权衡。
+
+- **[用户] 向量数据库用了哪个库？选型对比？**
+
+  **AI 回答**：选择 ChromaDB，对比分析如下：
+
+  | 维度 | ChromaDB | FAISS | Milvus |
+  |------|----------|-------|--------|
+  | 定位 | 轻量嵌入式 | Meta 开源检索库 | 云原生分布式 |
+  | 部署 | `pip install` 即可 | 需自行封装服务 | 需 Docker/K8s |
+  | 索引算法 | HNSW（默认） | HNSW/IVF/PQ/OPQ 全系列 | HNSW/IVF/DiskANN |
+  | 持久化 | 内置（SQLite+Parquet） | 需自行实现 | 内置（对象存储+元数据） |
+  | 元数据过滤 | ✅ 支持 | ❌ 需自行实现 | ✅ 支持标量过滤 |
+  | 适合阶段 | V0 原型 | 单机高性能 | 生产集群 |
+
+  选择理由：V0 阶段优先简单、Python 原生、开箱即用。ChromaDB 的 `PersistentClient` 自动处理持久化。若 V1 阶段遇到性能瓶颈（如需要 10 亿级向量），可迁移至 Milvus。
+
+- **[用户] 向量数据库的性能如何？**
+
+  **AI 回答**：本项目实测（ChromaDB HNSW，230 万 passages，768 维向量）：
+  - 单次查询延迟：~14ms
+  - 对比 BM25 单次查询延迟：~35ms（Dense 反而更快，因为 HNSW 是 O(log N) 而 BM25 需要扫描倒排列表累加分数）
+  - 索引构建时间：~23 小时（CPU，使用 m3e-base 编码 230 万 passages）
+  - 存储开销：768 维 × 230 万 × 4 bytes ≈ 7GB（浮点） + 原始文本
+
+- **[用户] embedding 模型如何选择？哪些关键原则？**
+
+  **AI 回答**：选型考量因素：
+  1. **中文支持**：bge 系列和 m3e 都是专门的中文模型，在中文检索任务上有针对性的预训练和微调。
+  2. **维度-效果权衡**：512 (bge-small) vs 768 (m3e) vs 1024 (bge-large)。更高维度表达力更强但存储和检索成本更高。
+  3. **训练数据污染**（最关键教训）：BGE 系列的 C-MTP labeled 训练数据包含了 T2Ranking 的 query-passage 对。这意味着 BGE 在训练时已经"见过"评估集的 query 分布，会导致指标被人为抬高。更严重的是改写后的 query 对 BGE 来说是 OOD 输入，改写增益无法公正评估。**因此排除了 BGE 系列，使用 m3e-base**。
+  4. **速度/成本**：bge-small ~100MB 最快，bge-large ~1.3GB 效果最好但慢 3 倍。本项目 V0 阶段用 m3e-base 平衡效果和速度。
+
+  实验数据：在原始查询下，bge-small Recall@10=0.455 > m3e Recall@10=0.389（差距 14%），但 bge-small 的数据污染使这个差距不可信。
+
+- **[用户] 如何训练你的 embedding 模型？目标、数据？**
+
+  **AI 回答**：本项目 V0 阶段未训练 embedding 模型（使用开源预训练模型），但已规划了训练路线：
+
+  **目标**：让 embedding 模型在中文互联网段落检索场景下，更好地对齐短查询与长 passage 的语义。
+
+  **数据构造**：
+  - 正样本：T2Ranking 训练集中 label=3（完全相关）的 (query, passage) 对。
+  - 负样本：Hard negatives — 使用当前最好的检索模型（Dense）检索得到的 top-50 中非相关的 passage。这比随机负样本更难，能学到更精细的判别边界。
+  - 数据增强：用 HyDE 假答案作为查询的「代理 passage」，构造 (假答案, 真passage) 的对比学习对。
+
+  **训练方法**：对比学习（Contrastive Learning），使用 InfoNCE loss。在 m3e-base 或 bge-small 基础上做 continued pretraining。
+
+  **评估**：在 T2Ranking dev 上对比训练前后 Recall@50，确保评估集与训练集无重叠。
+
+- **[用户] 如何平衡向量索引的效果与性能？**
+
+  **AI 回答**：几个关键权衡和本项目选择：
+  1. **HNSW 参数**：`M`（连接数）和 `ef_construction` 越大 → 精度越高但构建越慢、索引越大。ChromaDB 默认值在本项目 230 万文档上达到了可接受的精度-速度平衡（14ms 查询延迟）。
+  2. **向量压缩**：PQ（乘积量化）可将 768 维压缩为更小码本，加速检索但损失精度。本项目 V0 未压缩，全精度浮点存储。
+  3. **维度选择**：768 维（m3e）是在本项目上的最佳平衡点，512 维（bge-small）更快但存在污染，1024 维存储和计算开销更大但效果提升有限。
+  4. **过滤优化**：利用 ChromaDB 的 metadata filter 做预过滤（如按文档来源），缩小候选集。
+  5. **多路召回分级**：Dense 召回 top-50（覆盖语义相关），BM25 补充 top-50（覆盖精确匹配），RRF 融合后只保留 top-50 给 Reranker。避免了单路召回数过多导致的性能浪费。
+
+- **[用户] 多路召回的融合策略？**
+
+  **AI 回答**：本项目实现了多种融合策略，统一使用 RRF（Reciprocal Rank Fusion）：
+
+  | 阶段 | 实验 | 融合方式 | 路数 |
+  |------|------|----------|------|
+  | exp-002 E2b | Multi-Query | 多条子查询各自 Dense 检索 → RRF | 2~7 路 |
+  | exp-002 E2c | HyDE | 原查询 Dense + HyDE Dense → RRF | 2 路 |
+  | exp-003 S4 | 跨后端 | D-B0 + D-P2 + D-HyDE + B-B0 → RRF | 4 路 |
+
+  其他常见融合策略的对比：
+  | 策略 | 原理 | 优缺点 |
+  |------|------|--------|
+  | RRF | score = Σ 1/(k+rank) | 无需分数归一化，参数少 |
+  | 加权分数融合 | 各分数归一化后加权求和 | 保留原始分数，但需调 α |
+  | Round-robin | 依次从各路取结果 | 极简，无视分数 |
+  | 学习融合 | LambdaMART/XGBoost | 效果最优但需训练数据 |
+
+- **[用户] RRF 是什么？为什么选这个方法？**
+
+  **AI 回答**：RRF（Reciprocal Rank Fusion，Cormack et al., SIGIR 2009）的公式为：
+
+  \[
+  \text{RRF}(d) = \sum_{r \in R} \frac{1}{k + \text{rank}_r(d)}
+  \]
+
+  其中 k=60 是平滑常数。每条文档的最终得分是它在各路中排名的倒数之和。
+
+  选择 RRF 的理由：
+  1. **无需分数归一化**：BM25 分数（无界正数）和 Dense 向量相似度（0~1 的余弦距离）尺度差异巨大，RRF 只关心排名，天然跨后端兼容。
+  2. **参数极少**：只有一个 k 参数（平滑常数），且实验证明 k=30/60/90 的结果几乎无差异（R@50 差异 < 0.001），鲁棒性极强。
+  3. **文献充分验证**：在信息检索领域已被大量实验验证有效。
+
+  本项目的 `rrf_fusion()` 函数见 `src/retrieval/multi_query.py`。
+
+- **[用户] 关键词 + 语义向量两种检索方式，如何配比？怎么调出最佳配比？**
+
+  **AI 回答**：本项目通过 exp-003 的消融实验系统性地调出了最佳配比。
+
+  **实验设计**：在验证集（912 条）上，固定 RRF k=60，消融三个变量：
+  1. **路数**：从 1 路（只有 Dense 原查询）到 5 路（全部 Dense + BM25 变体）
+  2. **per-route K**：每路保留 top-20/30/50
+  3. **RRF k**：30/60/90
+
+  **配比结论**：
+
+  | 配置 | Recall@50 | MRR |
+  |------|-----------|-----|
+  | D-B0 单路（基线） | 0.609 | 0.450 |
+  | D-B0 + D-P2（2 路 Dense） | 0.684 | 0.487 |
+  | D-B0 + D-P2 + D-HyDE（3 路 Dense） | 0.704 | 0.523 |
+  | **D-B0 + D-P2 + D-HyDE + B-B0（4 路）** 🥇 | **0.709** | **0.526** |
+  | 上述 + B-P2（5 路） | 0.693 | 0.523 |
+
+  最优配比是 Dense 三路（原查询 + 改写 + HyDE）+ BM25 一路，per-route K=50，RRF k=60。BM25 贡献约 +0.4% 的边际增益（验证集），虽然小但非零，说明跨后端确实有互补性。5 路反而退步，BM25-P2 低质量路引入了 RRF 排名噪声。
+
+  **调优方法论**：先验知识（BM25 和 Dense 覆盖不同匹配模式）→ 小规模验证集消融路数和 per-route K → 固定最优配置后在测试集出最终指标。
+
+- **[用户] 多路召回有哪几路？召回多少条？怎么设计和比较的？召回指标怎么计算的？辅助指标？**
+
+  **AI 回答**：
+
+  **各路召回**（exp-003 最终方案 S4）：
+  | 路 | 含义 | 后端 | 召回数 | 单路 R@50 |
+  |-----|------|------|--------|-----------|
+  | D-B0 | 原始查询向量检索 | Dense(m3e) | top-50 | 0.609 |
+  | D-P2 | 领域 few-shot 改写后向量检索 | Dense(m3e) | top-50 | 0.661 |
+  | D-HyDE | HyDE 假答案向量检索 | Dense(m3e) | top-50 | 0.629 |
+  | B-B0 | 原始查询 BM25 检索 | BM25(Okapi) | top-50 | 0.170 |
+
+  **设计比较方法**：exp-003 采用 50/50 随机分割（seed=42），验证集调参、测试集出最终指标。消融从单路基线到 5 路逐个递增，观察每增加一路的边际增益。
+
+  **主指标**：Recall@50（召回能力，给 Reranker 提供候选池的上限度量）。选择 Recall@50 而非 Recall@10 是因为粗排阶段的目标不是「排到前 10」而是「把相关的都找出来」，排序交给后续的 Reranker。
+
+  **辅助指标**：MRR（Mean Reciprocal Rank，第一个相关文档的排名的倒数均值）、Hit@k（至少命中一条相关文档的查询比例）、Precision@k（检索效率）、NDCG@k（考虑标注等级的排序质量）。
+
+  **指标计算**：见 `src/evaluation/metrics.py` 中的 `compute_metrics()` 和 `compute_reranker_metrics()`。对每条查询，取检索结果的前 k 个 pid，与 qrels 中的相关 pid 做交集，计算各类指标后取全量平均。
+
+- **[用户] 你提到了训练数据污染，这个是怎么发现的？**
+
+  **AI 回答**：发现过程：
+  1. 在初始评估时使用了 bge-small-zh-v1.5，得到了 Recall@10=0.455 的基线。
+  2. 在规划 exp-002 时，需要排除「模型已经在评估集上被训练过」的可能性。于是查阅了 BGE 系列模型的论文和技术报告，发现其训练数据包括 C-MTP labeled——一个大规模的中文 passage 检索训练集。
+  3. 进一步查阅 C-MTP labeled 的数据来源，确认其构建过程中使用了 T2Ranking 的 query-passage 对。
+  4. 这意味着 BGE 模型在对比学习训练阶段已经「见过」T2Ranking 的 query 分布。直接用 BGE 做 Dense 检索的指标（如 0.455）可能是 inflated 的。
+  5. 更重要的是，LLM 改写后的 query 对 BGE 来说是分布外（OOD）输入——模型在训练时未见过改写风格的 query，因此改写增益无法公正评估。
+  6. 决策：从 exp-002 中排除 BGE 系列，切换为 m3e-base（确认训练数据与 T2Ranking 无交集）。
+
+  这个发现在 `experiments/exp-002-query-rewriting.yaml` 的 `meta.retrieval_backend.excluded` 中做了记录，是项目最具学术严谨性的决策之一。
 
 ---
 
-### Q7: 为什么选择 ChromaDB？和 FAISS/Milvus 的对比？
+## 重排（精排）
 
-| 维度 | ChromaDB | FAISS | Milvus |
-|------|----------|-------|--------|
-| 定位 | 轻量嵌入式向量库 | Meta 开源向量检索库 | 云原生分布式向量数据库 |
-| 部署复杂度 | `pip install` 即可 | 需自行封装服务 | 需 Docker/K8s 部署 |
-| 索引算法 | HNSW（默认） | HNSW/IVF/PQ/OPQ 等全系列 | HNSW/IVF/DiskANN 等 |
-| 持久化 | 内置（SQLite + Parquet） | 需自行实现 | 内置（对象存储+元数据） |
-| 过滤/元数据 | 支持 metadata filter | 需自行实现 | 支持标量过滤 |
-| 适用阶段 | V0 开发/原型 | 单机高性能 | 生产集群 |
+- **[用户] 双塔和单塔的原理和区别？详细介绍 Reranker 的模型结构，交叉编码器架构。**
 
-**本项目选择理由**：V0 阶段优先简单、Python 原生、开箱即用。ChromaDB 的 `PersistentClient` 自动处理持久化，减少工程负担。V1 阶段若遇到性能瓶颈可迁移至 Milvus。
+  **AI 回答**：
 
----
+  **双塔（Bi-Encoder / 双编码器）**：
+  - Query 和 Document 分别过独立的编码器（通常是共享参数的同一个 Transformer）。
+  - 各自产出固定维度的向量（如 768 维）。
+  - 检索时用 query embedding 在预先计算好的 document embedding 索引中做 ANN 搜索。
+  - **交互方式**：Query 和 Document 的交互只发生在最后的点积/余弦这一步——属于「晚期交互」（late interaction）。
+  - **优点**：Document embedding 可预先计算并索引，检索极快（O(log N)）。
+  - **缺点**：Query-Document 之间没有 token 级别的细粒度交互，精度受限。
 
-### Q8: 嵌入模型选型的考量因素？
+  **单塔（Cross-Encoder / 交叉编码器）**：
+  - 将 Query 和 Document 拼接成一个序列：`[CLS] query [SEP] document [SEP]`。
+  - 一起输入同一个 Transformer（如 BERT/RoBERTa）。
+  - Transformer 的每一层 self-attention 都在 query tokens 和 document tokens 之间做全交互——属于「早期交互」（early interaction）。
+  - 最后取 `[CLS]` token 的 embedding 过一个线性层输出相关性分数。
+  - **优点**：精度远高于 Bi-Encoder，token 级全交互能捕获细粒度语义匹配（如否定词、条件关系等）。
+  - **缺点**：每对 (query, doc) 都要过一遍完整模型，无法预先索引。只能用于重排序（Reranker），对粗排返回的 top-50~100 做精排。
 
-- **中文支持**：bge 系列和 m3e 都是专门的中文模型。
-- **维度**：512 (bge-small) vs 768 (m3e) vs 1024 (bge-large)，更高维度表达力更强但存储和检索成本也更高。
-- **训练数据污染**：本项目的关键教训——bge 系列的 C-MTP labeled 训练数据包含了 T2Ranking 的 query-passage 对，导致模型在评估集上被"预训练过"，改写后的 OOD 查询无法公平评估。**面试中被问到"如何检测和避免训练数据泄露"时，这是一个很好的实例。**
-- **速度/成本权衡**：bge-small ~100MB 最快，bge-large ~1.3GB 效果最好但慢 3 倍。
+  **交叉编码器（Cross-Encoder）的典型架构**（以 BGE-Reranker 为例）：
+  ```
+  输入: [CLS] 查询文本 [SEP] 文档文本 [SEP]
+   ↓
+  BERT/RoBERTa Encoder (12/24 层 Transformer)
+   ↓
+  [CLS] token embedding → Linear(output_dim=1) → Sigmoid → 相关性分数 (0~1)
+  ```
+  训练时使用 (query, positive_doc, negative_doc) 三元组，用交叉熵或对比损失优化。
 
-**本项目实验结果**：bge-small Recall@10=0.455 > m3e Recall@10=0.389（差距 14%），m3e 在中文互联网段落上显著弱于 bge-small。
+  **本项目规划**：V0 阶段使用 Bi-Encoder（m3e-base）做粗排召回，V1 阶段引入 Cross-Encoder（如 bge-reranker-v2-m3）对 top-50 做精排，预期 MRR@10 从当前的 0.497 大幅提升。
 
----
+- **[用户] Rerank 模型选型依据？如何训练？目标数据。**
 
-### Q9: Hybrid Search 融合策略有哪些？RRF 的原理？
+  **AI 回答**：本项目 V0 阶段尚未训练 Reranker，已规划选型与训练方案：
 
-**常见融合策略**：
+  **选型依据**：
+  1. **中文能力**：bge-reranker-v2-m3 是目前中文 Reranker 的 SOTA，支持多语言（中英）。
+  2. **与 Embedding 模型解耦**：Reranker 和 Embedding 模型可以独立选型，不需要是同一个系列。这避免了「BGE Embedding 被污染 → 必须放弃 BGE Reranker」的连锁问题。
+  3. **推理速度**：Cross-Encoder 单次推理（1 query × 1 doc）约 10-20ms（GPU）。对 top-50 做精排，每查询约 0.5-1 秒，可接受。
+  4. **模型大小**：0.5B-1.5B 参数量级在精度和延迟之间取平衡。
 
-| 策略 | 原理 | 优点 | 缺点 |
-|------|------|------|------|
-| **RRF** | 按倒数排名加权：score = Σ 1/(k+rank) | 无需分数归一化，参数少 | 丢弃了原始分数信息 |
-| **加权分数融合** | 各分数归一化后加权求和 | 保留原始分数信息 | 需要调 α，对分数分布敏感 |
-| **Round-robin** | 依次从各路取结果 | 极简，无参数 | 完全无视分数 |
-| **学习融合** | 用 LambdaMART/XGBoost 学各路特征组合 | 效果最优 | 需要训练数据 |
+  **训练数据和目标**：
+  - 正样本：T2Ranking 训练集中 label=3（完全相关）的 (query, passage) 对。
+  - 负样本：Hard negatives — 粗排阶段 Dense 召回的 top-50 中 label=0（完全不相关）的 passage，以及 label=1/2（部分相关）作为中等负样本。
+  - 训练目标：Cross-Encoder Binary Classification / Ranking Loss（如 ListNet 或 LambdaRank）。
 
-**RRF 公式**（本项目 `src/retrieval/multi_query.py` 实现）：
+  **训练范式**：从开源 Reranker checkpoint 出发做领域微调（而非从头训练），使用 T2Ranking 训练集做 continued fine-tuning。
 
-\[
-\text{RRF}(d) = \sum_{r \in R} \frac{1}{k + \text{rank}_r(d)}
-\]
+- **[用户] 用树模型怎么做？深度模型怎么做？**
 
-其中 `k=60` 是平滑常数（默认值来自 Cormack et al., SIGIR 2009）。
+  **AI 回答**：
 
-**本项目使用场景**：
-- E2b Multi-Query 融合：多路子查询各自检索后 RRF 合并
-- E2c HyDE+Query 融合：原查询检索 + 假答案检索两路 RRF
+  **树模型做 Reranker（LambdaMART / XGBoost / LightGBM）**：
+  - 特征工程是核心：对每对 (query, doc) 提取多维特征，包括：
+    - BM25 分数、BM25 排名
+    - Dense 相似度分数、Dense 排名
+    - 各路 RRF 融合后的排名
+    - query 长度、doc 长度、term overlap 比例
+    - query type（事实型/概念型/对比型/开放讨论型）
+    - 实体匹配特征（query 和 doc 中共同出现的专有名词数量）
+  - 训练：用 LambdaMART（LambdaRank + MART）优化 NDCG。输入为特征向量，输出为相关性分数。
+  - **优点**：可解释性强（特征重要性排序），训练和推理极快，不需要 GPU。
+  - **缺点**：依赖人工特征设计，无法捕获深层语义，效果通常不如深度模型。
 
----
+  **深度模型做 Reranker（Cross-Encoder）**：
+  - 不需要人工特征，Query 和 Document 直接输入 Transformer，模型自动学习交互模式。
+  - 训练：用 (query, pos_doc, neg_doc) 三元组和对比损失。
+  - **优点**：效果通常优于树模型，能捕获否定、因果、条件等复杂语义关系。
+  - **缺点**：推理需要 GPU，黑盒不可解释。
 
-## 三、RAG 系统架构与设计
+  **本项目建议**：深度模型（Cross-Encoder）作为主 Reranker，树模型可以做**轻量级预过滤**——在 Cross-Encoder 之前先过滤掉明显不相关的候选（如 BM25 分数为 0 的），减少 Cross-Encoder 的计算量。
 
-### Q10: 描述你的 RAG 系统整体架构
+- **[用户] 嵌入模型的选择上提到了训练数据污染，重排模型有同样的问题吗？如何分辨？**
 
-```
-[用户输入] 
-    → 意图理解/查询重写（LLM Prompt 工程 / 关键词分类）
-    → 搜索排序（BM25 + Dense 双路召回 → RRF 融合 → Top-K）
-    → LLM 生成（DeepSeek API + typed prompt templates + 检索结果上下文）
-    → [最终回复]
-```
+  **AI 回答**：**重排模型同样存在数据污染的风险**。检测方法与 Embedding 模型一致：
 
-**Pipeline 特点**：
-- 渐进式基线递进：BM25 (B0) → Dense (B1) → Hybrid (B2) → Personalized (B3)
-- 查询重写后置（检索之前），而非前置修改 query
-- 评估与生成分离：检索评估独立于 LLM 生成，节省 API 费用
+  **可能受影响的模型**：BGE-Reranker 系列（如 bge-reranker-v2-m3）。如果 BGE 的 Reranker 训练数据也使用了 C-MTP labeled（包含 T2Ranking 的 query-passage 对），那么同样有污染问题。
 
----
+  **如何分辨**：
+  1. **查阅训练数据来源**：查看模型论文/技术报告中训练数据的构建方式。BGE-Reranker 的训练数据通常来源于与 BGE Embedding 相同的 C-MTP 数据集或其他检索数据集。
+  2. **跨数据集验证**：在 T2Ranking 之外的另一个中文检索数据集（如 DuReader、MIRACL 中文子集）上同时评估 BGE-Reranker 和备选 Reranker（如 m3e-reranker），观察指标是否存在异常高的情况。
+  3. **OOD 改写测试**：如果原始查询 → 改写查询 → 检索 → Reranker，观察改写前后的 Reranker 分数分布。如果改写后分数系统性地低于改写前（且低得不合理），可能说明 Reranker 对改写 query 不鲁棒，间接证明原始 query 分布被过拟合。
+  4. **消融测试**：用被污染的 Embedding（BGE）+ 干净的 Reranker，vs 干净的 Embedding（m3e）+ BGE Reranker，交叉验证指标的异常来源。
 
-### Q11: 如何处理长文档？分片策略如何选？
+  **安全的替代方案**：选择明确声明训练数据来源且不包含 T2Ranking 的 Reranker，如 m3e-reranker。或者使用通用领域预训练的 Cross-Encoder（如 `cross-encoder/ms-marco-MiniLM-L-6-v2`）在 T2Ranking 训练集上自主微调。
 
-**分片参数权衡**：
+- **[AI] 为什么粗排用 Recall@50 而精排关注 MRR@10？两者评估什么不同的能力？**
 
-| chunk_size | 优点 | 缺点 |
-|------------|------|------|
-| 小（128-256） | 检索更精确 | 丢失上下文，Recall 降低 |
-| 中（500） | 上下文-精度平衡 | 一条 chunk 可能不完整 |
-| 大（1000+） | 上下文完整 | 噪音多，精确率降低 |
+  **AI 回答**：这两个指标对应 RAG pipeline 的不同阶段和不同目标：
 
-**本项目两种策略**：
-- **Wikipedia 场景**：`chunk_size=500, overlap=50`，固定长度分片 + 语义断句。
-- **T2Ranking 场景**：不分片，passage 即检索单元。原因：qrels 以 passage 粒度标注，分片会破坏 qid→pid 映射。
+  - **Recall@50（粗排阶段）**：衡量「相关的 passage 是否被找出来了」。粗排的目标是尽可能增大「候选池的覆盖度」——宁可多召回一些不相关的（降低 Precision），也要确保相关的都在池子里。50 是一个宽松的截断点，给后续 Reranker 足够的操作空间。本项目最优粗排的 Recall@50=0.691，Hit@50=0.899（90% 的查询在 top-50 中至少有一条相关）。
 
----
+  - **MRR@10（精排阶段）**：衡量「第一个相关 passage 被排到前面了吗」。精排的目标是将粗排池中的相关 passage 排到最前面，因为最终展示给用户/LLM 的通常只有 top-3~10。MRR 对排名非常敏感——如果第一个相关 passage 排在第 2 位 vs 第 10 位，MRR 差异是 0.5 vs 0.1。
 
-### Q12: 为什么不直接用 LangChain 默认的 RAG chain？
-
-LangChain 的 `RetrievalQA` chain 做了很多默认假设（如默认 prompt 模板、默认文档拼接方式），不适合本项目特点：
-
-- 本项目有 **typed prompt**（factual/concept/comparison/open_discussion 四种 System Prompt + few-shot 示例）。
-- 本项目评估指标是 **纯检索层面的 Recall@k/MRR/NDCG**，不需要跑完生成再评估。
-- 检索器需要同时支持 BM25 和 Dense 双路 + RRF 融合，LangChain 的 `EnsembleRetriever` 对此支持有限。
-
-**所以本项目只用 LangChain 的 `BaseLanguageModel` 接口和 `PromptTemplate`，检索和评估逻辑全部自行实现。**
-
----
-
-## 四、查询重写 / Prompt 工程
-
-### Q13: 为什么需要查询重写？不重写直接检索有什么问题？
-
-**核心问题**：短查询（5-15 字）与长 passage（中位数 368 字）之间的 **语义鸿沟**。
-
-- 用户用口语词（"摁错"），passage 用正式术语（"输入错误"）→ **术语不匹配**。
-- 查询省略了隐含上下文（"手机银行转账限额怎么改" 缺少银行名称/场景）→ **缺少隐含上下文**。
-- 单条查询只锚定一个语义方向 → **语义覆盖不足**。
-
-**本项目量化证据**：bge-small 全量池 Recall@10 仅 0.455，超过一半的相关 passage 第一轮找不出来。
+  **为什么不能直接用 Recall@10 评估粗排**：在还没有 Reranker 的阶段，粗排本身不具备精确排序能力（BM25/Dense 的排序信号有限），要求粗排把相关 passage 排到前 10 是不合理的。Recall@50 才是粗排能力的真实度量。
 
 ---
 
-### Q14: 你的 Prompt 工程做了哪些消融实验？
+## LLM 生成
 
-详见 `experiments/exp-002-query-rewriting.yaml`，核心消融维度：
+- **[用户] 最终效果如何评估？有哪些维度？**
 
-| 维度 | 变体 | 假设 |
-|------|------|------|
-| 规则密度 | B1（4 条规则）→ P1（8-10 条 + 硬约束） | 更细的规则减少 LLM 偏离 |
-| 示例来源 | B1（通用 7 例）→ P2（T2Ranking 领域 10 例）→ P3（对比好/坏） | 领域 few-shot > 通用；对比教学学到边界 |
-| 输出格式 | B1-P4（自然语句）→ P5（关键词串） | 关键词串密度高但 BM25 IDF 也压低通用词 |
-| 类型感知 | P4（按 query type 分发不同 prompt） | 统一 vs 差异化策略 |
+  **AI 回答**：本项目 V0 阶段的「最终效果」是多维度的：
 
-**面试中可能的追问**："消融实验为什么要这样设计？" → 回答：单变量控制，每次只改变一个维度，确保能归因增益来源。
+  1. **检索维度**（定量，已充分评估）：
+     - Recall@10/20/50：召回覆盖度
+     - MRR：排序质量
+     - NDCG@k：考虑标注等级的排序质量
+     - Precision@k：检索效率
+     - Hit@k：至少命中一条的查询比例
 
----
+  2. **生成维度**（定性，V0 阶段不做系统性评估）：
+     - 答案准确性：LLM 生成的答案与检索资料的一致性，是否编造信息
+     - 引用质量：是否正确引用了来源，引用是否对应了相关 passage
+     - 答案完整性：是否覆盖了问题的核心要点
+     - 幻觉率：在检索资料不足时是否如实说明，还是编造了内容
 
-### Q15: Multi-Query RRF 融合是什么？为什么比单条查询好？
+  3. **成本维度**：
+     - API 成本：每查询约 ¥0.001（改写 1 次 + HyDE 1 次 + 生成 1 次）
+     - 检索延迟：BM25 ~35ms + Dense ~14ms + RRF < 1ms ≈ 50ms
 
-**做法**：1 条用户查询 → LLM 生成 N 条子查询 → N 路分别检索 → RRF 合并。
+  4. **工程维度**：
+     - 索引构建时间、存储开销
+     - 可扩展性（分片数 vs 查询延迟）
 
-**三条子查询的设计逻辑**（E2b-M1）：
-- 原查询（保留精确 term）
-- 术语规范化版（口语→正式术语）
-- 上下文补全版（补充隐含场景）
+- **[用户] 如何平衡输入的信息量与精确度？**
 
-**为什么更好**：单条查询的向量只能锚定一个语义方向。多条查询覆盖不同侧面和抽象层次，RRF 合并后能互补覆盖 passage 的不同区域。
+  **AI 回答**：这是一个贯穿整个 pipeline 的权衡问题，本项目在多个阶段做了平衡：
 
-**本项目还引入了 Step-Back（Google DeepMind 2023）**：将具体查询抽象化为高层问题（"XX 是哪年成立" → "XX 的历史背景和创立过程"），进一步扩大召回范围。
+  1. **粗排阶段**：per-route K=50（每条路召回 50 条）是在「给 Reranker 足够候选」和「控制 Reranker 计算量」之间的平衡。实验验证了 K=50 全面优于 K=20/30（R@50 差 3.8%），说明有用信号在 50 条内分布均匀，不应过早截断。
 
----
+  2. **LLM 生成阶段**：`max_context_chars=3000`（见 `src/generation/generator.py`）控制输入 LLM 的检索结果总量。通过 `_trim_context()` 函数按 passage 顺序截断，确保不超过 LLM 的上下文窗口，同时优先保留排名靠前的 passage。
 
-### Q16: HyDE（Hypothetical Document Embedding）的原理？为什么 BM25 也能用 HyDE？
+  3. **查询重写阶段**：HyDE 的 fake answer 长度消融实验（50/100/200 字）显示不同长度对最终融合效果几乎无影响，说明 100-150 字的基础配置已足够平衡信息量和精确度。
 
-**HyDE 原始论文（Gao et al., 2022）**：
-Query → LLM 生成假答案 → 用假答案的向量做 Dense 检索。
-核心假设：假答案的向量比短查询的向量更接近真实相关文档的向量分布。
+  4. **多路融合阶段**：4 路是最优路数（Dense 三路 + BM25 一路），5 路反而退步。说明并不是路越多越好——低质量路引入 RRF 排名噪声。
 
-**BM25 版 HyDE（本项目 E2c）**：
-Query → LLM 生成 100-150 字假答案 → jieba 分词 → BM25 term 匹配。
-原理不同但理念相同：假答案的术语丰富度和信息密度远高于短查询，预期能通过词袋匹配命中更多相关 passage。
+  **核心原则**：「先宽后窄」——粗排放宽召回（Recall@50），精排收紧输出（MRR@10），LLM 生成时进一步精选上下文（max 3000 chars）。
 
-**Dense vs BM25 HyDE 的关键区别**：
-- Dense：靠假答案的语义向量匹配。
-- BM25：靠假答案的 term 直接命中。没有向量偏移问题，每个 term 都是独立的正向匹配信号。
+- **[用户] 模型如何选型？**
 
----
+  **AI 回答**：生成阶段的模型选型：
 
-### Q17: PRF（伪相关反馈）的原理？
+  | 阶段 | 使用场景 | 模型 | 理由 |
+  |------|----------|------|------|
+  | V0 查询重写 | LLM 改写/HyDE 假答案 | DeepSeek-chat (API) | 成本极低（¥0.00036/条）、迭代快 |
+  | V0 最终生成 | 回答生成 | DeepSeek-chat (API) | 同上，temperature=0.3 |
+  | V1 计划 | 查询重写本地化 | Qwen2.5-7B-Instruct | 降低 API 成本、减少延迟、隐私可控 |
+  | V1 计划 | 最终生成 | DeepSeek-chat 或 Qwen2.5-14B | 根据生成质量需求决定是否上更大模型 |
 
-**完整流程**（`src/retrieval/prf.py`）：
+  **Embedding 模型选型**：排除了 BGE 系列（污染），使用 m3e-base（768 维），未来可考虑训练自己的 Embedding 模型。
 
-```
-Step 1: 原始查询 → 第一轮检索 → Top-K 结果（假设 top-20 相关）
-Step 2: 对 top-20 结果做 TF-IDF 词提取 → 选出 N 个最高权重的扩展词
-Step 3: 原始查询 + 扩展词 → 第二轮检索 → 最终 Top-K 结果
-```
+  **Reranker 选型**：V1 阶段计划引入 Cross-Encoder，候选包括 bge-reranker-v2-m3（需验证是否污染）或 m3e-reranker。
 
-**关键实现细节**：
-- 扩展词选择：过滤已在原查询中的词，按 `df × idf`（文档频率 × 逆文档频率）排序。
-- 可选加权模式：`weighted=True` 时用完整 TF-IDF 分数（而非仅计数）。
-- **PRF 最大优势**：不需要 LLM API 调用，完全本地计算！成本为零。
+- **[用户] 如何构造生成模型的微调训练数据？**
 
----
+  **AI 回答**：本项目 V0 阶段未做生成模型微调，已规划方案：
 
-## 五、实验评估
+  **数据来源**：
+  1. T2Ranking 训练集：对每条查询，使用当前最优检索 pipeline 召回 top-5 passage，将 (query, passages, 理想答案) 作为训练三元组。理想答案可用 DeepSeek API 生成并由人工审核。
+  2. 人工标注：选取 500-1000 条典型查询，人工撰写高质量答案，覆盖 factual/concept/comparison/open_discussion 四种类型。
+  3. 负样本构造：对每条 query，随机替换 1-2 条检索 passage 为不相关的 passage，训练模型在不完整/不准确信息下如实说明的能力（反幻觉训练）。
 
-### Q18: 你的评估体系是怎么设计的？
+  **数据格式**（ChatML）：
+  ```
+  <system>你是一个基于知识库回答问题的助手...</system>
+  <human>参考资料: ... \n 用户问题: ...</human>
+  <assistant>理想回答</assistant>
+  ```
 
-**四层递进策略**：
+  **质量保障**：
+  - 引用准确性检查：逐条验证答案中的 [来源] 引用是否确实存在于对应的 passage 中。
+  - 幻觉检测：对比答案内容与 passage 内容，标注「编造」「过度推理」「正确推断」。
+  - 覆盖度检查：答案是否覆盖了 passage 中的核心信息。
 
-| 阶段 | 抽样量 | 目的 |
-|------|--------|------|
-| Smoke Test | 100 条 | 验证全链路无报错 |
-| Ablation | 2000 条 | 对比实验组差异（多方案排序） |
-| Full Report | 22812 条 | 产出论文级最终数字 |
-| Stratified | 全量 | 按 query type 分层分析 |
+- **[用户] 是否尝试过偏好对齐？**
 
-**核心指标**：
-- **Recall@k**：召回能力（"找到了吗？"）
-- **MRR**：排序质量（"排在前面了吗？"）
-- **NDCG@k**：考虑标注等级的排序质量
-- **Precision@k**：检索效率（"返回的有多少相关？"）
+  **AI 回答**：本项目 V0 阶段未尝试偏好对齐（如 RLHF/DPO），但已规划为 V2 阶段方向：
 
----
+  **为什么现在不做**：偏好对齐的前提是有一个足够好的 SFT 基座。当前 V0 阶段连 SFT 都没做，直接上偏好对齐是跳步。且偏好对齐需要大量人工标注的偏好数据（或高质量的自动偏好信号），成本较高。
 
-### Q19: 为什么选 T2Ranking 而不是 MIRACL 或自建评估集？
+  **V2 规划**：
+  - DPO（Direct Preference Optimization）：在 SFT 模型基础上，构造偏好对——「好回答」（引用准确、无幻觉）vs「坏回答」（编造信息、不标注引用）。DPO 不需要 reward model，直接优化 LLM。
+  - 偏好信号来源：T2Ranking 的 4 级标注可作为弱偏好信号——label=3 的 passage 构成的回答应优于 label=1 的。
+  - 也可使用 LLM-as-Judge（如 GPT-4 评分）自动生成偏好对，但需人工抽检验证评分的可靠性。
 
-| 维度 | T2Ranking | MIRACL |
-|------|-----------|--------|
-| 查询数量 | 30 万+ | ~1,500 |
-| 标注粒度 | 4 级（0~3） | 二元（相关/不相关） |
-| 查询来源 | 搜狗真实搜索日志 | 人工构造 |
-| Query Types | ✅ 附带意图标签 | ❌ |
-| 统计可靠性 | 极高 | 一般 |
-| 学术权威性 | SIGIR 2023 | TACL 2023 + WSDM Cup |
+- **[AI] LLM 生成阶段用了 Typed Prompt，四种类型（factual/concept/comparison/open_discussion）是如何设计的？为什么这样分类？**
 
----
+  **AI 回答**：Typed Prompt 设计见 `src/generation/prompts.py`，四种类型各有不同的回答结构和侧重点：
 
-### Q20: 训练数据污染（Data Contamination）在你这项目中怎么体现的？
+  | 类型 | 目标 | 回答结构 |
+  |------|------|----------|
+  | factual | 精确事实回答 | 直接答案(1句) → 补充说明(2-3句) → 来源标注 |
+  | concept | 概念解释 | 核心定义(1-2句) → bullet points 展开 → 来源标注 |
+  | comparison | 对比分析 | 各方简介 → 对比表格 → 总结 |
+  | open_discussion | 综合评述 | 总体概述 → 分角度讨论(小标题) → 总结展望 |
+  | default | 通用回答 | 自由格式 + 来源标注 |
 
-**关键决策**：从 exp-002 中排除了 BGE 系列模型。
+  分类理由：不同信息需求需要不同的呈现方式。统一 prompt 对 factual 查询可能过度展开（用户只需要一个数字），对 comparison 查询又可能不够结构化。Typed Prompt 让 LLM 先分类再生成，回答格式与信息需求匹配。
 
-**原因**：BGE 的 C-MTP labeled 训练数据包含 T2Ranking 的 query-passage 对。这意味着 BGE 模型在训练时已经"见过"T2Ranking 评估集的 query 分布。如果用 BGE 做 Dense 检索，检索指标会被人为抬高。更严重的是——LLM 改写后的 query 对 BGE 来说是分布外（OOD）输入，改写增益无法公正评估。
-
-**面试亮点**：这展示了你能识别并处理数据泄露问题的能力。面试官可能追问"在你的项目中怎么发现和排除的"，答案是：查阅了 BGE 训练数据来源（C-MTP labeled），发现其构建过程中使用了 T2Ranking，确认了污染后切换为 m3e-base。
-
----
-
-### Q21: 你的实验设计中有哪些"科学方法"的体现？
-
-- **单变量消融（Ablation）**：每次只改变一个因素（如 E2a：规则密度/示例来源/输出格式/类型感知各一个消融）。
-- **对照组（Control）**：E2a-B0（no rewrite）是所有改写实验的统一对照组。
-- **干净的变量隔离**：E2b-M2 vs M1 唯一变量是多了 1 条 step-back 查询，其他完全相同。
-- **效应量量化**：不仅看"好不好"，还量化"好多少"（Recall 差距、MRR 差距）。
-- **成本预估**：每组分 API 成本预先计算，避免实验跑一半预算不够。
+  **分类方式**：纯规则匹配（`classify_query_type()`），通过关键词（如「什么时候」「区别」「什么是」「发展趋势」）判断类型。未使用 LLM 做分类，以避免额外 API 调用。回退规则：以「？」结尾的查询归为 open_discussion。
 
 ---
 
-## 六、LLM 集成 / 工程实践
+## 系统设计
 
-### Q22: 为什么 V0 阶段选择 DeepSeek API 而不是本地部署模型？
+- **[用户] 描述你的 RAG 整体架构、迭代的思路。**
 
-- **成本极低**：单条查询重写约 ¥0.00036，全量 22812 条仅 ¥30 左右。
-- **迭代速度快**：Prompt 调优只需改文本，无需等 GPU 推理。
-- **V0 阶段重点**：验证 Prompt 工程/HyDE/PRF 的上限，而非模型微调。
-- **V1 计划**：确认最优策略后，再部署本地 Qwen2.5-7B-Instruct 做查询重写。
+  **AI 回答**：
 
----
+  **架构**：
+  ```
+  [用户查询]
+     │
+     ├─→ 查询重写 (DeepSeek API, Prompt 工程)
+     │      ├─ 领域 few-shot 改写 (E2a-P2)
+     │      └─ HyDE 假答案生成 (E2c)
+     │
+     ├─→ 多路召回 (粗排, top-50 per route)
+     │      ├─ Dense-B0: 原查询 m3e 向量检索
+     │      ├─ Dense-P2: 改写后 m3e 向量检索
+     │      ├─ Dense-HyDE: 假答案 m3e 向量检索
+     │      └─ BM25-B0: 原查询 BM25 词袋检索
+     │           │
+     │           └─→ RRF 融合 → top-50
+     │                  │
+     │                  ▼
+     │            [Reranker 精排] (V1 规划) → top-10
+     │                  │
+     │                  ▼
+     └─→ LLM 生成 (DeepSeek API, Typed Prompt)
+            └─→ 用户回复
+  ```
 
-### Q23: 多进程分词为什么要特殊处理？
+  **迭代思路（渐进式基线递进）**：
 
-**`bm25_store.py` 中的多进程分词设计**：
+  | 阶段 | 基线 | 内容 | 目标 |
+  |------|------|------|------|
+  | B0 | BM25 基线 | 纯关键词检索 | 建立最低基准 |
+  | B1 | Dense 基线 | 单模型向量检索 | 验证语义检索上限 |
+  | B2/V0 | Hybrid 融合 | Prompt + Multi-Query + HyDE + RRF | 不打磨模型，验证上限 |
+  | B3/V1 | Reranker 精排 | Cross-Encoder 精排 | 将 Recall 转化为 MRR |
+  | V2 | 微调 | Embedding/Reranker/LLM 微调 + 偏好对齐 | 替换 API，提升天花板 |
 
-```python
-def _init_worker(stopwords_set):
-    global _worker_stopwords
-    _worker_stopwords = stopwords_set
-    jieba.lcut("")  # 在每个 worker 中初始化 jieba
+  **核心方法论**：先验证「不改模型能做到什么上限」→ 确认有意义的提升空间 → 再投入微调资源。每阶段用严格的消融实验验证每个决策的边际贡献，不依赖直觉。
 
-def _tokenize_worker(text):
-    global _worker_stopwords
-    tokens = jieba.lcut(text)
-    # ...
-```
+- **[用户] 选择数据集的方法？理由？**
 
-**设计原因**：
-- 每个子进程需要独立的 jieba 实例（jieba 内部有 C 扩展和全局状态，不能跨进程共享）。
-- 停用词集合通过 `initializer` + `initargs` 传入（比每次序列化传递更高效）。
-- 限制 worker 上限为 8（`max_safe_jobs`），防止多进程同时加载 jieba 导致内存压力。
-- `maxtasksperchild` 防止长时间运行后内存泄漏。
+  **AI 回答**：选择 T2Ranking 的原因：
 
----
+  | 维度 | T2Ranking | MIRACL | 自建数据集 |
+  |------|-----------|--------|------------|
+  | 查询数量 | 30 万+ | ~1,500 | 需标注 |
+  | 查询来源 | 搜狗真实搜索日志 | 人工构造 | — |
+  | 标注粒度 | 4 级（0~3） | 二元（相关/不相关） | 可自定义 |
+  | Query Types | ✅ 附带意图标签 | ❌ | — |
+  | 统计可靠性 | 极高（大样本） | 一般 | 取决于标注量 |
+  | 学术权威性 | SIGIR 2023 论文 | TACL 2023 + WSDM Cup | — |
+  | 中文互联网段落 | ✅ 真实网页 passage | ❌（百科类居多） | — |
 
-### Q24: 分词后为什么过滤 `len(w) <= 1` 的 token？
+  选择理由：
+  1. **真实搜索场景**：搜狗搜索日志保证了查询分布的生态效度，评估结论能泛化到真实搜索引擎场景。
+  2. **4 级标注**：支持 NDCG 评估（需要分级相关性），二元标注无法区分"完全相关"和"部分相关"。
+  3. **大样本**：22,812 条带标注查询（dev 集），统计结果可靠（置信区间窄）。
+  4. **附带 Query Type**：factual/concept/comparison/open_discussion 标签天生适合按类型分层分析。
+  5. **学术权威性**：SIGIR 2023 发表，社区认可度高，结果可与其他论文对比。
 
-- 中文单字词（"的"、"是"、"在"等）单独看信息量极低。
-- BM25 的 IDF 虽然会压低它们，但显式过滤能显著减少索引大小和检索计算量。
-- Jieba 分词后仍会产生大量单字 token（标点、语气词等）。
+- **[AI] 实验中为什么用 50/50 分割而不是 k-fold 交叉验证？**
 
----
+  **AI 回答**：原因有三：
+  1. **数据量足够大**：912 条测试集已经提供了足够的统计可靠性，k-fold 的边际收益较小。
+  2. **计算开销**：k-fold 需要重复跑 k 次全量实验（包括 LLM API 调用），成本和时间开销翻 k 倍。而本实验已通过 RewriteCache 做了 LLM 输出缓存，但检索评估仍需重复。
+  3. **实验阶段匹配**：这是 V0 的方案探索阶段，目标是快速筛选有效技术路线，而非产出论文级别的最终指标。简单 hold-out 验证足够做方案对比。
+  
+  在 V2 最终报告阶段，会在全量 22,812 条上跑最优方案，此时样本量足够大，不需要交叉验证也能获得稳定的置信区间。
 
-### Q25: 断点续跑（Resume）是如何实现的？
+- **[AI] 为什么 V0 阶段不用 LangChain 的默认 RAG chain？**
 
-**T2Ranking 索引构建**（`build_t2ranking_index.py`）：
-
-`state.json` 记录：
-```json
-{
-  "last_processed_line": 150000,
-  "total_stored": 149873,
-  "batches_completed": 150
-}
-```
-
-- 每批次完成后更新 state.json。
-- 重新运行时自动从 `last_processed_line` 续跑。
-- `--rebuild` 参数清除旧索引和状态文件从头开始。
-- 配合 `build_log.jsonl` 做诊断回溯。
-
----
-
-### Q26: 为什么 T2Ranking 评估中不分片（chunk）？
-
-- qrels 标注粒度是 passage 级别（qid→pid 映射）。
-- 分片后一个 passage 变成多个 chunk，无法直接对应 qrels 中的 pid。
-- 必然需要做 chunk→pid 的回溯映射，增加了工程复杂度。
-- T2Ranking passage 中位数 368 字符，自身长度已接近常见的 chunk_size（500），分片收益有限。
-
----
-
-### Q27: 这个项目中你遇到的最大的技术难题是什么？怎么解决的？
-
-**开放式问题，候选回答方向**：
-
-1. **训练数据污染**：发现 BGE 模型已"见过" T2Ranking 数据，果断排除，切换 m3e-base。（展示科研诚信）
-2. **BM25 在中文段落完全失效**：Recall@10 接近 0 → 深入分析发现中文互联网段落术语密度高、同义词丰富，BM25 词袋匹配天然不足 → 转而重点投入查询重写弥补 gap。（展示分析能力）
-3. **多进程 jieba 死锁/内存泄漏**：通过 `maxtasksperchild` + worker 上限 + `jieba.lcut("")` 初始化解决。（展示工程能力）
-
----
-
-## 七、开放性问题（面试官可能从简历发散问）
-
-### Q28: 如果有无限资源，你会怎么改进这个系统？
-
-- Dense 检索模型升级为 ColBERT 或 late-interaction 模型（效果接近 Cross-Encoder 但可索引）。
-- 部署完整的 Elasticsearch + Milvus 混合检索服务，支持分布式。
-- 引入真正的个性化模块：基于用户历史行为（AOL4PS 数据集）训练双塔模型。
-- 重排序从 RRF 升级为 LambdaMART/LightGBM，学习多路召回特征的融合权重。
-- 本地部署 7B 模型做查询重写和 LLM 生成，减少 API 依赖。
+  **AI 回答**：LangChain 的 `RetrievalQA` chain 做了很多不适合本项目的默认假设：
+  - 默认 prompt 模板与本项目的 Typed Prompt 设计冲突——本项目有 4 种 System Prompt + few-shot 示例，不是统一的一个 prompt。
+  - 评估指标是纯检索层面的 Recall@k/MRR/NDCG，不需要跑完完整的「检索 → 生成 → 评估」链条。LangChain 的 chain 把检索和生成耦合在一起，评估时无法单独拆解检索器的贡献。
+  - 检索器需要同时支持 BM25 和 Dense 双路 + RRF 融合，LangChain 的 `EnsembleRetriever` 对于多后端 RRF 融合的支持有限（只有简单的权重融合）。
+  - 需要保存每条查询的 (pid, score, rank) 三元组做详细的召回曲线分析，LangChain 不原生支持这种粒度的日志记录。
+  
+  所以本项目只用 LangChain 的 `BaseLanguageModel` 接口和 `PromptTemplate`，检索和评估逻辑全部自行实现。
 
 ---
 
-### Q29: 你这个系统如果要上线，最大的风险是什么？
+## 开放性问题
 
-- **查询重写的 LLM 幻觉**：生成不存在的术语、偏离原意的改写 → 需要人工评估改写质量（Semantic Similarity、BLEU 等）。
-- **BM25 检索的冷启动**：如果 T2Ranking 语料换成完全不同领域的数据，BM25 的分词和停用词可能需要重新调优。
-- **chromadb 的持久化不是为生产设计的**：高并发下性能会急剧下降，需要迁移到 Milvus 或自建 FAISS 服务。
-- **DeepSeek API 依赖**：API 不稳定或涨价会直接影响整个 pipeline。
+- **[用户] Vibe Coding 的关键经验有哪些？（文档思路、快速验证、多方求证）。**
 
----
+  **AI 回答**：本项目体现了 Vibe Coding 的几个关键经验：
 
-### Q30: 你怎么看待 LLM-as-a-Judge 做评估？项目中有用到吗？
+  **文档思路**：
+  - 每个实验（exp-001 ~ exp-004）都配有独立的 YAML 配置文件（实验目标、消融维度、分组设计、分析问题列表）和翔实的 results-analysis.md（完整指标、分模块分析、关键发现、后续方向）。
+  - 这种「先设计再执行、执行完立刻写分析」的范式让实验可复现、决策可追溯。几周后回头看，每个实验为什么做、结论是什么，一清二楚。
 
-**本项目未使用 LLM-as-a-Judge 做检索评估**（用 T2Ranking 人工标注的 qrels 更可靠）。但在 proposal.md 中规划了 Pooling 标注方案作为备选：
+  **快速验证**：
+  - 2000 条消融 → 912 条验证集调参 → 912 条测试集确认 → 全量 22,812 条出最终报告。四层递进，每层成本可控。
+  - RewriteCache（`src/retrieval/rewrite_cache.py`）缓存 LLM 输出，避免了重复的 API 调用，使快速迭代成为可能。
+  - Smoke Test（100 条）最先跑，确保全链路无报错后才放大实验规模。
 
-> 对 Pool 内每篇文档，调用 DeepSeek API 评估相关性 → 输出 3(直接相关)/2(部分相关)/1(弱相关)/0(不相关)
+  **多方求证**：
+  - 每个消融实验同时跑 BM25 和 Dense 两个后端，观察技术在不同后端上的一致性或差异性。例如 PRF 在两个后端上一致退化，结论可信度极高；Multi-Query RRF 在 BM25 上退步但在 Dense 上提升，说明后端差异化的发现同样有价值。
+  - 不只看一个指标：R@50 + MRR + NDCG + Hit@k + Precision@k 多指标交叉验证，避免单一指标误导决策。
+  - 训练数据污染的发现和排除：查阅模型论文 → 确认数据来源 → 排除受污染模型，体现了学术严谨性。
 
-LLM-as-a-Judge 的优势是灵活和低成本，劣势是"弱相关 vs 不相关"边界判断不如人工精确，本项目规划中建议降级为二元相关。
+  **[AI] Vibe Coding 补充经验**（基于本项目观察）：
 
----
+  **「跑实验，别争论」——数据驱动决策**：
+  - 当团队对某个技术方向有分歧时（如「关键词串 vs 自然语句哪个更适合 BM25？」「对比教学 few-shot 会不会更好？」），不做理论推演——直接跑消融实验，让数据说话。
+  - 本项目中，直觉上「关键词串密度更高所以 BM25 效果应该更好」是合理的，但实验证明自然语句更好。直觉和实验结论不一致时，信任实验。
 
-## 八、"被问到概率极高"的 Top 5 题
+  **「先写分析问题，再跑实验」——防止事后合理化**：
+  - 每个 YAML 配置文件里都有 `analysis_questions` 列表（如 E2a 的 Q1~Q6）。在跑实验之前就定义好「这个实验要回答什么问题」，拿到数据后逐条回答。
+  - 这避免了拿到数据后 cherry-pick 对自己有利的解读。面试中展示这种「实验设计先于结果解读」的方法论意识，非常加分。
 
-如果你只想准备 5 道题，以下是面试官最可能从你简历上这个项目顺藤摸瓜问到的：
+  **「缓存一切花钱的东西」——API 经济性**：
+  - LLM API 调用是 V0 阶段的唯一成本。`RewriteCache` 把每条 query 的 LLM 输出（改写、HyDE 假答案、多条子查询）全部缓存到 JSONL 文件。切换检索后端、调整 RRF 参数、换融合路数——都不需要重新调用 LLM。
+  - 体现的原则：**昂贵计算只做一次，便宜计算随便重跑**。这是 AI 辅助开发中最重要的工程习惯之一。
 
-1. **BM25 原理 + 为什么不直接用 BM25**（引到 Dense/Hybrid 的必要性）
-2. **RAG 系统整体架构图**（考察系统设计能力）
-3. **查询重写怎么做，效果如何验证**（考察 Prompt 工程和实验设计）
-4. **T2Ranking 是什么，为什么选它**（考察数据 sense 和评估意识）
-5. **训练数据污染是怎么发现和处理的**（考察科研严谨性，非常加分）
+  **「负面结果也是结果」——拥抱失败的实验**：
+  - PRF 在所有条件下退化、对比 few-shot 反而退步、类型感知改写退化、step-back 在 Dense 端有害——这些「失败」全部被清晰记录、分析根因、写出教训。
+  - 面试中的亮点：不只是展示成功的实验，还能清晰地解释失败实验为什么失败、学到了什么。这比只展示成功实验更有说服力。
+
+  **「管道的边界」——模块间低耦合**：
+  - 文本清洗（`data_loader.py`）→ 分词（`bm25_store.py`）→ 索引构建（`bm25s_store.py`）→ 评估（`metrics.py`）四层各自独立。变更分词策略不需要重跑清洗，切换检索后端不需要重新评估。
+  - 这保证了快速试错：改 Prompt 只影响改写阶段，不需重跑索引；改 RRF k 只影响融合阶段，不需重调 LLM。面试官如果问「你的系统怎么支持快速迭代」，这就是答案。
+
+  **「不做不需要的东西」——延迟架构决策**：
+  - V0 阶段没有做：Agent 多轮检索、Reranker 精排、Embedding 模型微调、生成模型 SFT、偏好对齐。不是因为不重要，而是因为前面的实验还没验证这些方向的必要性。
+  - YAGNI（You Aren't Gonna Need It）原则：先证明当前天花板在哪，再决定是否需要突破天花板。本项目中 V0 证明了「不改模型的上限是 R@50=0.69」，这为 V1/V2 的投入提供了明确的 justification。
+
+  **「渐进放量」——从小样本到全量**：
+  - Smoke Test（100 条验证无报错）→ 消融（2000 条筛选方案）→ 验证集调参（912 条）→ 测试集确认（912 条）→ 全量报告（22,812 条）。
+  - 每一层都有明确的「晋级标准」：Smoke Test 只检查能否跑通，2000 条消融只比较方案排序，最终测试集只跑一次防止 overfit。这种分层策略避免了「在 22,812 条上跑一遍发现脚本报错，浪费一天」的窘境。
+
+  **「配置文件就是实验记录本」**——YAML as Lab Notebook：
+  - `exp-002-query-rewriting.yaml` 本身就是一份可执行的实验设计文档：动机、评估体系、消融维度、分组配置、分析问题——全部结构化记录。任何人在任何时候捡起这个项目，都能完整复现实验。
+  - 面试中对比「在 Jupyter Notebook 里随便改参数跑实验」的同行，这种工程化实验管理的意识是明显的区分度。
+
+  **「关联指标，别只看一个」**——多维证据链：
+  - 仅看 R@50 可能会被单一指标误导：某个方案 R@50 提升但 MRR 下降了，说明它虽然召回了相关文档但把它们排得更靠后了，对最终用户没帮助。
+  - 同时关注 R@10（严格排序）和 R@50（宽松覆盖）的差距：如果 R@10 → R@50 增长超过 5%，说明大量相关文档在 11-50 位，增大 RRF 输出 K 有实际收益——这是一个可操作的优化方向。
+
+  **[AI] 普适性 Vibe Coding 经验**（社区总结，非本项目特有）：
+
+  以下经验来自 AI 辅助开发的社区共识，适用于任何项目的 Vibe Coding 实践：
+
+  **「把 AI 当结对编程搭档，不当代码生成器」**：
+  - 最高效的使用方式不是「写一个 XX 功能」，而是「我在做一个 XX，现在遇到的问题是 YY，我试了 ZZ 但不行，你觉得为什么？」。把上下文、约束、尝试过的方案都告诉 AI，让它像人类同事一样参与推理。
+  - 核心：AI 的推理能力远强于盲目生成能力。给足上下文比给精确指令更重要。
+
+  **「Prompt 是投资，不是消耗」**：
+  - 花 10 分钟写好 prompt 比花 1 小时改 bug 划算。好 prompt 包含：角色定义、任务边界、输入输出格式、约束条件、成功标准、反例（不要做什么）。
+  - 积累可复用的 prompt 模板库，每次复用微调而不是从零写。
+
+  **「全程让 AI 驱动，但关键决策点自己把关」**：
+  - AI 生成代码 → 你自己审查关键逻辑（权限、安全、数据一致性、边界条件）。AI 擅长"从 0 到 80%"但最后 20% 需要人的判断力。
+  - 一个实用习惯：让 AI 在每次大改动后列出「潜在风险点」，你逐条过一遍。
+
+  **「错误信息是最好的 prompt」**：
+  - 编译器报错、linter 警告、运行时异常——直接复制粘贴给 AI，附上「这个报错怎么修？可能的原因是什么？」。不要让 AI 猜你哪里出错了，直接把错误丢给它。
+  - 进阶技巧：让 AI 解释「为什么这个错误会发生」，而不仅仅是「怎么修」。理解根因比背解决方案重要。
+
+  **「小步快跑，每步验证」**：
+  - 最危险的 Vibe Coding 方式是「给我生成一个完整系统」——生成 3000 行代码，然后调试 3 小时。
+  - 正确的节奏：提一个小需求 → AI 生成 50 行 → 跑起来验证 → 提下一个需求。每一步的时间粒度控制在 5-10 分钟内。这跟 TDD（测试驱动开发）的理念完全一致。
+
+  **「敢于推翻重来，别修修补补」**：
+  - AI 生成的代码如果连续 3 次修改都修不好同一个 bug，不要继续修——直接让 AI 从零重写。上下文被多次修补污染后，AI 会陷入「补丁循环」。
+  - 经验法则：同一段代码被改超过 3 轮还没对 → 删掉重来。AI 写代码是零成本的，你的时间不是。
+
+  **「明确区分"我想做什么"和"我让你做什么"」**：
+  - 新手常犯的错误：告诉 AI "怎么做"（用 pandas 读取 CSV、过滤第三列、按日期排序），而不是"想做什么"（我需要找出上个月销量最高的 5 个产品）。
+  - 正确的姿势：先描述目的，让 AI 决定方案。如果它的方案不行，再给具体指令。允许 AI 比你聪明。
+
+  **「让 AI 自我审查」**：
+  - 一个高效的工作流：AI 写代码 → 切到另一个对话窗口，把代码贴进去，问「这段代码有什么问题？」→ 用新窗口中 AI 指出的问题去修改原窗口的代码。
+  - 也可以用同一对话窗口问「review 你刚才写的代码，找出潜在 bug」，但效果不如独立审查（前者有上下文偏见）。
+
+  **「不要为 AI 而 AI——选对场景」**：
+  - AI 擅长：CRUD 业务逻辑、数据处理脚本、单元测试生成、文档/注释补全、正则表达式、SQL 查询、配置文件。
+  - AI 不擅长：极度复杂的算法设计、分布式一致性、需要深度领域知识的架构决策、10 层以上抽象链的代码。
+  - 判断标准：如果你自己也需要查文档才能写的代码，让 AI 写；如果你闭着眼睛都知道怎么写但懒得敲，也让 AI 写；如果你自己都不知道怎么做，让 AI 帮你理清思路但不一定让它实现。
+
+  **「工具链就是生产力」**：
+  - IDE 的 AI 插件（Copilot/Cursor/Trae）用于 inline 补全 → 聊天窗口用于架构讨论和复杂功能 → Claude/GPT 的 Web 端用于长文档分析。
+  - 不同场景用不同工具：inline 补全适合「我知道要写什么但懒得敲」；聊天窗口适合「我知道要做什么但不知道怎么设计」；Web 端适合「我有一堆资料需要总结分析」。
+  - 建立自己的「提示词武器库」：把好用的 prompt 模板存到项目中（如 `.trae/rules/` 或 `prompts/` 目录），做成可复用的资产而非一次性消耗品。
+
+  **「不要跳过代码审查」**：
+  - AI 写的代码和人写的代码一样需要 review。AI 会：
+    - 引入不存在的库或 API（幻觉）
+    - 忽略安全最佳实践（SQL 注入、XSS、密钥硬编码）
+    - 生成看似正确但边界条件处理不完善的逻辑
+    - 使用过时的 API 版本
+  - 最低限度的 review checklist：依赖是否存在？错误处理是否完善？有无硬编码密钥？边界条件（空输入、空列表、超长输入）是否处理？
+
+  **「Vibe 之后要沉淀」**：
+  - Vibe Coding 追求的是快速出东西，但产物不能停留在"AI 写的、我也不太懂"的状态。
+  - 每个阶段结束后做一次「知识锚定」：把 AI 生成的核心模块用自己的语言写一段注释/文档，确保你真的理解了它在做什么。不理解的代码不要合入。
+
+  **「设定硬边界」**：
+  - 给 AI 设置明确的'禁止事项'：不要引入未在 `requirements.txt` / `package.json` 中的依赖；不要修改已有的测试；用与现有代码一致的风格；不要添加注释除非我明确要求。
+
+  **「AI 善于执行，你善于判断」**：
+  - Vibe Coding 的核心悖论：越依赖 AI 生成代码，越需要人的判断力。AI 降低了编码门槛但抬高了架构、质量把控、安全审查的门槛。
+  - 最好的 Vibe Coder 不是最会写 prompt 的人，而是最能识别「AI 什么时候在胡说」的人。
+
+- **[用户] 项目最大的技术难点？**
+
+  **AI 回答**：项目最大的技术难点是**在低资源约束下（不微调模型、极小 API 预算）系统性提升中文互联网短查询的检索召回率**。具体挑战包括：
+
+  1. **短查询与长 passage 的词汇鸿沟不可跨越**：BM25 在全量 230 万池上的 R@50 仅 0.175。无论 Prompt 怎么优化，纯 term 匹配的上限就是 ~20%。这意味着必须依靠语义检索。
+
+  2. **语义检索的「上限诅咒」**：Dense 基线 R@50=0.628，还有 37% 的相关 passage 找不出来。这些「找不出来的 37%」多数是术语高度不匹配的 niche 查询——embedding 模型缺乏足够的训练信号来建立这些 query-passage 的语义映射。不微调 embedding 模型的情况下，只能靠 Prompt 注入新 term（改写）或扩展语义方向（HyDE/Multi-Query）来填补。
+
+  3. **Prompt 工程的「边际递减」**：16 组实验跑下来，最好方案（HyDE+RRF）比基线仅提升 8.6%。每一组新技术带来的增益越来越小——从改写 (+3.2%) → 领域 few-shot (+4.0%) → HyDE (+8.6%)，但组合后不能线性叠加。跨后端融合（Dense + BM25）也只贡献了 0.4% 的边际增益。说明在「不改模型」的约束下，很快触及天花板。
+
+  4. **数据污染的发现与处理**：BGE 系列被排除后，可选的开源中文 Embedding 模型极为有限（m3e 是少数的干净选项）。而 m3e 的性能又显著弱于 bge-small（14% 差距），需要在公平性和绝对指标之间做取舍。
+
+- **[用户] 项目还有哪些改进方向？**
+
+  **AI 回答**：按优先级排列：
+
+  **V1 近期（不改模型 + 精排）**：
+  - Reranker 精排：在 R@50=0.69 的候选池上引入 Cross-Encoder，预期 MRR@10 大幅提升（当前 0.497）。T2Ranking 的 4 级标注天然适合训练 Reranker。
+  - HyDE × 领域 Few-Shot 组合：E2c-H2 的 HyDE prompt 还未融合 E2a-P2 的领域 few-shot，组合后预期 R@50 可突破 0.70。
+  - 自适应路由选择：分析哪些 query 从哪路获益最大（如 factual 查询可能更多依赖 BM25 的精确匹配），建立自适应路由策略，避免对所有查询跑全量 4 路。
+  - 差异化 per-route K：高质量路（D-P2）取 50 条，低质量路（B-B0）只取 20 条。
+
+  **V2 中期（微调）**：
+  - Embedding 模型微调：在 m3e-base 上用 T2Ranking 训练集做对比学习微调，将 baseline Recall@50 从 0.628 推至 0.70+。
+  - 生成模型 SFT：用 (query, retrieved passages, 理想回答) 三元组做监督微调，提升回答质量和引用准确性。
+  - 偏好对齐（DPO）：在 SFT 基础上做偏好优化，减少幻觉、提高信息密度。
+
+  **V3 远期（架构升级）**：
+  - Agent 多轮检索：对于第一轮 R@10 仍然为 0 的查询（约 22%），触发多轮检索——用第一轮的 top passage 做 query expansion，重新检索。
+  - 个性化 RAG：引入用户画像 → 查询改写 → 检索 → 个性化生成。
+  - 多模态 RAG：支持图片、表格的检索和生成。
+
+- **[用户] 该项目最大的风险。**
+
+  **AI 回答**：
+
+  1. **评估集的生态效度风险**：T2Ranking 是搜狗搜索 2019 年左右的查询日志。查询分布、用户表达习惯可能与当前（2026 年）的搜索引擎用户行为有差异。且 dev 集的查询是固定的——所有 Prompt 的 few-shot 示例都从 dev 分布中来，模型可能过拟合到「T2Ranking 风格」。
+
+  2. **模型依赖风险**：整个 pipeline 严重依赖 DeepSeek API——查询重写、HyDE 假答案、最终生成三个环节都用 DeepSeek。如果 DeepSeek 服务不稳定、涨价、或者模型更新改变行为，所有实验指标都需要重新验证。V0 阶段 RewriteCache 缓存了大量 LLM 输出，但这些输出是「deepseek-chat 在某个时间点」的快照，不具备可迁移性。
+
+  3. **「天花板过早触及」风险**：在「不改模型」的约束下，最高 R@50=0.691（测试集）。后续即使做了 Reranker，MRR@10 的上限也受制于粗排的 Recall 上限——Reranker 不能创造新的相关 passage。如果微调路线也拿不到显著增益（如 Embedding 微调后 R@50 仍然 < 0.75），项目可能陷入「投入-产出比过低」的困境。
+
+  4. **中文互联网段落的特殊性**：T2Ranking 的 passage 来自搜狗搜索的真实网页，包含大量 HTML 噪声、口语化表达、不完整句子。在这种数据上的优化策略（如 Prompt 设计、分词方式）可能无法迁移到更干净的百科类数据集上。
+
+- **[用户] 如果让你设计个性化 RAG，召回、排序、生成阶段你会怎么设计？**
+
+  **AI 回答**：个性化 RAG 的核心是在每个阶段注入用户画像信号，同时保持检索质量不退化。设计方案如下：
+
+  **阶段一：用户画像构建**
+  - 长期画像：历史搜索记录、点击行为、收藏/保存过的内容 → 提取兴趣主题和术语偏好（如用户偏好「手机银行」而非「网上银行」）。
+  - 短期画像：当前 session 的对话上下文 → 提取当前信息需求的场景（如正在了解「基金」vs 正在购买「基金」）。
+  - 画像表示为结构化特征 + 自然语言描述（供 LLM 消费）。
+
+  **阶段二：个性化查询重写**
+  - 在现有 Query Rewriter（`src/intent/query_rewriter.py`）中接入 `user_profile` 参数。
+  - 提示词中加入：`用户偏好术语: {preferred_terms}；用户的专业背景: {expertise_level}；当前场景: {session_context}`。
+  - 如用户历史搜索了大量「机器学习」相关内容，查询「SVM」时改写为「支持向量机 SVM 算法原理 监督学习」（自动补充相关术语），而非通用改写。
+
+  **阶段三：个性化多路召回**
+  - 在现有 4 路召回基础上增加第 5 路：**个性化 Dense 检索**——query embedding 向用户兴趣向量做一定程度的偏置（如 query_vec + α × user_interest_vec），让召回结果向用户历史兴趣倾斜。
+  - α 的取值需要消融——α 过大则搜索结果变成「信息茧房」，α 过小则个性化无效。
+  - 保留一路「非个性化」的 Dense 或 BM25 检索作为对照组，确保检索的多样性。
+
+  **阶段四：个性化重排**
+  - Reranker 的输入增加用户特征：`[CLS] 用户画像文本 [SEP] 查询文本 [SEP] 文档文本 [SEP]`。
+  - 训练数据构造：正样本 = 用户点击过的文档，负样本 = 同 query 下曝光但未点击的文档。比传统的相关性标注更能反映「用户偏好」。
+  - 也可用轻量级特征工程：在树模型 Reranker 中加入 user-doc 交互特征（如用户是否点击过同 domain 的文档、doc 与用户历史搜索的 term overlap 等）。
+
+  **阶段五：个性化生成**
+  - 在 LLM 生成的 System Prompt 中加入用户画像：`用户的专业背景是 {expertise_level}，请用对应的语言风格回答`。
+  - 如果用户是初学者，回答用通俗语言、避免术语；如果用户是专家，回答用精确术语、提供深入分析。
+  - 引用优先级：用户曾点击/收藏过的来源优先展示。
+
+  **防「信息茧房」机制**：
+  - 多样性约束：在 RRF 融合阶段增加 diversity penalty——已被个性化路召回的 passage 在非个性化路的排名受限。
+  - 探索-利用平衡：随机 20% 的查询不使用个性化偏置，让用户有机会接触新内容。
+  - 用户可控：提供「个性化开关」，用户可随时切换个性化/通用模式。
+
+  **评估方式**：
+  - 离线评估：需要带用户交互信息的评估集（如 AOL4PS），对比个性化 vs 非个性化的 Click-Through Rate、Mean Reciprocal Rank、Session 满意度。
+  - 在线 A/B 测试：个性化 vs 非个性化，核心指标为用户点击率、停留时长、回访率。
+
+- **[AI] 在做消融实验时，如何判断「一个技术的提升是真实的」而不是「统计噪声」？**
+
+  **AI 回答**：本项目的判断标准：
+
+  1. **跨后端一致性**：如果一个技术在 BM25 和 Dense 两个独立后端上都一致地正向/负向，置信度极高。如 HyDE+RRF 在两个后端上都是最优，PRF 在两个后端上都退步，结论非常可靠。
+
+  2. **效应量 > 噪声的合理估计**：2000 条样本上，Recall@50 的标准误约 0.01~0.015。因此 < 0.01 的差异不解读为有效果（如 RRF k=30 vs 60 的 0.0005 差异），> 0.02 的差异才认为有意义。
+
+  3. **单变量控制**：每次消融只改变一个因素（E2a-P1 只改了规则密度，其他和 B1 完全相同），确保能归因增益来源。多变量同时变的「组合实验」无法区分各变量的独立贡献。
+
+  4. **测试集隔离**：验证集（912 条）上做方案筛选和参数调优，最终只在测试集（912 条）上跑一次最优方案出报告。避免了在同一个集合上反复调参导致的选择偏差。
+
+  5. **不追逐微小差异**：如 MRR 上 S4 的 k=30 vs k=60 的差异仅 0.012（k=30 略好），但 Recall@50 完全一致（0.7086 vs 0.7086）。考虑到 RRF k=60 是文献标准值且 Recall@50 无差异，选择 k=60 而不是追逐 MRR 的微小提升——这在面试中体现了「不 overfit 评估集」的工程判断力。

@@ -110,9 +110,7 @@ def build_prompt(
     passages: list[dict],
     prompt_manager: PromptManager,
 ) -> tuple[str, str]:
-    """构建 system prompt 和 user prompt。"""
-    query_type = prompt_manager.classify_query_type(query_text)
-    system_prompt = prompt_manager.get_system_prompt(query_type)
+    system_prompt = prompt_manager.get_system_prompt()
 
     context_parts = []
     for i, p in enumerate(passages):

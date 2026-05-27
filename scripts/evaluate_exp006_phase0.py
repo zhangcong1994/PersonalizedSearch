@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.evaluation.data_loader import clean_text
+from src.utils.config import DATA_ROOT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,9 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-EXP003_RESULTS = PROJECT_ROOT / "results" / "exp003" / "exp003_test_S4_K50_RRFk60.jsonl"
-COLLECTION_FILE = PROJECT_ROOT / "data" / "raw" / "t2ranking" / "collection.tsv"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "exp006"
+EXP003_RESULTS = DATA_ROOT / "results" / "exp003" / "exp003_test_S4_K50_RRFk60.jsonl"
+COLLECTION_FILE = DATA_ROOT / "data" / "raw" / "t2ranking" / "collection.tsv"
+OUTPUT_DIR = DATA_ROOT / "results" / "exp006"
 
 GAP_ANALYSIS_SYSTEM = """你是一个搜索失败诊断专家。用户提出查询后，搜索引擎返回了第一轮的 Top-10 段落。
 请分析为什么这些结果可能没有满足用户的信息需求，并生成第二轮检索的改写查询。
@@ -167,10 +168,14 @@ def main():
     parser.add_argument("--api-key", default=None, help="DeepSeek API key")
     parser.add_argument("--thinking", action="store_true", help="Use deepseek-reasoner (thinking mode)")
     parser.add_argument("--full-text", action="store_true", help="Print full passage texts (not truncated)")
+    parser.add_argument("--exp003-results", default=str(EXP003_RESULTS),
+                        help="Path to exp-003 S4 JSONL results file")
+    parser.add_argument("--collection", default=str(COLLECTION_FILE),
+                        help="Path to collection.tsv")
     args = parser.parse_args()
 
     logger.info("Loading data...")
-    all_results = load_exp003_results(EXP003_RESULTS)
+    all_results = load_exp003_results(Path(args.exp003_results))
     zero_hit = find_zero_hit_queries(all_results)
     logger.info(f"Zero-hit queries: {len(zero_hit)} / {len(all_results)}")
 
@@ -188,7 +193,7 @@ def main():
     for e in selected:
         for item in e.get("rrf@k60_perK50", [])[:10]:
             needed_pids.add(item["pid"])
-    pid_to_text = load_collection_texts(needed_pids, COLLECTION_FILE)
+    pid_to_text = load_collection_texts(needed_pids, Path(args.collection))
     logger.info(f"Loaded {len(pid_to_text)} passage texts")
 
     api_client = None

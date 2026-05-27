@@ -29,7 +29,6 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 
@@ -44,6 +43,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.evaluation.data_loader import load_qrels, clean_text
+from src.utils.config import DATA_ROOT
+from src.utils.config import resolve_model_local_path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,16 +52,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw" / "t2ranking"
+RAW_DATA_DIR = DATA_ROOT / "data" / "raw" / "t2ranking"
 QRELS_FILE = RAW_DATA_DIR / "qrels.retrieval.dev.tsv"
 COLLECTION_FILE = RAW_DATA_DIR / "collection.tsv"
 
-EXP003_RESULTS = PROJECT_ROOT / "results" / "exp003" / "exp003_test_S4_K50_RRFk60.jsonl"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "exp006"
+EXP003_RESULTS = DATA_ROOT / "results" / "exp003" / "exp003_test_S4_K50_RRFk60.jsonl"
+OUTPUT_DIR = DATA_ROOT / "results" / "exp006"
 GAP_ANALYSIS_CACHE = OUTPUT_DIR / "gap_analysis_cache.jsonl"
 
-VECTOR_DB_DIR = PROJECT_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
+VECTOR_DB_DIR = DATA_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
 COLLECTION_NAME = "t2ranking_passages"
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
@@ -140,23 +140,9 @@ def load_collection(path: Path, max_lines: int = 0) -> dict[str, str]:
     return pid_to_text
 
 
-def resolve_model_local_path(model_id: str) -> Optional[Path]:
-    candidates = [
-        PROJECT_ROOT / "models" / "bge-small-zh-v1.5",
-        PROJECT_ROOT / "models" / "models--BAAI--bge-small-zh-v1.5" / "snapshots",
-    ]
-    for c in candidates:
-        if c.is_dir():
-            if c.name == "snapshots":
-                subdirs = list(c.iterdir())
-                if subdirs:
-                    return subdirs[0]
-            if (c / "config.json").exists():
-                return c
-    return None
-
-
-def load_dense_retriever(device: str = "cpu"):
+def load_dense_retriever(device: str = "cpu", vector_db_dir: str = ""):
+    if not vector_db_dir:
+        vector_db_dir = str(VECTOR_DB_DIR)
     model_id = EMBEDDING_MODEL
     local_path = resolve_model_local_path(model_id)
     model_name = str(local_path.resolve()) if local_path else model_id
@@ -171,7 +157,7 @@ def load_dense_retriever(device: str = "cpu"):
     vs = Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
-        persist_directory=str(VECTOR_DB_DIR),
+        persist_directory=vector_db_dir,
     )
     count = vs._collection.count()
     logger.info(f"Dense retriever loaded: {count:,} docs in '{COLLECTION_NAME}'")
@@ -432,6 +418,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--concurrency", type=int, default=4, help="Max concurrent API calls")
     parser.add_argument("--output", default=None, help="Output JSONL path")
+    parser.add_argument("--exp003-results", default=str(EXP003_RESULTS),
+                        help="Path to exp-003 S4 JSONL results file")
+    parser.add_argument("--vector-db", default=str(VECTOR_DB_DIR),
+                        help="Path to ChromaDB vector DB directory")
+    parser.add_argument("--collection", default=str(COLLECTION_FILE),
+                        help="Path to collection.tsv")
     parser.add_argument("--no-collection", action="store_true", help="Skip collection.tsv loading (dry-run only)")
     parser.set_defaults(no_collection=True)
     args = parser.parse_args()
@@ -446,7 +438,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Step 1: Loading Round 1 (exp-003 S4) results")
     logger.info("=" * 60)
-    all_entries = load_exp003_results(EXP003_RESULTS)
+    all_entries = load_exp003_results(Path(args.exp003_results))
 
     # Step 2: Filter / sample queries
     if args.phase == 0 and args.query_source == "zero_hit":
@@ -470,7 +462,7 @@ def main():
     pid_to_text: dict[str, str] = {}
     if not args.dry_run or not args.no_collection:
         logger.info("Loading collection.tsv...")
-        pid_to_text = load_collection(COLLECTION_FILE)
+        pid_to_text = load_collection(Path(args.collection))
 
     # Step 4: Load qrels
     qrels = load_qrels(QRELS_FILE)
@@ -479,7 +471,7 @@ def main():
 
     # Step 5: Load Dense retriever
     logger.info("Loading Dense retriever...")
-    vs, _ = load_dense_retriever(device=args.device)
+    vs, _ = load_dense_retriever(device=args.device, vector_db_dir=args.vector_db)
 
     # Step 6: Gap analysis (API calls)
     api_client = None

@@ -17,11 +17,15 @@ from src.utils.config import RAW_DATA_DIR
 SAVE_DIR = RAW_DATA_DIR / "t2ranking"
 
 FILES = {
-    "collection.tsv":           ("2,303,643 条 passage", "~3.5 GB"),
-    "queries.dev.tsv":          ("24,832 条查询（V0 评估主力）", "~1 MB"),
-    "queries.test.tsv":         ("24,832 条查询（V1 最终评估）", "~1 MB"),
-    "qrels.retrieval.dev.tsv":  ("118,933 条检索 qrels（二元相关）", "~1.5 MB"),
-    "qrels.dev.tsv":            ("400,536 条精排 qrels（TREC 格式，4 级标注 0-3）", "~6 MB"),
+    "collection.tsv":              ("2,303,643 条 passage", "~3.5 GB"),
+    "queries.train.tsv":           ("258,042 条训练查询", "~15 MB"),
+    "queries.dev.tsv":             ("24,832 条查询（V0 评估主力）", "~1 MB"),
+    "queries.test.tsv":            ("24,832 条查询（V1 最终评估）", "~1 MB"),
+    "qrels.retrieval.train.tsv":   ("744,663 条检索 qrels 训练集（二元相关）", "~9 MB"),
+    "qrels.retrieval.dev.tsv":     ("118,933 条检索 qrels（二元相关）", "~1.5 MB"),
+    "qrels.train.tsv":             ("1,613,421 条精排 qrels 训练集（TREC 格式，4 级标注 0-3）", "~24 MB"),
+    "qrels.dev.tsv":               ("400,536 条精排 qrels（TREC 格式，4 级标注 0-3）", "~6 MB"),
+    "train.bm25.tsv":              ("200,359,731 条 BM25 负样本", "~2.5 GB"),
 }
 
 CHUNK_SIZE = 128 * 1024

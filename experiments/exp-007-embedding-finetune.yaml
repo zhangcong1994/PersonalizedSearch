@@ -1,0 +1,615 @@
+# 实验计划：V1 Embedding 模型微调
+# exp-007: 双塔 Embedding 模型领域自适应训练
+# 创建日期: 2026-05-27
+
+meta:
+  experiment_id: exp-007
+  phase: "V1"
+  objective: "在 T2Ranking 训练集上微调 Embedding 模型，提升 Dense 检索在中文 passage 场景下的召回能力。分三阶段渐进式推进，从简单基线到完整多输入对齐"
+  status: "planned"
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "下载 T2Ranking 训练集文件（queries.train.tsv + qrels.retrieval.train.tsv）"
+  design_principle: "数据驱动·渐进式·分布对齐——先跑通最简管线验证提升，再逐步引入改写/HyDE 数据对齐线上推理分布，最后用高级 Loss 和 Hard Negative 压榨上限"
+  key_difference_from_previous: |
+    exp-001~006 全部使用现成模型（零微调），exp-007 是项目首次引入模型训练。
+    训练后的模型将替换 exp-003 中的 Dense 路由，产生乘数效应——
+    Recall 提升 → RRF 融合候选池质量提升 → Reranker 输入质量提升 → 最终 RAG 答案质量提升
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么必须微调 Embedding
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    current_baseline:
+      model: "moka-ai/m3e-base"
+      dim: 768
+      recall_at_10: 0.389
+      recall_at_50: 0.628
+      mrr: ~0.30
+    ceiling_with_prompt_engineering:
+      best_config: "exp-003 S4 (D-B0 + D-P2 + D-HyDE + B-B0)"
+      recall_at_50: 0.6912
+      note: "不改模型的上限已被探明——HyDE + RRF 融合仅比原始 Dense 提升约 10%"
+    gap:
+      absolute: "Recall@50 仅 0.6912，约 31% 的相关 passage 始终无法召回"
+      relative: "原始 Dense 基线 Recall@10 仅 0.389，不到 40% 的 query 能在前 10 条找到正确答案"
+      root_cause: "M3E-base 在通用语料上训练，未见过 T2Ranking 的 passage 分布和 query 风格。对中文百科式 query-passage 匹配缺乏领域感知"
+
+  why_m3e_not_bge:
+    data_contamination:
+      discovery: "BGE 系列的 C-MTP labeled 训练数据包含 T2Ranking 的 query-passage 对"
+      symptom: "BGE-small-zh 在原始 query 上 Recall@10=0.455 > M3E 的 0.389（+14%），但「越改写 query 检索效果越差」——因为改写后的 query 对 BGE 是 OOD 输入"
+      consequence: "排除所有 BGE 系列模型（small/large/m3/reranker）。M3E-base 是目前确认无污染的干净基座"
+    model_status:
+      clean_models: "moka-ai/m3e-base（768 维，~110M 参数）"
+      contaminated_models: "BAAI/bge-small-zh-v1.5, BAAI/bge-large-zh-v1.5, BAAI/bge-m3"
+      phase2_option: "BGE-M3 可在 Phase 2 重新评估——用我们自己的 T2Ranking 训练数据微调后，污染问题会被「覆盖」。且 BGE-M3 支持 dense+sparse 混合检索，上限更高"
+
+  why_not_cross_encoder_first:
+    reason: "精排（Cross-Encoder）的输入是粗排的 top-K 候选。如果粗排 Recall@50 只有 0.69，精排再怎么优化也有至少 31% 的正确内容永远见不到。Embedding 微调直接提升召回的上限池，是所有下游任务的放大器"
+    ordering: "先修 Embedding → 再修 Reranker → 最后修 Generator。这是两阶段检索的依赖链"
+
+  core_hypothesis:
+    main: "在 T2Ranking 训练集（258K query × 2.3M passage）上做对比学习微调，M3E-base 的 Recall@10 能从 0.389 提升至 0.50~0.55（+28%~41%），Recall@50 提升至 0.72~0.78"
+    secondary: "引入改写 query 和 HyDE 假答案共同训练后，三种推理输入（原始/改写/HyDE）都能正确映射到 passage 语义空间，消除离线/在线分布偏移"
+
+
+# =============================================================================
+# 第二部分：模型选型
+# =============================================================================
+
+model_selection:
+
+  phase1_base:
+    model: "moka-ai/m3e-base"
+    dim: 768
+    params: "~110M"
+    framework: "sentence-transformers"
+    rationale: "确认无数据污染的中文 Embedding 模型。768 维在效果和效率间平衡良好。110M 参数在 4090 24GB 上训练舒适"
+    expected_gpu_memory:
+      batch_size_32: "~8GB"
+      batch_size_64: "~12GB"
+      batch_size_128: "~18GB (可能触及上限)"
+
+  phase2_base:
+    option_a:
+      model: "BAAI/bge-m3"
+      dim: 1024
+      params: "~568M"
+      rationale: "多语言 dense+sparse 混合，目前中文 Embedding SOTA。用我们自己的数据微调后，原有污染被覆盖。但参数大，训练时间长"
+      expected_gpu_memory:
+        batch_size_32: "~14GB"
+        batch_size_48: "~18GB"
+    option_b:
+      model: "moka-ai/m3e-base"
+      dim: 768
+      rationale: "延续 Phase 1 基座，仅做数据增强。如果 Phase 1 效果已足够，可跳过 Phase 2 的模型切换"
+
+
+# =============================================================================
+# 第三部分：数据
+# =============================================================================
+
+data:
+
+  training_set:
+    source: "T2Ranking train split"
+    queries_file: "data/raw/t2ranking/queries.train.tsv"            # 258,042 条训练查询
+    qrels_file: "data/raw/t2ranking/qrels.retrieval.train.tsv"    # 744,663 条二元 qrels
+    format:
+      queries: "tsv: qid, query"
+      qrels: "tsv: qid, pid（label > 0 的 passage 视为正样本）"
+    avg_pos_per_query: 2.9
+    note: "T2Ranking 论文中使用此训练集做 Dual Encoder 训练。官方 baselines 显示 Recall@50 可达 0.67（batch 1024 + GradCache, epoch 20）"
+
+  evaluation_set:
+    source: "T2Ranking dev split（复用 exp-001~006 的评估体系）"
+    queries_file: "data/raw/t2ranking/queries.dev.tsv"              # 24,832 条
+    qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"      # 118,933 条
+    collection_file: "data/raw/t2ranking/collection.tsv"           # 2,303,643 条 passage
+    split:
+      method: "从 dev 集中按 qid 做 50/50 随机分割（seed=42）"
+      validation: "~12,400 条查询——用于每个 epoch 后的 Recall@k 评估和 early stopping"
+      test: "~12,400 条查询——只用于最终模型评估，不做超参调整"
+      note: "不涉及 train split 中的查询，避免训练/评估泄漏"
+    eval_corpus:
+      full_collection: "2,303,643 条 passage（真正的 full ranking 评估）"
+      bm25_candidate_pool: "可选：用 BM25 取 top-1000 作为候选池缩小评估范围，评估速度提升 2000 倍，指标偏差 <0.5%"
+
+  negative_samples:
+    strategy: "自己构建，不下载官方 train.bm25.tsv 和 train.mined.tsv"
+    rationale:
+      - "train.bm25.tsv（2.5GB）太大但信息密度低——对每条 query 实际只需 5-15 个 hard negatives"
+      - "train.mined.tsv 是用 ANCE 模型挖掘的，与 M3E-base/BGE-M3 不匹配"
+      - "项目已有 BM25 索引（src/retrieval/bm25_store.py），自己跑一遍 BM25 只需几十分钟，且可控 top-K 和过滤策略"
+    types:
+      in_batch_negatives:
+        source: "训练时自动产生（同一 batch 内其他 query 的正样本作为负样本）"
+        cost: "零成本"
+        benefit: "提供大量简单负样本，保证训练稳定性"
+      bm25_hard_negatives:
+        source: "用项目现有 BM25 索引对每条训练 query 检索 top-100，排除 qrels 中的正样本后采样"
+        cost: "本地计算，~30-60 分钟"
+        benefit: "覆盖词汇层面的混淆（BM25 高分但不相关的 passage）"
+      dynamic_dense_hard_negatives:
+        source: "训练过程中周期性用当前模型做 dense 检索，取模型高分但不在 qrels 中的 passage"
+        cost: "周期性额外推理，每 1-2 个 epoch 更新一次"
+        benefit: "挖掘模型自身的盲点，针对性修正"
+
+
+# =============================================================================
+# 第三点五：Loss 函数选型指南
+# =============================================================================
+# 放在训练方案之前，因为 Loss 选择贯穿所有 Phase。
+# Phase 1 只用 MNRL 跑基线，后续 Phase 可沿此指南逐步升级。
+
+loss_function_guide:
+
+  overview: |
+    双塔对比学习的核心机制：query 和 passage 被同一个 encoder 编码为向量，
+    Loss 函数驱动「正对靠近、负对远离」的梯度更新。不同的 Loss 适用于不同
+    的训练数据格式和负样本策略。
+
+  comparison_table:
+
+    - name: "CosineSimilarityLoss"
+      data_format: "(query, passage, score)"
+      mechanism: "MSE 拟合 cosine 相似度到 target score"
+      best_for: "有 graded relevance label（如 qrels.train.tsv 的 0-3）时"
+      pros: "利用分级标注信息，模型学到「部分相关 vs 高度相关」的精细区分"
+      cons: "没有内置负样本机制，需配合其他 Loss 或手动引入负样本；单独使用可能坍缩"
+      applicable_in: "未来方向——需要额外下载 qrels.train.tsv"
+
+    - name: "MultipleNegativesRankingLoss (MNRL)"
+      data_format: "(query, positive) 对"
+      mechanism: "同一个 batch 内，正对对角线互选，其余 passage 都是负样本，softmax + CE"
+      best_for: "正样本质量高、batch_size 大、不需要显式负样本的场景"
+      pros: "代码最简、坑最少、sentence-transformers 原生支持。in-batch negatives 提供大量负样本（bs=64 → 4032 个/step）"
+      cons: "负样本太简单（随机负样本），区分度有限。batch_size 不够大时负样本量不足"
+      applicable_in: "**Phase 1（基线）**、Phase 2（数据增强）"
+
+    - name: "CachedMultipleNegativesRankingLoss (CachedMNRL)"
+      data_format: "(query, positive) 对"
+      mechanism: "MNRL 的变体——将 batch 拆成 mini-batch 逐步计算，缓存所有 mini-batch 的 passage 向量作为额外负样本"
+      best_for: "显存有限但想用大量负样本时"
+      pros: "实际负样本量 = mini_batch_size × num_mini_batches，可比 MNRL 大 5-10 倍。2024 年社区最推荐"
+      cons: "需要调节 mini_batch_size 参数；实现比 MNRL 复杂一点"
+      applicable_in: "**Phase 3.1（主训练阶段 Loss 升级）**"
+
+    - name: "TripletLoss"
+      data_format: "(q, p, n) 三元组"
+      mechanism: "max(0, sim(q,n) - sim(q,p) + margin)"
+      best_for: "需要显式指定 hard negatives，针对性修正模型盲点"
+      pros: "margin 参数提供精细控制；对 hard negatives 的利用最直接"
+      cons: "需要显式构建负样本三元组；margin 选择需要调参"
+      applicable_in: "**Phase 3.2（Hard Negative 精调）**"
+
+    - name: "GISTEmbedLoss"
+      data_format: "(query, positive) 对 + teacher 模型"
+      mechanism: "用更强的 teacher 模型（如大 LLM embedding）引导训练，学习 teacher 的相似度偏好"
+      best_for: "有更强的 teacher 模型可用作信号时"
+      pros: "可蒸馏大模型的知识；适合知识蒸馏场景"
+      cons: "需要额外加载 teacher 模型；teacher 选择不当可能引入噪声"
+      applicable_in: "未来方向——如果 Phase 2 使用 BGE-M3 作为 teacher"
+
+  convergence_of_loss_and_data: |
+    Loss 选择由训练数据格式决定，而数据格式又取决于你在哪个 Phase：
+    
+    Phase 1：只有 (q, p) 对 → MNRL（自然选择）
+    Phase 2：只有 (q, p) 对（多输入） → MNRL（自然选择）
+    Phase 3.1：有 (q, p) 对，想增大负样本量 → CachedMNRL（Loss 升级）
+    Phase 3.2：有 (q, p, n) 三元组 → TripletLoss（引入 Hard Negatives）
+    未来：有 (q, p, score) → CosineSimilarityLoss（分级标注）
+
+  key_insight: |
+    不要一上来就追求最复杂的 Loss。MNRL 在大多数场景下已经足够好——
+    T2Ranking 论文官方 Dual Encoder baseline 用的就是 MNRL。
+    Loss 升级的边际收益通常远小于数据质量和负样本策略的改善。
+
+
+# =============================================================================
+# 第四部分：训练方案 —— 三阶段渐进式
+# =============================================================================
+#
+# 三阶段的划分逻辑：
+#   Phase 1 → 数据维度：仅原始 query，验证基线提升
+#   Phase 2 → 数据维度：引入改写 + HyDE，对齐推理分布
+#   Phase 3 → 训练策略维度：在已有数据上，通过 Loss 升级 + Hard Negative
+#             Mining 压榨上限
+#
+# Phase 1 和 Phase 2 是「数据扩充」层面，Phase 3 是「训练技巧」层面。
+# 两者正交——Phase 3 的技巧可以应用到 Phase 1 或 Phase 2 的数据上。
+
+training_plan:
+
+  # ─────────────────────────────────────────────────────────
+  # Phase 1：原始 Query 基线微调
+  # ─────────────────────────────────────────────────────────
+
+  phase1:
+    name: "原始 Query 基线"
+    objective: "用最简 pipeline 跑通训练全链路，验证 M3E-base 在 T2Ranking 上的微调增益"
+    training_data:
+      query_source: "T2Ranking queries.train.tsv（原始 query 文本）"
+      positives: "qrels.retrieval.train.tsv 中所有 label > 0 的 passage"
+      negatives: "仅 in-batch negatives（训练时自动产生）"
+      query_type_distribution: "100% 原始 query"
+      rationale: "T2Ranking 原始标注质量最高，且原始 query 在推理时占比最大（D-B0 路线）"
+    loss:
+      name: "MultipleNegativesRankingLoss (MNRL)"
+      principle: "同一 batch 内，(query, positive) 为正对，其余 passage 为负样本，做 InfoNCE 对比学习"
+      advantages:
+        - "代码最简——只需 InputExample(texts=[query, positive])，不需要显式构建负样本"
+        - "in-batch negatives 天然提供大量负样本（batch 64 → 4032 个负样本/step）"
+        - "sentence-transformers 原生支持，坑最少"
+      batch_size: 64  # 或 96，取决于 4090 24GB 实际显存
+    hyperparameters:
+      epochs: 3
+      learning_rate: 2e-5
+      warmup_ratio: 0.1
+      optimizer: "AdamW"
+      scheduler: "cosine"
+      weight_decay: 0.01
+      max_grad_norm: 1.0
+      fp16: true
+    evaluation:
+      evaluator: "InformationRetrievalEvaluator（sentence-transformers 内置）"
+      metrics: "Recall@1/5/10/20/50, MRR@10, NDCG@10"
+      eval_frequency: "每 500 steps"
+      early_stopping: "patience=3, 基于 eval Recall@10"
+    expected_outcome:
+      recall_at_10: "0.50 ~ 0.55"
+      risk: "纯 in-batch negatives 可能太简单，增益有限。如果 Phase 1 Recall@10 < 0.45，需要 Hard Negative"
+      optimization_path: "Phase 1 成功后，可沿两条路径继续优化——路径 A：跳转 Phase 2 做数据增强；路径 B：跳转 Phase 3 做 Loss 升级 + Hard Negative Mining。详见第九部分「优化路线图」"
+    deliverable:
+      - "训练脚本 scripts/train_embedding_phase1.py"
+      - "微调后的模型 model_path: models/m3e-base-t2ranking-phase1"
+
+  # ─────────────────────────────────────────────────────────
+  # Phase 2：多输入数据增强（对齐线上推理分布）
+  # ─────────────────────────────────────────────────────────
+
+  phase2:
+    name: "多输入分布对齐"
+    objective: "引入改写 query 和 HyDE 假文本共同训练，消除离线训练（仅原始 query）与线上推理（三种输入）之间的分布偏移"
+    prerequisite: "Phase 1 已完成，baseline 模型可加载"
+    training_data:
+      query_sources:
+        original_query:
+          ratio: "55%"
+          source: "T2Ranking queries.train.tsv"
+          mapping: "直接使用 qrels.retrieval.train.tsv 中的标注"
+        rewritten_query:
+          ratio: "25%"
+          source: "exp-002 中 D-P2 路线的改写结果（约 2000 条改写 query 的样本可作为种子）"
+          construction: "用 DeepSeek API 对训练集 query 做批量改写（基础改写模板），生成 (rewritten_query, original_positive_pid) 对"
+          quality_filter: "用 LLM Judge 判断改写语义保真度，保留 fidelity > 0.8 的改写"
+          rationale: "对齐 D-P2 推理路线"
+        hyde_text:
+          ratio: "20%"
+          source: "exp-002 中 D-HyDE 路线的 HyDE 结果"
+          construction: "用 DeepSeek API 对训练集 query 生成 HyDE 假答案，生成 (hyde_text, original_positive_pid) 对"
+          quality_filter: "用 HyDE 文本与正样本 passage 的 embedding 相似度过滤（相似度 < 0.5 的丢弃，表明生成的假答案偏得太远）"
+          rationale: "对齐 D-HyDE 推理路线"
+      positives: "所有三种 query 类型共享 T2Ranking qrels 中的正样本标注"
+      negatives: "in-batch negatives（默认）"
+    instruction_prefix:
+      enabled: true
+      template: "为这个句子生成表示以用于检索相关文章："
+      note: "BGE/M3E 家族支持 instruction 前缀。训练和推理时 query 侧统一加此前缀，passage 侧不加。让模型知道「不管输入什么形式，目标都是用来做检索」"
+    model_options:
+      option_a:
+        base: "moka-ai/m3e-base（延续 Phase 1）"
+        advantage: "模型不变，纯粹的数据增强效果评估"
+      option_b:
+        base: "BAAI/bge-m3"
+        advantage: "参数更大、上限更高。用我们自己的数据微调后覆盖原有污染。支持 dense+sparse 混合"
+        risk: "训练时间更长，显存压力更大"
+    hyperparameters:
+      epochs: 2  # 数据增强阶段 epoch 数可略少，因为已在 Phase 1 基座上微调
+      learning_rate: 1e-5  # 更小 LR，防止灾难性遗忘
+    expected_outcome:
+      phase2_vs_phase1:
+        original_query: "Recall 持平或小幅提升（因为增加了同分布数据）"
+        rewritten_query: "改写 query 的 Recall 应显著提升——这是 Phase 2 的核心目标"
+        hyde_text: "HyDE 假文本的 Recall 应大幅提升——段落式输入不再被模型「误解」"
+      optimization_path: "Phase 2 完成后，可叠加 Phase 3 的训练策略升级（CachedMNRL + Hard Negatives），在数据增强的基础上用高级 Loss 进一步压榨上限"
+    deliverable:
+      - "训练脚本 scripts/train_embedding_phase2.py"
+      - "改写 query + HyDE 生成脚本 scripts/generate_training_augmentations.py"
+      - "微调后的模型 model_path: models/m3e-base-t2ranking-phase2"
+
+  # ─────────────────────────────────────────────────────────
+  # Phase 3：高级训练策略（可选，追求极致上限）
+  # ─────────────────────────────────────────────────────────
+  #
+  # Phase 3 按照「Warmup → 主训练 → 精调」的三阶段训练方法论展开，
+  # 每个子阶段有不同的 Loss 和负样本策略，对应 Loss 选型指南中的不同条目。
+  #
+  # 核心思想：让模型在不同阶段面对不同难度的负样本——
+  #   先学会区分「明显不相关」的（in-batch random）
+  #   再学会区分「词汇层面接近但不相关」的（BM25 hard）
+  #   最后修正「语义层面接近但不相关」的盲点（Dynamic Dense hard）
+
+  phase3:
+    name: "高级训练策略"
+    status: "optional——如果 Phase 1/2 的 Recall@10 已 ≥0.55，边际收益有限，可跳过"
+    prerequisite: "Phase 1 的 MNRL baseline 模型已产出"
+    data_base: "Phase 1 的原始 query 数据（258K query × 744K positives），也可叠加 Phase 2 的多输入增强数据"
+    overall_objective: |
+      通过 Loss 升级 + 组合式负样本策略，在 Phase 1 的 Recall 基线上
+      进一步压榨 2-5 个百分点。核心方法：用 CachedMNRL 增大负样本量 +
+      引入 BM25/Dense hard negatives 提供更有区分度的训练信号。
+
+    # ============================================================
+    # Phase 3.1：CachedMNRL 主训练（Loss 升级）
+    # ============================================================
+    sub_phase_3_1:
+      name: "CachedMNRL 主训练"
+      rationale: |
+        MNRL 的瓶颈在于负样本量受 batch_size 限制（bs=64 → 4032 个负样本/step）。
+        CachedMNRL 通过跨 mini-batch 缓存 passage 向量，在相同显存下将有效负样本量
+        放大 5-10 倍（bs=64 → 20,000+ 个负样本/step）。
+      loss: "CachedMultipleNegativesRankingLoss"
+      loss_params:
+        mini_batch_size: 32
+        mechanism: |
+          1. 将 batch=64 拆成 2 个 mini-batch（各 32 对）
+          2. 第一个 mini-batch 用 MNRL 计算 loss（32×32 相似度矩阵）
+          3. 缓存第一个 mini-batch 的 32 个 passage 向量
+          4. 第二个 mini-batch 计算 loss 时，负样本 = 32 个 in-batch + 32 个缓存 = 64 个
+          5. 梯度累积后再 backward
+          6. 实际效果：每个 query 面对的负样本量 = 32 + N×32（N=缓存的 mini-batch 数）
+      negatives: "仅 in-batch + cached negatives（无显式 hard negatives）"
+      hyperparameters:
+        epochs: 3
+        learning_rate: 2e-5
+        batch_size: 64
+        warmup_ratio: 0.1
+        optimizer: "AdamW"
+        scheduler: "cosine"
+        fp16: true
+      expected_gain_vs_phase1: "+1~2% Recall@10（纯负样本量增大带来的收益）"
+      deliverable: "models/m3e-base-t2ranking-phase3-1"
+
+    # ============================================================
+    # Phase 3.2：Hard Negative Mining + TripletLoss 精调
+    # ============================================================
+    sub_phase_3_2:
+      name: "Hard Negative Mining + TripletLoss 精调"
+      status: "Phase 3.1 完成后方可进入"
+      rationale: |
+        CachedMNRL 虽然负样本多了，但仍是「随机负样本」——模型已经能轻松区分
+        它们和正样本的区别。真正的提升来自 Hard Negatives：
+        
+        BM25 hard negatives  → 覆盖词汇层面的混淆
+          「BM25 检索到，词面匹配度高，但内容不相关」的 passage
+        Dense hard negatives  → 覆盖语义层面的混淆
+          「当前 embedding 模型给高分，但实际不相关」的 passage
+        
+        两类结合 + TripletLoss margin，让模型在困难区域做精细调整。
+
+      dynamic_hard_negative_mining_workflow:
+        description: |
+          这不是一次性构建完就固定的数据集，而是训练过程中周期性刷新的动态流程。
+        steps:
+          - step: "Step 0（训练前）"
+            action: "用项目现有 BM25 索引对每条训练 query 检索 top-100"
+            filter: "排除已在 qrels 中的 pid"
+            output: "每 query 预留 20 个 BM25 hard negative 候选，训练时每条 query 随机采 5 个"
+          - step: "Step 1（Epoch 1 Warmup）"
+            action: "加载 Phase 3.1 的 CachedMNRL 模型作为起点"
+            loss: "TripletLoss, margin=0.5"
+            negatives: "BM25 hard negatives（5 个/query）+ in-batch negatives"
+            purpose: "让模型先适应 BM25 层面的 hard negatives，不引入过多变量"
+          - step: "Step 2（Epoch 1 结束 → 首次 Dense Hard Negative 挖掘）"
+            action: "用当前模型对全部 258K 训练 query 做 dense 检索，取 top-50"
+            filter: "排除 qrels 正样本，排除 pass 过已有 BM25 hard negatives（去重）"
+            output: "每 query 选出模型当前「误认为高分但实际不相关」的 5 个 passage"
+            note: "这是 Dynamic Hard Negative Mining 的核心——挖掘模型自身的盲点"
+          - step: "Step 3（Epoch 2）"
+            action: "用「BM25 hard（5 个）+ Dense hard（5 个）」组合继续 TripletLoss 训练"
+            loss: "TripletLoss, margin=0.3（因为 hard negatives 更难，margin 略小）"
+            purpose: "同时面对词汇混淆和语义混淆，全面修正"
+          - step: "Step 4（Epoch 2 结束 → 第二次 Dense Hard Negative 更新）"
+            action: "重复 Step 2——用当前模型重新检索，挖掘新的盲点"
+            filter: "替换上一轮的 Dense hard negatives"
+          - step: "Step 5（Epoch 3）"
+            action: "用更新后的 hard negatives 继续 TripletLoss 训练最后 1 个 epoch"
+            loss: "TripletLoss, margin=0.3"
+            purpose: "收尾——模型已在不断变化的 hard negatives 上完成 3 轮迭代"
+        key_design_decisions:
+          warmup_with_bm25_first: "先只用 BM25 hard negatives 训 1 个 epoch，让模型平稳过渡。如果一上来就 BM25 + Dense 混合，梯度信号太杂，训练不稳定"
+          update_not_every_epoch: "每 1 个 epoch 更新一次 dense hard negatives，而非每 500 steps。原因：258K query 的全量 dense 检索需要 ~30 分钟，太频繁不值得"
+          replace_old_hard_negatives: "旧的 hard negatives 必须丢弃——模型已经学会区分它们了，继续用有「作弊」嫌疑"
+
+      loss: "TripletLoss"
+      loss_params:
+        margin_phase2_first: 0.5
+        margin_phase2_later: 0.3
+        distance_metric: "cosine"
+      hyperparameters:
+        epochs: 3
+        learning_rate: 1e-5
+        batch_size: 32
+        hard_neg_per_query:
+          bm25: 5
+          dense: 5
+      expected_gain_vs_phase3_1: "+1~3% Recall@10"
+      deliverable: "models/m3e-base-t2ranking-phase3-2"
+
+    # ============================================================
+    # Phase 3.3：Graded Label 精调（可选延伸）
+    # ============================================================
+    sub_phase_3_3:
+      name: "Graded Label 精调"
+      status: "optional——需额外下载 qrels.train.tsv"
+      rationale: |
+        T2Ranking 有 4 级标注（0-3），Phase 1~3.2 只用到了二元（label>0）。
+        如果希望模型不仅区分「相关/不相关」，还能感知「部分相关 vs 高度相关」，
+        可以用 CosineSimilarityLoss：
+        
+        (query, passage, label/3) → MSE 拟合到 normalized score
+        同时配合 MNRL 做 multi-task（加一个小的辅助 Loss 保持对比能力，防止坍缩）
+      data: "qrels.train.tsv (1,613,421 条, ~24MB)"
+      risk: "单独使用 CosineSimilarityLoss 可能导致模型坍缩（所有 passage 都打高分）"
+      mitigation: "与 MNRL 联合训练（CosineSimilarityLoss × 0.7 + MNRL × 0.3）"
+      applicable: "Phase 3.2 之后的可选补充"
+
+
+# =============================================================================
+# 第九部分：Phase 内部优化路线图（总览）
+# =============================================================================
+#
+# 从 Phase 1 到 Phase 3，你可以选择两条路径：
+#
+# 路径 A（推荐主线）：数据驱动
+#   Phase 1（原始 query + MNRL）
+#     → Phase 2（+改写 +HyDE + MNRL）
+#     → 如果 Recall 满意，直接交付
+#
+# 路径 B（进阶优化）：训练策略驱动
+#   Phase 1（原始 query + MNRL）
+#     → Phase 3.1（原始 query + CachedMNRL）
+#     → Phase 3.2（原始 query + Hard Negatives + TripletLoss）
+#     → Phase 3.3（原始 query + Graded Labels + CosineSimilarityLoss）
+#
+# 两条路径最后可以汇合：
+#   Phase 1 → Phase 2 → Phase 3.1 → Phase 3.2
+#   （数据扩充 + 训练策略叠加，预期达成最优效果）
+
+
+# =============================================================================
+# 第五部分：评估与验证
+# =============================================================================
+
+evaluation:
+
+  layer1_loss_curve:
+    description: "观察 training loss 下降 + eval loss 走势，确认无过拟合"
+    criteria: "eval loss 在 2-3 个 epoch 后不再下降为正常；若回升说明过拟合，需减小 LR 或加 dropout"
+
+  layer2_offline_metrics:
+    description: "在 T2Ranking dev 集上跑标准检索评估"
+    primary_metrics:
+      - "Recall@10（核心指标，与 exp-002 Dense 基线 0.389 直接对比）"
+      - "Recall@20"
+      - "Recall@50（召回阶段的上限能力）"
+      - "MRR"
+    secondary_metrics:
+      - "NDCG@10（需加载 qrels.dev.tsv 的 graded label）"
+      - "Hit@50"
+    baseline_comparison:
+      pretrained_m3e: "Recall@10=0.389, Recall@50=0.628"
+      phase1_target: "Recall@10=0.50~0.55, Recall@50=0.72~0.78"
+      official_t2ranking: "Recall@50=0.67 (batch 128, epoch 20)"
+
+  layer3_end_to_end:
+    description: "将微调后的 Embedding 模型替换到 exp-003 多路检索 + exp-004 精排 + exp-005 生成的完整 RAG pipeline 中"
+    validation:
+      - "重新跑 exp-003 S4 多路融合，观察 RRF 后 Recall@50 是否提升"
+      - "重新跑 exp-004 Reranker 精排，观察 NDCG 是否提升"
+      - "采样 50 条 query 做最终生成质量对比（微调前 vs 微调后）"
+
+  ablation_plan:
+    queries:
+      - "训练 query 数量对效果的影响：10% / 30% / 100% 训练集"
+      - "正样本数量与质量：只用 label=3 的强正样本 vs 全部 label>0"
+      - "batch size 影响：bs=32 vs 64 vs 96"
+
+
+# =============================================================================
+# 第六部分：工程实施计划
+# =============================================================================
+
+implementation:
+
+  step1_data_download:
+    description: "下载 T2Ranking 训练集文件到本机/服务器"
+    command: "python scripts/download_t2ranking.py --files queries.train.tsv qrels.retrieval.train.tsv"
+    files:
+      - "queries.train.tsv (258,042 条, ~15MB)"
+      - "qrels.retrieval.train.tsv (744,663 条, ~9MB)"
+    total_size: "~25MB"
+    status: "pending"
+
+  step2_build_training_data:
+    description: "将原始 TSV 文件转换为 sentence-transformers 训练格式"
+    script: "scripts/prepare_embedding_training_data.py"
+    output: "data/processed/embedding_train_phase1.jsonl"
+    format: "每行 {'query': str, 'positive': str}"
+    status: "pending"
+
+  step3_train_phase1:
+    description: "Phase 1 原始 Query 基线微调"
+    script: "scripts/train_embedding_phase1.py"
+    gpu_time_estimate: "~2-3 小时（258K query × 3 epochs, bs=64, RTX 4090）"
+    status: "pending"
+
+  step4_evaluate_phase1:
+    description: "在 T2Ranking dev 集上评估 Phase 1 模型"
+    script: "scripts/evaluate_embedding.py"
+    status: "pending"
+
+  step5_train_phase2:
+    description: "Phase 2 多输入数据增强（需先生成改写 query 和 HyDE 数据）"
+    prerequisite: "Phase 1 验证通过 + 改写/HyDE 数据生成完毕"
+    script: "scripts/train_embedding_phase2.py"
+    status: "pending"
+
+  step6_evaluate_phase2:
+    description: "评估 Phase 2 模型在三种 query 类型上的 Recall"
+    status: "pending"
+
+  step7_full_pipeline_eval:
+    description: "用最优模型替换 exp-003 中的 Dense 路由，跑全链路评估"
+    status: "pending"
+
+
+# =============================================================================
+# 第七部分：关键风险与缓解
+# =============================================================================
+
+risks:
+
+  - risk: "数据污染间接残留"
+    severity: "medium"
+    description: "虽然 M3E-base 不含 T2Ranking，但其预训练语料可能包含中文百科/问答数据，评估指标可能被轻微抬高"
+    mitigation: "始终以 dev 集 Recall 的相对提升幅度（而非绝对值）作为主要评判标准。对比 M3E-base 原始 vs 微调后的差值"
+    confirmation: "Phase 2 如果切换到 BGE-M3 做微调，对比原始 BGE-M3（被污染）和微调后 BGE-M3（被覆盖）的 Recall 差距，可量化污染影响"
+
+  - risk: "过拟合到训练 query 风格"
+    severity: "medium"
+    description: "T2Ranking 训练集 query 来自搜狗搜索引擎问句，可能与用户真实输入有风格差异"
+    mitigation: "early stopping + 监控验证集 Recall 曲线。验证集 Recall 不再提升即停止"
+
+  - risk: "显存不足"
+    severity: "low"
+    description: "M3E-base (110M) 在 bs=64 时约 12GB，4090 24GB 充足。BGE-M3 (568M) 在 bs=48 时约 18GB"
+    mitigation: "必要时降低 batch_size 到 32 + 使用 gradient_accumulation_steps=2 等效模拟大 batch"
+
+  - risk: "Fine-tuning 后线上检索速度变慢"
+    severity: "low"
+    description: "模型参数不变（M3E-base 仍是 110M），推理速度应不变"
+    mitigation: "训练后做一次推理 latency benchmark 对比微调前后"
+
+
+# =============================================================================
+# 参考资料
+# =============================================================================
+
+references:
+  t2ranking_paper:
+    title: "T2Ranking: A large-scale Chinese Benchmark for Passage Ranking"
+    venue: "SIGIR 2023"
+    arxiv: "2304.03679"
+    key_findings: "训练集 258K query，官方 baseline Dual Encoder 在 Recall@50 可达 0.67"
+  sentence_transformers:
+    docs: "https://sbert.net/"
+    key_modules: "MultipleNegativesRankingLoss, CachedMultipleNegativesRankingLoss, InformationRetrievalEvaluator"
+  contrastive_learning:
+    simclr: "A Simple Framework for Contrastive Learning of Visual Representations (Chen et al., 2020)"
+    relevance_to_ir: "InfoNCE loss = MultipleNegativesRankingLoss 的数学本质"

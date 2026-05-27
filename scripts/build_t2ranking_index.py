@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ── constants ────────────────────────────────────────────
 from src.utils.config import (
     PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR as _BASE_VECTOR_DB_DIR,
-    MODEL_CACHE_DIR, EMBEDDING_MODEL, EMBEDDING_MODEL_CHOICES,
+    MODEL_CACHE_DIR, EMBEDDING_MODEL,
     resolve_model_local_path, model_short_name,
 )
 
@@ -134,12 +134,16 @@ def get_embedding_model(
     from langchain_huggingface import HuggingFaceEmbeddings
     import torch
 
-    local_path = resolve_model_local_path(model_name)
-    if local_path is not None:
-        model_name = str(local_path.resolve())
+    if os.path.isdir(model_name):
+        model_name = os.path.abspath(model_name)
         logger.info(f"Using local embedding model: {model_name}")
     else:
-        logger.info(f"Loading embedding model: {model_name}")
+        local_path = resolve_model_local_path(model_name)
+        if local_path is not None:
+            model_name = str(local_path.resolve())
+            logger.info(f"Using local embedding model: {model_name}")
+        else:
+            logger.info(f"Loading embedding model: {model_name}")
 
     model_kwargs = {"device": device}
 
@@ -221,8 +225,9 @@ def save_index_info(total_stored: int, embedding_dim: int, model_name: str,
 def main():
     parser = argparse.ArgumentParser(description="Build T2Ranking evaluation vector index incrementally")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Passages per batch (default: 1000)")
-    parser.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL, choices=EMBEDDING_MODEL_CHOICES,
-                        help="Embedding model name")
+    parser.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL,
+                        help="Embedding model name (HF ID or local path). For fine-tuned models, "
+                             "pass the local directory, e.g. models/m3e-base-t2ranking-phase1")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="Device for embedding")
     parser.add_argument("--rebuild", action="store_true", help="Delete existing index and start fresh")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint (default: auto-detect)")

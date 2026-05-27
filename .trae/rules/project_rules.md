@@ -30,9 +30,11 @@ python app.py
 - `models/` - 本地模型缓存
 - `data/` - 数据文件
 - `config.yaml` - 项目配置（模型注册、索引、检索参数等）
+- `progress.yaml` - 实验进度记录
 
 ## 代码规范
 - 函数使用 snake_case 命名
 - 所有公开函数必须有类型注解
 - 日志使用 loguru
 - 配置通过 `config.yaml` 和 `src/utils/config.py` 读取
+- 开发机与服务器的数据盘路径不同，代码需要配置数据路径

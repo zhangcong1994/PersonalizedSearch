@@ -181,3 +181,89 @@ index_registry:
     total_docs: 150000
     dataset: t2ranking
     build_status: partial
+
+# =============================================================================
+# 实验进度总览（2026-05-27 更新）
+# =============================================================================
+experiment_summary:
+  - id: exp-001
+    name: 检索基线（BM25 vs Dense）
+    status: done
+    date_range: 2026-05-17 ~ 2026-05-18
+    summary: "建立 BM25 与 Dense（m3e-base/bge 系列）双后端检索基线，消融嵌入模型、分片策略对 Recall/MRR 的影响，确定最优 Dense 单路基线全量 R@10=0.4548 (bge-small) / R@10=0.3893 (m3e-base)。"
+    best_result: "bge-small-zh-v1.5, R@10=0.4548, MRR=0.5097（全量 230 万 passage）"
+    files:
+      plan: experiments/exp-001-retrieval-baseline.yaml
+
+  - id: exp-002
+    name: 查询重写增强检索
+    status: done
+    date_range: 2026-05-18 ~ 2026-05-20
+    summary: "通过 Prompt 工程（领域 few-shot、对比示例、类型感知）、Multi-Query RRF 融合、HyDE 预回答扩展、PRF 伪相关反馈四组实验提升召回率。最优方案 HyDE+原查询 RRF 融合在 Dense 后端 R@50=0.6819（+8.6% vs 基线），BM25 后端同样受益最大（+11.1%）。"
+    best_result: "Dense E2c-H2 (HyDE+原查询 RRF), R@50=0.6819"
+    key_findings:
+      - "领域 few-shot（P2）在单查询改写中全面最优，比通用示例高 4%"
+      - "HyDE + RRF 是全部 16 组实验中最大赢家，在两个后端上均取得最高 R@50"
+      - "对比示例（P3）、类型感知（P4）、关键词串（P5）均退化"
+      - "Multi-Query 子查询质量随数量递增急剧下降（第 3-4 条子查询几乎无效）"
+      - "PRF 伪相关反馈在两个后端上均显著退步（-10%~-11%），不推荐"
+    files:
+      plan: experiments/exp-002-query-rewriting.yaml
+      analysis: experiments/exp-002-results-analysis.md
+
+  - id: exp-003
+    name: 多路召回 RRF 融合
+    status: done
+    date_range: 2026-05-20 ~ 2026-05-21
+    summary: "在 exp-002 各路检索结果基础上做跨后端（Dense+BM25）RRF 融合消融，最优 4 路方案 S4（D-B0 + D-P2 + D-HyDE + B-B0）在测试集 R@50=0.6912（+13.5% vs 基线），验证异质检索器互补增益。RRF k 参数（30/60/90）对所有指标区分度极低。"
+    best_result: "S4 (4 路), per-route K=50, RRF k=60, 测试集 R@50=0.6912, MRR=0.4965, Hit@50=0.8991"
+    key_findings:
+      - "Per-route K=50 全面碾压 K=20/30"
+      - "4 路 > 3 路 > 2 路，但 5 路退步（BM25-P2 引入噪声）"
+      - "RRF k=30/60/90 的 R@50 几乎无差异，固定 k=60"
+      - "BM25 原查询贡献 +0.42%（边际但非零），跨后端互补增益得到证实"
+      - "成本：2 次 LLM API 调用（改写 + HyDE），约 ¥0.00086/查询"
+    files:
+      plan: experiments/exp-003-multi-route-fusion.yaml
+      analysis: experiments/exp-003-results-analysis.md
+
+  - id: exp-004
+    name: Cross-Encoder 精排模型对比
+    status: done
+    date_range: 2026-05-20 ~ 2026-05-22
+    summary: "在 exp-003 S4 粗排 top-50 候选池上对比 5 个开源 Reranker，bge-reranker-v2-m3 测试集 NDCG@10=0.4717（+26.8% vs 粗排），MRR=0.5857（+18.0%）。gte-mul 为无数据泄露风险的干净备选（NDCG@10=0.4442）。qwen3-rerank 和 mxbai-v2 对中文精排完全不可用。"
+    best_result: "bge-reranker-v2-m3, NDCG@10=0.4717, MRR=0.5857, Recall@10=0.5339"
+    key_findings:
+      - "BGE 家族碾压：bge-v2-m3 > bge-base > gte-mul > qwen3-rerank > mxbai-v2"
+      - "NDCG@5 提升 32.0%（精排最大价值在于把最好的排到最前面）"
+      - "K=20 是最优输出深度（边际收益在 20 之后基本消失）"
+      - "qwen3-rerank 和 mxbai-v2 对中文 NDCG@10 < 0.11，远低于粗排基线"
+      - "BGE 存在数据泄露风险（C-MTP 训练集含 T2Ranking），gte-mul 为论文安全选择"
+    files:
+      plan: experiments/exp-004-reranking.yaml
+      analysis: experiments/exp-004-results-analysis.md
+
+  - id: exp-005
+    name: 生成阶段评估（AI 搜索生成质量对比）
+    status: in_progress
+    date_range: 2026-05-21 ~ 至今
+    summary: "设计 AI 搜索六层评估框架（准确性/整合质量/引文质量/相关性/用户体验/安全合规）并扩展为 11 维生成阶段评估标准，多开源生成模型质量对比。已跑 3 个小模型（Qwen2.5-1.5B / Qwen3-4B thinking / Qwen3-4B non-thinking）各 50 条。"
+    interim_best: "Qwen3-4B non-thinking, Avg=59.0/100, Pass%=52%"
+    key_findings:
+      - "Qwen2.5-1.5B 不可用（Avg=22.5, Pass%=6%, 86% 答案零引用）"
+      - "Qwen3-4B thinking 模式在 AI 搜索场景有害（Avg=57.4 vs non-thinking 59.0）——与官方 RULER 长上下文检索结论一致"
+      - "「整合」和「引文」是所有模型的共同短板（最高 3 分，无一条得 4 分）"
+      - "⚠️ 全部结论为阶段性发现，受限于：无人机校准、无双 Judge 交叉验证、模型覆盖不全、样本量不足 50/200"
+    pending:
+      - "跑完全部 9 个模型 × 200 条"
+      - "人机校准（50 条双人标注 → Krippendorff's α）"
+      - "双 Judge 交叉验证（GPT-4o-mini × 20 条）"
+      - "理想排序测试（排除检索噪声，测量生成理论上限）"
+      - "统计显著性检验（配对 t 检验 + bootstrap CI）"
+    files:
+      plan: experiments/exp-005-generation.yaml
+      rubric_system: experiments/exp-005-ai-search-eval-rubric.md
+      rubric_generation: experiments/exp-005-generation-stage-eval-rubric.md
+      rubric_deprecated: experiments/exp-005-generation-eval-rubric-v1-deprecated.md
+      interim_results: experiments/exp-005-interim-results.md
+      improvement_suggestions: experiments/exp-005-improvement-suggestions.md

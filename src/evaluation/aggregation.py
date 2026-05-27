@@ -316,3 +316,106 @@ def aggregate_batch(
         "per_dim_avg": per_dim_avg,
         "per_dim_distribution": per_dim_dist,
     }
+
+
+# ===========================================================================
+# 生成阶段 6 维核心聚合（exp-005 两批 Judge 专用）
+# ===========================================================================
+
+CORE6_WEIGHTS: dict[str, float] = {
+    "veracity": 0.25,
+    "synthesis_quality": 0.25,
+    "citation_quality": 0.15,
+    "relevance": 0.15,
+    "user_experience": 0.10,
+}
+
+CORE6_GATE_DIMS: dict[str, dict] = {
+    "safety": {"threshold": 2, "label": "G-L6 安全合规"},
+    "veracity": {"threshold": 2, "label": "G-L1 信息准确性"},
+}
+
+CORE6_DIM_LABELS: dict[str, str] = {
+    "veracity": "G-L1 准确性",
+    "safety": "G-L6 安全性",
+    "relevance": "G-L4 相关性",
+    "synthesis_quality": "G-L2 整合质量",
+    "citation_quality": "G-L3 引文质量",
+    "user_experience": "G-L5 用户体验",
+}
+
+
+def aggregate_core6_scores(scores: dict[str, Any]) -> dict:
+    """
+    生成阶段 6 维核心评分聚合（两批 Judge 专用）。
+
+    Args:
+        scores: {dim_name: int} 或 {dim_name: {"score": int, "reason": str}}
+                必须包含 6 个维度:
+                veracity, safety, relevance (Batch1),
+                synthesis_quality, citation_quality, user_experience (Batch2)
+
+    Returns:
+        {
+            "pass": bool,
+            "total_score": float,        # 0-100 分
+            "grade": str,                 # S/A/B/C/D/F
+            "gate_failures": list[str],
+            "penalty_applied": bool,
+            "weighted_raw": float,
+        }
+    """
+    extracted: dict[str, int] = {}
+    for dim, val in scores.items():
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            extracted[dim] = int(val.get("score", 0))
+        else:
+            extracted[dim] = int(val)
+
+    gate_failures = _check_gates(extracted, CORE6_GATE_DIMS)
+    if gate_failures:
+        return {
+            "pass": False,
+            "total_score": 0.0,
+            "grade": "F",
+            "gate_failures": gate_failures,
+            "penalty_applied": False,
+            "weighted_raw": 0.0,
+            "reason": f"门槛维度不达标: {', '.join(gate_failures)}",
+        }
+
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for dim, weight in CORE6_WEIGHTS.items():
+        if dim in extracted:
+            weighted_sum += extracted[dim] * weight
+            total_weight += weight
+
+    if total_weight == 0:
+        return {
+            "pass": False,
+            "total_score": 0.0,
+            "grade": "F",
+            "gate_failures": [],
+            "penalty_applied": False,
+            "weighted_raw": 0.0,
+            "reason": "无有效评分",
+        }
+
+    weighted_sum = weighted_sum / total_weight
+
+    total_score = _score_to_100(weighted_sum)
+    penalty_applied = _compute_penalty(extracted, CORE6_WEIGHTS, CORE6_GATE_DIMS)
+    if penalty_applied:
+        total_score = max(0.0, total_score - PENALTY_AMOUNT)
+
+    return {
+        "pass": total_score >= 60,
+        "total_score": round(total_score, 1),
+        "grade": _grade(total_score),
+        "gate_failures": [],
+        "penalty_applied": penalty_applied,
+        "weighted_raw": round(weighted_sum, 3),
+    }

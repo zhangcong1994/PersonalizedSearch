@@ -1,0 +1,298 @@
+# 实验计划：V0 Thinking 模式多轮检索
+# exp-006: Gap 分析驱动两轮检索 + 平权 RRF 融合
+# 创建日期: 2026-05-27
+
+meta:
+  experiment_id: exp-006
+  phase: V0
+  objective: "在 exp-003 最优粗排基础上，利用 DeepSeek thinking mode 分析第一轮检索缺口、生成聚焦第二轮查询，通过平权 RRF 融合提升 Recall@50 和 Hit@50"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-003 S4 最优方案结果已保存（top-50 RRF 融合 + 各路由独立检索结果）"
+  design_principle: "最小假设——固定两轮、平权 RRF、gap 分析，变量隔离优先。零微调，仅调 DeepSeek API"
+  cost_ceiling: "Phase 0 ¥0.1 + Phase 1 ¥0.5 + Phase 2 ¥5 ≈ ¥6"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么要做多轮检索
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    exp003_best:
+      config: "S4 (D-B0 + D-P2 + D-HyDE + B-B0), per-route K=50, RRF k=60"
+      recall_at_50: 0.6912
+      hit_at_50: 0.8991
+    gap:
+      recall_gap: "约 31% 的相关 passage 不在 top-50 中"
+      hit_gap: "约 10% 的查询在 top-50 中一条相关都没有（Hit@50=0）"
+      ceiling: "91.5% 的查询 ≤10 个相关 passage，理论上限接近 1.0"
+
+  why_multi_round:
+    reason: "exp-002/003 的所有方案都是「单次检索」——一次查询改写 + 一次 HyDE + 一次 RRF 融合。LLM 在检索前没有看到任何检索结果。多轮检索让 LLM 先看到第一轮结果，再做针对性补充。这和人类搜索行为一致：搜一次 → 看结果 → 调整关键词再搜"
+    key_insight: "exp-003 中 10% 的 Hit@50=0 查询是低垂果实——第一轮完全没命中相关 passage 的查询，任何 >0 的改善都是纯净信号"
+
+  why_thinking_mode:
+    reason: "Gap 分析需要 LLM 阅读 top-10 passage 摘要、对比原查询、推理缺失维度。这是典型的「需要内部链式推理」的任务，thinking mode 有优势"
+    exp005_precedent: "exp-005 已集成 thinking/non-thinking 切换（generate_exp005.py L73），代码基础现成"
+    note: "exp-005 发现 thinking 在「生成答案」场景有害（忠实度下降），但在「分析检索缺口」场景是强项——这两个任务的需求正交"
+
+  why_not_adaptive_rounds:
+    reason: "自适应停止条件引入额外假设（覆盖率阈值、重叠率阈值），与多轮检索本身混淆。固定 2 轮是最干净的消融基线"
+    future: "如果 2 轮有正收益，后续可消融停止条件"
+
+  relation_to_hyde:
+    note: "HyDE（exp-002 E2c）也是 LLM 生成一段文本做检索，但它生成的是「假答案」而非「缺口查询」。HyDE 和 gap-filling query 可能检索到重叠的 passage。如果多轮增益小，需分析是否为 HyDE 已覆盖"
+
+
+# =============================================================================
+# 第二部分：评估数据与指标
+# =============================================================================
+
+evaluation:
+  source: "T2Ranking dev（复用 exp-001/002/003）"
+  queries_file: "data/raw/t2ranking/queries.dev.tsv"
+  qrels_file: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+
+  sampling:
+    phase0_case_study: 20    # 从 Hit@50=0 的查询中抽取
+    phase1_smoke: 200        # 复用 exp-003 split（seed=42）
+    phase2_full: 2000        # 复用 exp-003 split（seed=42）
+
+  metrics:
+    primary:
+      - Recall@50
+      - Hit@50
+    secondary:
+      - Recall@10
+      - Recall@20
+      - MRR
+    note: "Recall@50 和 Hit@50 是多轮检索最敏感的指标——多轮的目标是「把本来没召回的相关 passage 捞进来」，对 top-10 排序质量的影响是次要的。Reranker（exp-004）会在下游处理排序"
+
+  cost:
+    deepseek_thinking:
+      input: "¥1 / 1M tokens"
+      output: "¥4 / 1M tokens（thinking 模式输出长，含思考链）"
+    per_query_estimate:
+      gap_analysis: "~1500 input（prompt + top-10 passages） + ~800 output（thinking trace + 1-3 queries） ≈ ¥0.005"
+    total:
+      phase1: "200 × ¥0.005 ≈ ¥1"
+      phase2: "2000 × ¥0.005 ≈ ¥10"
+
+
+# =============================================================================
+# 第三部分：实验设计
+# =============================================================================
+
+design:
+
+  # ── 核心数据流 ──
+  data_flow: |
+    ┌─────────────────────────────────────────────┐
+    │  Round 1（复用 exp-003 S4 结果，零新增成本）    │
+    │  D-B0 + D-P2 + D-HyDE + B-B0 → RRF → top-50 │
+    └──────────────────┬──────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────┐
+    │  Gap 分析（DeepSeek thinking mode）           │
+    │  输入: 原查询 + top-10 passage 摘要            │
+    │  输出: thinking trace + 1-3 条补充查询          │
+    └──────────────────┬──────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────┐
+    │  Round 2 检索（Dense only, m3e-base）         │
+    │  每条补充查询 → Dense 检索 → 各自 top-50       │
+    └──────────────────┬──────────────────────────┘
+                       │
+                       ▼
+    ┌─────────────────────────────────────────────┐
+    │  平权 RRF 融合                                │
+    │  Round 1 的 4 路 + Round 2 的 1-3 路          │
+    │  → RRF (k=60) → top-50                       │
+    └──────────────────┬──────────────────────────┘
+                       │
+                       ▼
+                 计算 Recall@50 / Hit@50
+                 （对比 Round 1 only vs Round 1+2）
+
+  # ── Gap 分析 Prompt 设计 ──
+  gap_analysis_prompt:
+    system: |
+      你是信息检索缺口分析师。用户提出查询，搜索引擎返回了 top-10 段落。
+      请以思考模式逐步推理，识别检索覆盖的缺口，并生成精确的补充搜索查询。
+
+    human_template: |
+      ## 用户查询
+      {query}
+
+      ## 第一轮检索 Top-10 段落摘要
+      {passage_summaries}
+
+      ## 任务
+      请用思考模式逐步分析：
+      1. 逐条检查：每个段落覆盖了查询的哪些方面？
+      2. 缺口识别：查询的哪些关键信息需求完全没有被覆盖？
+      3. 证据质量：已覆盖的方面是否证据充分（多个来源支撑），还是仅有一条孤证？
+      4. 生成补充查询：1-3 条具体的搜索查询，每条应针对一个明确的缺口
+
+      输出格式（JSON）：
+      ```json
+      {{
+        "coverage_summary": "一句话总结覆盖情况",
+        "gaps": ["缺口1", "缺口2"],
+        "follow_up_queries": ["补充查询1", "补充查询2", "补充查询3"]
+      }}
+      ```
+
+    design_rationale: |
+      - thinking mode 用于步骤 1-3（内部推理），JSON 用于步骤 4（结构化输出）
+      - 限制 1-3 条补充查询：exp-002 发现子查询 ≥4 条后质量急剧下降（sub_3/sub_4 R@50 < 0.06）
+      - top-10 而非 top-50：10 条足够覆盖主要信息面，50 条会让 prompt 过长（~25000 tokens）且 LLM 注意力稀释
+      - passage 摘要而非原文：原文中位数 368 字 × 10 ≈ 3680 字，摘要压缩到每段 80-100 字可节省 60% token
+
+  # ── 合并策略 ──
+  fusion:
+    strategy: "平权累积 RRF"
+    formula: "RRF_score(pid) = Σ_{route ∈ Round1_4routes ∪ Round2_1~3routes} 1 / (60 + rank_in_route(pid))"
+    rationale: |
+      - 平权是最少假设的合并方式——如果降权后效果更好，说明 round 2 质量不如 round 1
+      - 但先用平权测上限：平权都不行，降权更不行
+      - RRF k=60 沿用 exp-003 最优值
+    alternatives: "见下方「可选消融实验」"
+
+
+# =============================================================================
+# 第四部分：实验阶段
+# =============================================================================
+
+phases:
+
+  # ========== Phase 0：零命中查询案例分析 ==========
+  - id: phase0
+    name: "零命中查询案例研究"
+    objective: "快速判断多轮检索思路是否合理，避免白写代码"
+    sample: 20 条（从 exp-003 Hit@50=0 的查询中随机抽取）
+    procedure: |
+      1. 从 exp-003 S4 测试集结果中，筛选 Hit@50=0 的查询（约 90 条 / 912 条测试集）
+      2. 随机抽 20 条
+      3. 对每条查询：
+         a. 展示原查询 + top-10 passage 标题/首句
+         b. 手动用 DeepSeek thinking 做 gap 分析 → 生成 1-3 条补充查询
+         c. 肉眼判断补充查询是否可能命中相关 passage
+         d. 分类失败原因：
+            - 检索器能力不足（相关 passage 存在但语义空间太远）
+            - 查询表述问题（改写就能覆盖）
+            - 标注噪声（qrels 中的相关 passage 确实不相关）
+            - 其他
+      4. 统计：多少条 zero-hit 可以通过多轮检索救回
+    success_criteria: ">5/20 条有改善潜力 → 进入 Phase 1"
+    output: "zero-hit 查询失败原因分类表 + case study 笔记"
+    cost: "~¥0.05（20 × thinking API）"
+    script: "scripts/analyze_zero_hit.py（待创建）"
+
+  # ========== Phase 1：200 条 Smoke Test ==========
+  - id: phase1
+    name: "200 条 Smoke Test"
+    objective: "得出初步 R@50/Hit@50 数字，判断是否有统计显著的增益"
+    sample: 200 条（复用 exp-003 split 分配，seed=42）
+    procedure: |
+      1. 加载 exp-003 S4 的 Round 1 结果（top-50 RRF 融合 + 各路独立 pid/rank）
+      2. 对每条查询：
+         a. 提取 top-10 passage pid，从 collection.tsv 查原文，生成 80-100 字摘要
+         b. 调 DeepSeek thinking API 做 gap 分析 → 1-3 条补充查询
+         c. 每条补充查询 → Dense（m3e-base）检索 top-50
+         d. 将 Round 1 4 路 + Round 2 1-3 路一起做平权 RRF(k=60) 融合 → top-50
+      3. 计算 Recall@50 / Hit@50 / MRR
+      4. 对比 Round 1 only vs Round 1+2：
+         - 全量 200 条的 delta
+         - 仅看 Hit@50=0 子集的 delta（最敏感）
+    success_criteria: "R@50 提升 >2% 或 Hit@50=0 子集中 >30% 改善 → 进入 Phase 2"
+    cost: "200 × 1 次 thinking API ≈ ¥1 + Dense 检索（已有索引，零边际成本）"
+    script: "scripts/evaluate_exp006.py（待创建）"
+
+  # ========== Phase 2：2000 条全量 + 消融 ==========
+  - id: phase2
+    name: "2000 条全量评估 + 消融"
+    objective: "出论文级最终数字，消融关键变量"
+    sample: 2000 条（复用 exp-003 split）
+    status: "待 Phase 1 通过后启动"
+    procedure: "同 Phase 1，规模扩展到 2000 条"
+    cost: "2000 × ¥0.005 ≈ ¥10"
+
+
+# =============================================================================
+# 第五部分：可选消融实验（Phase 1 通过后考虑）
+# =============================================================================
+
+optional_ablations:
+
+  - id: "A"
+    name: "Round 2 降权 RRF"
+    question: "Round 2 的 gap-filling 查询质量不如 Round 1 的已验证路由吗？"
+    method: "Round 2 路由使用 RRF 1/(120+rank) 或 1/(60+rank)×0.5，与平权对比"
+    note: "如果降权后 R@50 更高 → Round 2 质量确实不如 Round 1"
+
+  - id: "B"
+    name: "Gap 分析：thinking vs non-thinking"
+    question: "Gap 分析任务中 thinking mode 是否确实优于 non-thinking？"
+    method: "同一批 200 条查询，分别用 thinking 和 non-thinking 做 gap 分析，对比产出查询的检索质量"
+    note: "与 exp-005 的 thinking/non-thinking 正交——exp-005 测的是生成答案，这里测的是检索缺口分析"
+
+  - id: "C"
+    name: "Gap 分析输入：top-10 vs top-20 vs top-50 passages"
+    question: "给 LLM 看多少条第一轮结果最合适？"
+    method: "固定 200 条，变化输入 passage 数量，对比 gap 分析质量（Round 2 R@50）"
+
+  - id: "D"
+    name: "补充查询数量消融：1 条 vs 3 条"
+    question: "多几条补充查询能带来额外增益吗？"
+    method: "固定 200 条，限制 LLM 输出 1 条 vs 3 条，对比 Round 2 增量"
+
+  - id: "E"
+    name: "合并策略对比：RRF vs 去重拼接"
+    question: "是 RRF 融合更好，还是简单去重后拼接？"
+    method: "同一批 Round 1+2 结果，分别用 RRF 和去重拼接，对比 R@50"
+
+  - id: "F"
+    name: "与 HyDE only 对比（归因分析）"
+    question: "多轮检索的增益是否已经被 HyDE 覆盖？"
+    method: "新增一组对照：Round 1 不用 HyDE（仅 D-B0 + D-P2），直接和 Round 1+2 对比。如果这时 Round 1+2 增幅大，说明多轮提供的信号与 HyDE 互补"
+
+
+# =============================================================================
+# 第六部分：实现说明
+# =============================================================================
+
+implementation:
+
+  scripts:
+    - name: "scripts/analyze_zero_hit.py"
+      purpose: "Phase 0 零命中查询案例分析"
+      input: "exp-003 S4 测试集结果（JSON/JSONL）"
+      output: "zero-hit 查询列表 + 失败原因分类"
+      note: "不调 API，纯数据提取 + 人工分析辅助"
+
+    - name: "scripts/evaluate_exp006.py"
+      purpose: "Phase 1/2 多轮检索评估"
+      input:
+        - "exp-003 S4 的 Round 1 结果（复用已有 JSONL）"
+        - "collection.tsv（查 passage 原文）"
+        - "Dense 索引（m3e-base, 768-dim）"
+      output: "Round 1 only vs Round 1+2 的 Recall@50 / Hit@50 / MRR"
+      dependencies:
+        - "src/intent/query_rewrite_prompts.py（复用 Prompt 管理框架）"
+        - "src/retrieval/multi_query.py（复用 rrf_fusion）"
+        - "src/evaluation/metrics.py（复用 compute_metrics）"
+
+  key_design_decisions:
+    - decision: "Round 2 仅用 Dense（不用 BM25）"
+      reason: "exp-003 显示 BM25 单路 R@50 仅 0.17，gap-filling 查询如果连 Dense 都找不到，BM25 几乎不可能找到。同时减少一次 LLM 改写的 API 调用"
+    - decision: "Round 2 不做查询改写"
+      reason: "gap 分析产出的查询已经是 LLM 优化过的搜索词，再加一层改写可能引入偏移。且改写需要额外 API 调用"
+    - decision: "Phase 0 不调 API，仅人工分析"
+      reason: "20 条 case study 的目的是快速判断方向是否合理。手动分析 1-2 小时就能得出结论，比写自动化脚本 + 调 API 快"
+    - decision: "top-10 passage 用摘要而非原文"
+      reason: "原文 368 字 × 10 = 3680 字 ≈ 5000 tokens，加上 prompt 和 thinking trace 轻松过 8000。摘要控制在 80-100 字/段 ≈ 1200 tokens，给 thinking trace 留足空间"

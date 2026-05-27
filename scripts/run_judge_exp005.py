@@ -1,13 +1,12 @@
 """
-Exp-005 Judge 执行器。
+Exp-005 Judge 执行器（两批滚动评估）。
 
-批量调用 Judge LLM 对生成结果进行多维度评分。
-支持：
-  - 生成阶段 10 维评估（默认）
-  - 系统级 6 层评估
-  - 结果缓存
-  - 限流与重试
-  - 进度显示
+每条生成答案分两批评估：
+  Batch1（门槛组）: 准确性 + 安全性 + 相关性
+  Batch2（质量组）: 整合质量 + 引文质量 + 用户体验
+
+每条答案调用 Judge LLM 两次（每批一次），合并为 6 维核心评分。
+支持：结果缓存、限流与重试、进度显示。
 """
 
 import os
@@ -19,21 +18,22 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.intent.api_client import APIClientFactory
 from src.evaluation.judge_prompts import (
-    GEN_STAGE_SYSTEM_PROMPT,
-    SYSTEM_LEVEL_SYSTEM_PROMPT,
-    GEN_STAGE_DIMS,
-    SYSTEM_LEVEL_DIMS,
+    get_batch_system_prompt,
     build_gen_stage_judge_input,
     parse_judge_response,
+    ALL_CORE_DIMS,
 )
 from src.evaluation.aggregation import (
-    aggregate_gen_stage_scores,
-    aggregate_system_level_scores,
+    aggregate_core6_scores,
     aggregate_batch,
+    CORE6_DIM_LABELS,
 )
 from src.utils.config import DATA_ROOT
 
@@ -45,11 +45,10 @@ logger = logging.getLogger(__name__)
 
 RESULTS_DIR = DATA_ROOT / "results" / "exp005"
 MAX_RETRIES = 3
-RETRY_DELAY_BASE = 2  # 指数退避基数（秒）
+RETRY_DELAY_BASE = 2
 
 
 def load_generations(filepath: Path) -> list[dict]:
-    """加载生成结果 JSONL 文件。"""
     results = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -61,39 +60,21 @@ def load_generations(filepath: Path) -> list[dict]:
     return results
 
 
-def judge_single(
+def judge_single_batch(
     client,
     query: str,
     passages: list[dict],
     answer: str,
-    system_prompt_text: str = None,
-    judge_mode: str = "gen_stage",
-    model_name: str = None,
+    batch: int,
 ) -> dict | None:
     """
-    对单条生成结果进行 Judge 评分。
-
-    Args:
-        client: LLM API client
-        query: 用户查询
-        passages: 检索文档列表
-        answer: LLM 生成的答案
-        system_prompt_text: LLM 生成时使用的 system prompt
-        judge_mode: "gen_stage" 或 "system_level"
-        model_name: 生成模型的名称（用于日志和结果记录）
+    执行单批次 Judge 评分（Batch 1 或 Batch 2）。
 
     Returns:
-        {"scores": {...}, "aggregation": {...}, "raw_response": "..."} 或 None
+        {"scores": {...}, "raw_response": "..."} 或 None
     """
-    if judge_mode == "gen_stage":
-        system_prompt = GEN_STAGE_SYSTEM_PROMPT
-        user_message = build_gen_stage_judge_input(
-            query, passages, answer, system_prompt_text
-        )
-    else:
-        system_prompt = SYSTEM_LEVEL_SYSTEM_PROMPT
-        user_message = build_gen_stage_judge_input(query, passages, answer)
-
+    system_prompt = get_batch_system_prompt(batch)
+    user_message = build_gen_stage_judge_input(query, passages, answer, batch=batch)
     full_prompt = f"{system_prompt}\n\n{user_message}"
 
     for attempt in range(MAX_RETRIES):
@@ -103,56 +84,76 @@ def judge_single(
 
             if parsed is None:
                 logger.warning(
-                    f"Judge response parse failed (attempt {attempt + 1}). "
-                    f"Response preview: {raw_response[:200]}..."
+                    f"Batch{batch} parse failed (attempt {attempt + 1}). "
+                    f"Preview: {raw_response[:200]}..."
                 )
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_BASE ** (attempt + 1))
                 continue
 
-            if judge_mode == "gen_stage":
-                aggregation = aggregate_gen_stage_scores(parsed)
-            else:
-                aggregation = aggregate_system_level_scores(parsed)
-
-            return {
-                "scores": parsed,
-                "aggregation": aggregation,
-                "raw_response": raw_response,
-            }
+            return {"scores": parsed, "raw_response": raw_response}
 
         except Exception as e:
-            logger.warning(f"Judge API error (attempt {attempt + 1}): {e}")
+            logger.warning(f"Batch{batch} API error (attempt {attempt + 1}): {e}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY_BASE ** (attempt + 1))
 
-    logger.error(f"Judge failed after {MAX_RETRIES} attempts")
+    logger.error(f"Batch{batch} failed after {MAX_RETRIES} attempts")
     return None
+
+
+def judge_both_batches(
+    client,
+    query: str,
+    passages: list[dict],
+    answer: str,
+) -> dict:
+    """
+    执行两批 Judge 评分并合并结果。
+
+    Returns:
+        {
+            "scores": {all 6 dims merged},
+            "aggregation": aggregate_core6_scores result,
+            "batch1_raw": "...",
+            "batch2_raw": "...",
+            "error": bool,
+        }
+    """
+    result1 = judge_single_batch(client, query, passages, answer, batch=1)
+    result2 = judge_single_batch(client, query, passages, answer, batch=2)
+
+    if result1 is None or result2 is None:
+        return {
+            "scores": {},
+            "aggregation": {"total_score": -1},
+            "error": True,
+        }
+
+    all_scores = {}
+    all_scores.update(result1.get("scores", {}))
+    all_scores.update(result2.get("scores", {}))
+
+    aggregation = aggregate_core6_scores(all_scores)
+
+    return {
+        "scores": all_scores,
+        "aggregation": aggregation,
+        "batch1_raw": result1.get("raw_response", ""),
+        "batch2_raw": result2.get("raw_response", ""),
+        "error": False,
+    }
 
 
 def run_judge(
     generations_file: Path,
     output_file: Path,
-    judge_mode: str = "gen_stage",
     judge_model: str = "deepseek-chat",
     judge_api_key: Optional[str] = None,
     start_idx: int = 0,
     max_queries: int = 0,
     force: bool = False,
 ):
-    """
-    批量 Judge 评估。
-
-    Args:
-        generations_file: 生成结果 JSONL 文件
-        output_file: 输出结果 JSONL 文件
-        judge_mode: "gen_stage" 或 "system_level"
-        judge_model: Judge LLM 模型名
-        judge_api_key: API key
-        start_idx: 起始索引（断点续跑）
-        max_queries: 最大评估条数（0 = 全部）
-        force: 是否强制重新评估（忽略已有缓存）
-    """
     generations = load_generations(generations_file)
     total = len(generations)
 
@@ -185,8 +186,8 @@ def run_judge(
     failed = 0
 
     logger.info(
-        f"Starting judge evaluation: {len(generations)} queries, "
-        f"mode={judge_mode}, judge={judge_model}"
+        f"Starting 2-batch judge: {len(generations)} queries, "
+        f"judge={judge_model}, 2 calls/query → ~{len(generations) * 2} calls"
     )
 
     os.makedirs(output_file.parent, exist_ok=True)
@@ -211,46 +212,42 @@ def run_judge(
 
             answer = gen.get("answer", "")
             model_name = gen.get("model_id", gen.get("model", "unknown"))
-            system_prompt_text = gen.get("system_prompt", None)
 
-            result = judge_single(
+            judge_result = judge_both_batches(
                 client, query_text, passages, answer,
-                system_prompt_text, judge_mode, model_name,
             )
 
-            if result is None:
+            if judge_result["error"]:
                 failed += 1
-                result = {"scores": {}, "aggregation": {"total_score": -1}, "error": True}
 
             output = {
                 "query_id": qid,
                 "query_text": query_text,
                 "model": model_name,
                 "judge_model": judge_model,
-                "judge_mode": judge_mode,
-                "scores": result.get("scores", {}),
-                "aggregation": result.get("aggregation", {}),
+                "scores": judge_result.get("scores", {}),
+                "aggregation": judge_result.get("aggregation", {}),
             }
 
             out_f.write(json.dumps(output, ensure_ascii=False) + "\n")
             out_f.flush()
 
             processed += 1
-            if processed % 10 == 0:
+            if processed % 5 == 0:
                 logger.info(
                     f"  Processed {processed}/{len(generations)} "
                     f"(skipped {skipped}, failed {failed})"
                 )
-            elif processed % 50 == 0:
-                _print_progress_summary(output_file, judge_mode)
+            if processed % 25 == 0:
+                _print_progress_summary(output_file)
 
     logger.info(
-        f"Judge evaluation complete: {processed} processed, "
+        f"Judge complete: {processed} processed, "
         f"{skipped} skipped, {failed} failed"
     )
 
-    summary = compute_judge_summary(output_file, judge_mode)
-    _print_summary(summary, judge_mode)
+    summary = compute_judge_summary(output_file)
+    _print_summary(summary)
 
     summary_file = output_file.with_suffix(".summary.json")
     with open(summary_file, "w", encoding="utf-8") as f:
@@ -258,41 +255,26 @@ def run_judge(
     logger.info(f"Summary saved to {summary_file}")
 
 
-def _print_progress_summary(output_file: Path, judge_mode: str):
-    """打印中间进度摘要。"""
-    summary = compute_judge_summary(output_file, judge_mode)
-    dims = GEN_STAGE_DIMS if judge_mode == "gen_stage" else SYSTEM_LEVEL_DIMS
+def _print_progress_summary(output_file: Path):
+    summary = compute_judge_summary(output_file)
     parts = [f"avg={summary.get('avg_total_score', '?')}"]
-    for d in dims[:5]:
+    for d in ALL_CORE_DIMS:
         avg = summary.get("per_dim_avg", {}).get(d, "?")
         parts.append(f"{d[:6]}={avg}")
     logger.info(f"  Progress: {', '.join(parts)}")
 
 
-def compute_judge_summary(results_file: Path, judge_mode: str) -> dict:
-    """从已评估的结果文件计算汇总统计。"""
+def compute_judge_summary(results_file: Path) -> dict:
     results = load_generations(results_file)
     if not results:
         return {"count": 0}
-
-    dims = GEN_STAGE_DIMS if judge_mode == "gen_stage" else SYSTEM_LEVEL_DIMS
-    agg_fn = aggregate_gen_stage_scores if judge_mode == "gen_stage" else aggregate_system_level_scores
-
-    return aggregate_batch(results, dims, agg_fn)
+    return aggregate_batch(results, ALL_CORE_DIMS, aggregate_core6_scores)
 
 
-def _print_summary(summary: dict, judge_mode: str):
-    """打印评估汇总。"""
-    dims = GEN_STAGE_DIMS if judge_mode == "gen_stage" else SYSTEM_LEVEL_DIMS
-    dim_labels = (
-        __import__("src.evaluation.judge_prompts", fromlist=["GEN_STAGE_DIM_LABELS"]).GEN_STAGE_DIM_LABELS
-        if judge_mode == "gen_stage"
-        else __import__("src.evaluation.judge_prompts", fromlist=["SYSTEM_LEVEL_DIM_LABELS"]).SYSTEM_LEVEL_DIM_LABELS
-    )
-
+def _print_summary(summary: dict):
     print()
     print("=" * 60)
-    print(f"  JUDGE EVALUATION SUMMARY ({judge_mode})")
+    print("  JUDGE EVALUATION SUMMARY (6-dim core, 2-batch)")
     print("=" * 60)
     print(f"  Samples:        {summary.get('count', 0)}")
     print(f"  Avg Score:      {summary.get('avg_total_score', 0):.1f}")
@@ -300,43 +282,39 @@ def _print_summary(summary: dict, judge_mode: str):
     print(f"  Gate Failures:  {summary.get('gate_failure_rate', 0):.1%}")
     print(f"  Penalty Rate:   {summary.get('penalty_rate', 0):.1%}")
     print()
-    print(f"  Grade Distribution:")
+    print("  Grade Distribution:")
     for g in ["S", "A", "B", "C", "D", "F"]:
         count = summary.get("grade_distribution", {}).get(g, 0)
-        bar = "█" * max(1, count // (max(1, summary.get('count', 1)) // 40 + 1))
+        bar = "█" * max(1, count // (max(1, summary.get("count", 1)) // 40 + 1))
         print(f"    {g}: {count:4d}  {bar}")
 
     print()
-    print(f"  Per-Dimension Averages:")
-    for dim in dims:
-        label = dim_labels.get(dim, dim)
+    print("  Per-Dimension Averages:")
+    for dim in ALL_CORE_DIMS:
+        label = CORE6_DIM_LABELS.get(dim, dim)
         avg = summary.get("per_dim_avg", {}).get(dim, 0)
-        print(f"    {label:<30s} {avg:.2f}")
+        print(f"    {label:<25s} {avg:.2f}")
 
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Exp-005 Judge Evaluation Runner")
+    parser = argparse.ArgumentParser(description="Exp-005 2-Batch Judge Runner")
     parser.add_argument(
         "--input", "-i", type=str, required=True,
         help="生成结果 JSONL 文件路径",
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
-        help="评估结果输出路径（默认：results/exp005/judge_scores/<input_name>.jsonl）",
-    )
-    parser.add_argument(
-        "--mode", type=str, default="gen_stage", choices=["gen_stage", "system_level"],
-        help="评估模式（默认：gen_stage）",
+        help="评估结果输出路径（默认：results/exp005/judge_scores/<input_name>_judged.jsonl）",
     )
     parser.add_argument(
         "--judge-model", type=str, default="deepseek-chat",
-        help="Judge LLM 模型",
+        help="Judge LLM 模型（默认 deepseek-chat）",
     )
     parser.add_argument(
         "--api-key", type=str, default=None,
-        help="API Key（默认从环境变量读取）",
+        help="API Key（默认从环境变量 DEEPSEEK_API_KEY 读取）",
     )
     parser.add_argument(
         "--start", type=int, default=0,
@@ -366,7 +344,6 @@ if __name__ == "__main__":
     run_judge(
         generations_file=input_path,
         output_file=output_path,
-        judge_mode=args.mode,
         judge_model=args.judge_model,
         judge_api_key=args.api_key,
         start_idx=args.start,

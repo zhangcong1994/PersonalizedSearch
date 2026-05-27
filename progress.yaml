@@ -267,3 +267,20 @@ experiment_summary:
       rubric_deprecated: experiments/exp-005-generation-eval-rubric-v1-deprecated.md
       interim_results: experiments/exp-005-interim-results.md
       improvement_suggestions: experiments/exp-005-improvement-suggestions.md
+
+  - id: exp-006
+    name: 多轮检索 + Gap 分析改写
+    status: done
+    date_range: 2026-05-27
+    summary: "在 exp-003 S4 最优粗排（4 路 RRF，R@50=0.6912）基础上，通过 DeepSeek API gap analysis 分析 Round 1 Top-10 检索缺口、生成 1 条改写查询、Round 2 Dense 检索（m3e-base）后做平权 RRF 融合。全量 912 条测试集 R@50=0.6989（+0.77pp），Hit@50=0.9002（+0.11pp）。增益正向但边际，核心归因结论：同一 embedding 空间内 query 改写的天花板已近，真正瓶颈是 embedding 空间本身。为 exp-007 微调提供了动机。"
+    best_result: "Round 1+2 RRF: R@50=0.6989 (+0.77pp), Hit@50=0.9002 (+0.11pp)"
+    key_findings:
+      - "Gap analysis + 改写查询方向正确，全量正向增益 +0.77pp Recall@50"
+      - "跨模型 RRF 融合（bge-small Round2 + m3e-base Round1）会产生 +3pp 伪增益，不同 embedding 空间不可混用"
+      - "Phase 1（200 条）+1.59pp → Phase 2（912 条）+0.77pp，小样本放大好 case"
+      - "Hit@50 几乎不变（+0.11pp），改写查询与 Round 1 三路 Dense 覆盖高度重叠"
+      - "核心归因：强多路 Dense 融合基线下，首次 gap analysis 改写增益 ≤1pp，embedding 微调是下一步更高效的方向"
+    cost: "912 次 API 调用 ≈ ¥4.5，无额外检索成本"
+    files:
+      plan: experiments/exp-006-multi-round-retrieval.yaml
+      analysis: experiments/exp-006-results-analysis.md

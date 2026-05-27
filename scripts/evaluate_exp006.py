@@ -60,9 +60,9 @@ EXP003_RESULTS = DATA_ROOT / "results" / "exp003" / "exp003_test_S4_K50_RRFk60.j
 OUTPUT_DIR = DATA_ROOT / "results" / "exp006"
 GAP_ANALYSIS_CACHE = OUTPUT_DIR / "gap_analysis_cache.jsonl"
 
-VECTOR_DB_DIR = DATA_ROOT / "data" / "vector_db" / "t2ranking" / "bge-small-zh-v1.5"
+VECTOR_DB_DIR = DATA_ROOT / "data" / "vector_db" / "t2ranking" / "m3e-base"
 COLLECTION_NAME = "t2ranking_passages"
-EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+EMBEDDING_MODEL = "moka-ai/m3e-base"
 
 ROUND1_ROUTE_COUNT = 4
 ROUND2_PER_QUERY_K = 50
@@ -545,16 +545,15 @@ def main():
 
         results = [results_map[i] for i in range(len(entries))]
 
-        # Save cache
+        # Save cache (deduped: existing + new)
         if new_cache_entries:
             GAP_ANALYSIS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            all_entries = {k: {"qid": k, "gap_analysis": v} for k, v in cache.items()}
+            for ce in new_cache_entries:
+                all_entries[ce["qid"]] = ce
             with open(GAP_ANALYSIS_CACHE, "w", encoding="utf-8") as f:
-                for ce in cache.values():
-                    # collect deduped entries
-                    pass
-                for ce in new_cache_entries:
-                    if ce["qid"] not in cache:
-                        f.write(json.dumps(ce, ensure_ascii=False) + "\n")
+                for ce in all_entries.values():
+                    f.write(json.dumps(ce, ensure_ascii=False) + "\n")
             logger.info(f"Cached {len(new_cache_entries)} gap analyses")
 
     elapsed = time.time() - t_start

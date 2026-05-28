@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── constants ────────────────────────────────────────────
 from src.utils.config import (
-    PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR as _BASE_VECTOR_DB_DIR,
+    PROJECT_ROOT, RAW_DATA_DIR, VECTOR_DB_DIR as _BASE_VECTOR_DB_DIR, DATA_ROOT,
     MODEL_CACHE_DIR, EMBEDDING_MODEL,
     resolve_model_local_path, model_short_name,
 )
@@ -143,7 +143,12 @@ def get_embedding_model(
             model_name = str(local_path.resolve())
             logger.info(f"Using local embedding model: {model_name}")
         else:
-            logger.info(f"Loading embedding model: {model_name}")
+            data_root_candidate = (DATA_ROOT / model_name).resolve()
+            if data_root_candidate.is_dir():
+                model_name = str(data_root_candidate)
+                logger.info(f"Using local embedding model (DATA_ROOT): {model_name}")
+            else:
+                logger.info(f"Loading embedding model: {model_name}")
 
     model_kwargs = {"device": device}
 

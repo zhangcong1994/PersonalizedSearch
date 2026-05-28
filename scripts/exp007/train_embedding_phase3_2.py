@@ -46,9 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "m3e-base-t2ranking-phase1"
-DEFAULT_OUTPUT_BASE = PROJECT_ROOT / "models" / "m3e-base-t2ranking-phase3-2"
+DEFAULT_MODEL_PATH = DATA_ROOT / "models" / "m3e-base-t2ranking-phase1"
+DEFAULT_OUTPUT_BASE = DATA_ROOT / "models" / "m3e-base-t2ranking-phase3-2"
 
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QUERIES_TRAIN_FILE = T2RANKING_DIR / "queries.train.tsv"
@@ -68,7 +67,7 @@ MARGIN_EPOCH1 = 0.5
 MARGIN_LATER = 0.3
 DENSE_SEARCH_TOP_K = 50
 NUM_HARD_NEGS_PER_QUERY = 5
-ENCODE_BATCH_SIZE = 256
+ENCODE_BATCH_SIZE = 512
 
 HTML_RE = re.compile(r"<[^>]*>")
 URL_RE = re.compile(r"https?://\S+")

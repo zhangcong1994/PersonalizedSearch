@@ -14,6 +14,10 @@ Usage:
   # Full evaluation (needs GPU)
   python scripts/exp007/evaluate_embedding.py --device cuda --offline
 
+  # Only fine-tuned model, compare against hardcoded baseline (no baseline index needed)
+  python scripts/exp007/evaluate_embedding.py --model models/m3e-base-t2ranking-phase3-1 \
+      --device cuda --offline --baseline-values
+
   # Explicit index paths
   python scripts/exp007/evaluate_embedding.py \
       --baseline-vector-db data/vector_db/t2ranking/m3e-base \
@@ -51,6 +55,17 @@ COLLECTION_NAME = "t2ranking_passages"
 
 DEFAULT_BASELINE_MODEL = "moka-ai/m3e-base"
 DEFAULT_FINETUNED_MODEL = "models/m3e-base-t2ranking-phase1"
+
+BASELINE_METRICS = {
+    "Recall@10": 0.3896,
+    "Recall@20": 0.5074,
+    "Recall@50": 0.6278,
+    "MRR": 0.4556,
+    "NDCG@10": 0.3405,
+    "NDCG@10_graded": 0.3566,
+    "Hit@10": 0.7350,
+    "Hit@50": 0.8420,
+}
 
 EVAL_K_VALUES = [10, 20, 50]
 
@@ -227,6 +242,10 @@ def main():
         "--offline", action="store_true",
         help="Use HF offline mode"
     )
+    parser.add_argument(
+        "--baseline-values", action="store_true",
+        help="Use hardcoded pretrained m3e-base metrics as baseline (skip index loading)"
+    )
     args = parser.parse_args()
 
     do_baseline = not args.finetuned_only
@@ -244,7 +263,9 @@ def main():
     logger.info("=" * 60)
     logger.info(f"  Data root: {DATA_ROOT}")
     logger.info(f"  Vector DB base: {VECTOR_DB_DIR}")
-    if do_baseline:
+    if args.baseline_values:
+        logger.info(f"  Baseline:        hardcoded pretrained m3e-base metrics (--baseline-values)")
+    elif do_baseline:
         logger.info(f"  Baseline model:  {args.baseline_model}")
         logger.info(f"  Baseline index:  {baseline_index_dir}")
     if do_finetuned:
@@ -269,12 +290,13 @@ def main():
     logger.info(f"Queries with qrels: {len(queries_with_qrels)}")
 
     eval_tasks = []
-    if do_baseline:
+    all_metrics = {}
+    if args.baseline_values:
+        all_metrics["pretrained"] = dict(BASELINE_METRICS)
+    elif do_baseline:
         eval_tasks.append(("pretrained", args.baseline_model, baseline_index_dir))
     if do_finetuned:
         eval_tasks.append(("finetuned", args.model, finetuned_index_dir))
-
-    all_metrics = {}
 
     for tag, model_id, index_dir in eval_tasks:
         print()

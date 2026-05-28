@@ -6,6 +6,7 @@ scipy
 pyarrow
 chromadb
 sentence-transformers
+faiss-cpu
 scikit-learn
 gradio
 transformers

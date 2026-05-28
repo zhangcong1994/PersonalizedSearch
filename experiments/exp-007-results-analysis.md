@@ -81,7 +81,52 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 
 ---
 
-## 二、与预期目标的差距分析
+## 二、Phase 3.1 结果：CachedMNRL 继续训练（⚠️ 退化）
+
+### 实验配置
+
+| 项目 | Phase 1 | Phase 3.1 |
+|------|---------|-----------|
+| 起点模型 | moka-ai/m3e-base（原始权重） | Phase 1 微调后模型 |
+| Loss 函数 | MultipleNegativesRankingLoss | CachedMultipleNegativesRankingLoss |
+| mini_batch_size | — | 32 |
+| Epochs | 3 | 2 |
+| 训练数据 | 744K query-positive 对 | 相同（同一份 JSONL） |
+| 其他超参 | lr=2e-5, batch=64, warmup=0.1 | 相同 |
+
+### 指标总表
+
+| Metric | Phase 1 | Phase 3.1 | Delta | 相对变化 |
+|--------|---------|-----------|-------|---------|
+| **Recall@10** | **0.4539** | 0.4470 | -0.0069 | **-1.5%** |
+| Recall@20 | 0.5784 | 0.5743 | -0.0041 | -0.7% |
+| Recall@50 | 0.7003 | 0.6917 | -0.0086 | -1.2% |
+| MRR | 0.4976 | 0.4897 | -0.0079 | -1.6% |
+| NDCG@10 | 0.3903 | 0.3831 | -0.0072 | -1.8% |
+| NDCG@10_graded | 0.4114 | 0.4036 | -0.0078 | -1.9% |
+| Hit@10 | 0.7960 | 0.7915 | -0.0045 | -0.6% |
+| Hit@50 | 0.8940 | 0.8900 | -0.0040 | -0.4% |
+
+### 结论：全指标退化，CachedMNRL 无效
+
+**Phase 3.1 所有 8 个指标均低于 Phase 1**，且退化幅度均匀（-0.004 ~ -0.009），这是一个清晰的过拟合信号。
+
+**根因分析：**
+
+1. **模型已收敛，同一份数据再训练无意义**：Phase 1 的 3 epochs × 744K 对已经让模型充分吸收了训练数据中的信号。Phase 3.1 用同一份 JSONL 继续训练 2 个 epoch，模型只是在不断降低已见过的 (query, positive) 对的 loss，验证集泛化反而变差。
+
+2. **CachedMNRL 的收益条件不成立**：CachedMNRL 的核心优势是"更多负样本"——通过缓存最近几个 mini-batch 的 passage embedding，将负样本量从 batch_size 级别放大到 mini_batch_size × batch_size 级别。但对于一个已经收敛的模型，这些缓存的负样本早已被轻易区分，提供不了新的梯度信号。
+
+3. **均匀退化 = 经典过拟合**：如果 CachedMNRL 只是引入了噪声（例如缓存的 stale embedding 导致梯度方向错误），通常会出现部分指标升、部分指标降。全指标均匀下降的特征强烈指向：模型在训练集上继续优化，在验证集上泛化能力变差。
+
+**行动项：**
+- ❌ Phase 3.1 废弃，Phase 1 模型仍是当前 best model
+- ✅ Phase 3.2 从 Phase 1 模型开始，仅训 1~2 epoch，引入 hard negatives 作为唯一新信息源
+- ✅ 后续如需重新引入 CachedMNRL，应在 Phase 2 引入新数据分布（改写 query / HyDE）时使用
+
+---
+
+## 三、与预期目标的差距分析
 
 | 指标 | 实验计划目标 | 实际结果 | 差距 |
 |------|-------------|---------|------|
@@ -94,7 +139,7 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 
 1. **训练数据量不足**：744K 训练对仅来自二元 qrels（label>0），未使用 T2Ranking 官方的 1.6M 训练对（包含 graded label）。官方 Recall@50=0.67 使用 batch=128、epoch=20 训练，我们的 batch=64、epoch=3 在训练数据量和训练步数上均更少。
 
-2. **仅使用 in-batch negatives**：MNRL 的负样本量受 batch_size=64 限制，每个 query 仅 63 个负样本。CachedMNRL（Phase 3.1）将负样本量放大 5-10 倍，预期可进一步提升 1-2%。
+2. **仅使用 in-batch negatives**：MNRL 的负样本量受 batch_size=64 限制，每个 query 仅 63 个负样本。Phase 3.1 尝试了 CachedMNRL（负样本放大 5-10 倍），但因训练数据不变、模型已收敛而过拟合退化。
 
 3. **未使用 instruction 前缀**：实验计划中提到了"为这个句子生成表示以用于检索相关文章："前缀，本次未加入。BGE/M3E 家族对 instruction 敏感，加入后可能提升 1-3%。
 
@@ -120,8 +165,8 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 ### Phase 3：高级训练策略
 
 如果 Phase 1 + 2 的 Recall@10 仍低于 0.50，启动 Phase 3：
-- 3.1: CachedMNRL（负样本量放大 5-10 倍）→ 预期 +1~2%
-- 3.2: BM25 + Dense Dynamic Hard Negative Mining → 预期 +1~3%
+- 3.1: ~~CachedMNRL~~ → **已废弃（过拟合退化 -1.5%）**
+- 3.2: Dynamic Dense Hard Negative Mining + TripletLoss → 预期 +1~3%
 - 3.3: Graded Label (CosineSimilarityLoss + MNRL multi-task) → 预期 +1~2%
 
 ---
@@ -132,11 +177,14 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 |------|------|
 | `scripts/exp007/prepare_training_data.py` | 训练数据准备（TSV → JSONL） |
 | `scripts/exp007/train_embedding_phase1.py` | Phase 1 训练脚本 |
+| `scripts/exp007/train_embedding_phase3_1.py` | Phase 3.1 训练脚本（CachedMNRL，已废弃） |
 | `scripts/exp007/evaluate_embedding.py` | 检索效果评估脚本 |
-| `scripts/build_t2ranking_index.py` | 向量索引构建脚本（已适配微调模型） |
-| `models/m3e-base-t2ranking-phase1/` | Phase 1 微调后的模型权重 |
+| `scripts/exp007/build_index.py` | 向量索引构建脚本（实验七专用） |
+| `models/m3e-base-t2ranking-phase1/` | Phase 1 微调后的模型权重（当前 best model） |
+| `models/m3e-base-t2ranking-phase3-1/` | Phase 3.1 微调后的模型权重（已过拟合，废弃） |
 | `data/vector_db/t2ranking/m3e-base/` | Pretrained M3E 向量索引 |
-| `data/vector_db/t2ranking/m3e-base-t2ranking-phase1/` | Fine-tuned M3E 向量索引 |
+| `data/vector_db/t2ranking/m3e-base-t2ranking-phase1/` | Fine-tuned M3E Phase 1 向量索引 |
+| `data/vector_db/t2ranking/m3e-base-t2ranking-phase3-1/` | Fine-tuned M3E Phase 3.1 向量索引 |
 
 ---
 

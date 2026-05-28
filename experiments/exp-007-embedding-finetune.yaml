@@ -6,7 +6,7 @@ meta:
   experiment_id: exp-007
   phase: "V1"
   objective: "在 T2Ranking 训练集上微调 Embedding 模型，提升 Dense 检索在中文 passage 场景下的召回能力。分三阶段渐进式推进，从简单基线到完整多输入对齐"
-  status: "planned"
+  status: "in_progress (Phase 1 complete, Phase 3.1 abandoned, Phase 3.2 next)"
   target_platform: "AutoDL (RTX 4090 24GB)"
   prerequisite: "下载 T2Ranking 训练集文件（queries.train.tsv + qrels.retrieval.train.tsv）"
   design_principle: "数据驱动·渐进式·分布对齐——先跑通最简管线验证提升，再逐步引入改写/HyDE 数据对齐线上推理分布，最后用高级 Loss 和 Hard Negative 压榨上限"
@@ -170,9 +170,9 @@ loss_function_guide:
       data_format: "(query, positive) 对"
       mechanism: "MNRL 的变体——将 batch 拆成 mini-batch 逐步计算，缓存所有 mini-batch 的 passage 向量作为额外负样本"
       best_for: "显存有限但想用大量负样本时"
-      pros: "实际负样本量 = mini_batch_size × num_mini_batches，可比 MNRL 大 5-10 倍。2024 年社区最推荐"
-      cons: "需要调节 mini_batch_size 参数；实现比 MNRL 复杂一点"
-      applicable_in: "**Phase 3.1（主训练阶段 Loss 升级）**"
+      pros: "实际负样本量 = mini_batch_size × num_mini_batches，可比 MNRL 大 5-10 倍"
+      cons: "需要调节 mini_batch_size 参数；在模型已收敛时继续训练会导致过拟合（Phase 3.1 实证：Recall@10 -1.5%）"
+      applicable_in: "**已废弃**——对于已收敛模型无效。可能在引入新数据分布（Phase 2）时有重新评估价值"
 
     - name: "TripletLoss"
       data_format: "(q, p, n) 三元组"
@@ -195,7 +195,6 @@ loss_function_guide:
     
     Phase 1：只有 (q, p) 对 → MNRL（自然选择）
     Phase 2：只有 (q, p) 对（多输入） → MNRL（自然选择）
-    Phase 3.1：有 (q, p) 对，想增大负样本量 → CachedMNRL（Loss 升级）
     Phase 3.2：有 (q, p, n) 三元组 → TripletLoss（引入 Hard Negatives）
     未来：有 (q, p, score) → CosineSimilarityLoss（分级标注）
 
@@ -259,6 +258,11 @@ training_plan:
       recall_at_10: "0.50 ~ 0.55"
       risk: "纯 in-batch negatives 可能太简单，增益有限。如果 Phase 1 Recall@10 < 0.45，需要 Hard Negative"
       optimization_path: "Phase 1 成功后，可沿两条路径继续优化——路径 A：跳转 Phase 2 做数据增强；路径 B：跳转 Phase 3 做 Loss 升级 + Hard Negative Mining。详见第九部分「优化路线图」"
+    actual_result:
+      recall_at_10: 0.4539
+      recall_at_50: 0.7003
+      mrr: 0.4976
+      assessment: "低于预期下限 0.50，但相比 pretrained (+16.5%) 提升显著。需要 Phase 3.2 的 hard negatives 突破。详见 experiments/exp-007-results-analysis.md"
     deliverable:
       - "训练脚本 scripts/train_embedding_phase1.py"
       - "微调后的模型 model_path: models/m3e-base-t2ranking-phase1"
@@ -311,7 +315,7 @@ training_plan:
         original_query: "Recall 持平或小幅提升（因为增加了同分布数据）"
         rewritten_query: "改写 query 的 Recall 应显著提升——这是 Phase 2 的核心目标"
         hyde_text: "HyDE 假文本的 Recall 应大幅提升——段落式输入不再被模型「误解」"
-      optimization_path: "Phase 2 完成后，可叠加 Phase 3 的训练策略升级（CachedMNRL + Hard Negatives），在数据增强的基础上用高级 Loss 进一步压榨上限"
+      optimization_path: "Phase 2 完成后，可叠加 Phase 3.2 的 Dynamic Dense Hard Negative Mining，在数据增强的基础上进一步压榨上限"
     deliverable:
       - "训练脚本 scripts/train_embedding_phase2.py"
       - "改写 query + HyDE 生成脚本 scripts/generate_training_augmentations.py"
@@ -321,37 +325,35 @@ training_plan:
   # Phase 3：高级训练策略（可选，追求极致上限）
   # ─────────────────────────────────────────────────────────
   #
-  # Phase 3 按照「Warmup → 主训练 → 精调」的三阶段训练方法论展开，
-  # 每个子阶段有不同的 Loss 和负样本策略，对应 Loss 选型指南中的不同条目。
+  # Phase 3 的核心是引入 Hard Negative Mining ——
+  #   Phase 3.1 (CachedMNRL) → 已废弃（过拟合退化，见实验结果分析）
+  #   Phase 3.2 (Dynamic Dense Hard Negatives + TripletLoss) → 当前主攻方向
   #
-  # 核心思想：让模型在不同阶段面对不同难度的负样本——
-  #   先学会区分「明显不相关」的（in-batch random）
-  #   再学会区分「词汇层面接近但不相关」的（BM25 hard）
-  #   最后修正「语义层面接近但不相关」的盲点（Dynamic Dense hard）
+  # 核心思想：每 epoch 用当前模型对 2.3M passages 做全量 dense 检索，
+  #   挖掘模型自身盲点作为 hard negatives，引入 TripletLoss 针对性修正。
 
   phase3:
     name: "高级训练策略"
-    status: "optional——如果 Phase 1/2 的 Recall@10 已 ≥0.55，边际收益有限，可跳过"
-    prerequisite: "Phase 1 的 MNRL baseline 模型已产出"
-    data_base: "Phase 1 的原始 query 数据（258K query × 744K positives），也可叠加 Phase 2 的多输入增强数据"
+    status: "active——Phase 1 Recall@10=0.4539 低于目标 0.50，需要 hard negatives 突破"
+    prerequisite: "Phase 1 的 MNRL baseline 模型已产出（best model: models/m3e-base-t2ranking-phase1）"
+    data_base: "Phase 1 的原始 query 数据（258K query × 744K positives）"
     overall_objective: |
-      通过 Loss 升级 + 组合式负样本策略，在 Phase 1 的 Recall 基线上
-      进一步压榨 2-5 个百分点。核心方法：用 CachedMNRL 增大负样本量 +
-      引入 BM25/Dense hard negatives 提供更有区分度的训练信号。
+      Phase 3.1（CachedMNRL）已废弃——同一份训练数据上继续训练导致过拟合退化（-1.5%）。
+      关键洞察：模型已收敛，只有引入**新的信息源**（hard negatives）才能继续提升。
+      Phase 3.2 用 Dynamic Dense Hard Negative Mining + TripletLoss，
+      每 epoch 前全量重建 passage 索引并挖掘盲点。
 
     # ============================================================
-    # Phase 3.1：CachedMNRL 主训练（Loss 升级）
+    # Phase 3.1：CachedMNRL 主训练（⚠️ 已废弃）
     # ============================================================
     sub_phase_3_1:
       name: "CachedMNRL 主训练"
-      model_start: "Phase 1 微调后的模型（models/m3e-base-t2ranking-phase1）"
-      rationale: |
-        MNRL 的瓶颈在于负样本量受 batch_size 限制（bs=64 → 4032 个负样本/step）。
-        CachedMNRL 通过跨 mini-batch 缓存 passage 向量，在相同显存下将有效负样本量
-        放大 5-10 倍（bs=64 → 20,000+ 个负样本/step）。
-        
-        从 Phase 1 模型起步（已训 3 epoch MNRL），Phase 3.1 只需 2 epoch 的
-        CachedMNRL 即可完成负样本量的过渡，节省训练时间。
+      status: "ABANDONED —— 全指标退化 -1.5%，过拟合。Phase 1 模型仍是 best model"
+      reason_abandoned: |
+        从 Phase 1 模型起步（已训 3 epoch MNRL），用同一份训练数据继续训 2 epoch
+        CachedMNRL。结果：Recall@10 从 0.4539 降至 0.4470（-1.5%），全 8 项指标
+        一致退化。根因：模型已收敛，CachedMNRL 的额外负样本对已收敛模型无新梯度信号。
+        详见 experiments/exp-007-results-analysis.md 第二节。
       loss: "CachedMultipleNegativesRankingLoss"
       loss_params:
         mini_batch_size: 32
@@ -375,66 +377,88 @@ training_plan:
       deliverable: "models/m3e-base-t2ranking-phase3-1"
 
     # ============================================================
-    # Phase 3.2：Hard Negative Mining + TripletLoss 精调
+    # Phase 3.2：Dynamic Dense Hard Negative Mining + TripletLoss
     # ============================================================
     sub_phase_3_2:
-      name: "Hard Negative Mining + TripletLoss 精调"
-      status: "Phase 3.1 完成后方可进入"
+      name: "Dynamic Dense Hard Negative Mining + TripletLoss"
+      status: "active —— 当前主攻方向"
+      model_start: "Phase 1 微调后模型（models/m3e-base-t2ranking-phase1）—— 废弃 Phase 3.1"
       rationale: |
-        CachedMNRL 虽然负样本多了，但仍是「随机负样本」——模型已经能轻松区分
-        它们和正样本的区别。真正的提升来自 Hard Negatives：
-        
-        Dense hard negatives  → 覆盖语义层面的混淆
-          「当前 embedding 模型给高分，但实际不相关」的 passage
-        
-        Dynamic Hard Negative Mining + TripletLoss margin，让模型修正自身盲点。
+        Phase 3.1（CachedMNRL）已证明：模型在 Phase 1 的 3 epoch MNRL 后已收敛，
+        同一份训练数据上继续训练只会过拟合。真正的提升必须来自**新的信息源**——
+        Dynamic Dense Hard Negative Mining：每 epoch 用当前模型对 2.3M passages 做
+        全量编码 + FAISS 检索，挖掘模型自身的语义盲点。
 
-      dynamic_hard_negative_mining_workflow:
+      workflow_overview:
         description: |
-          这不是一次性构建完就固定的数据集，而是训练过程中周期性刷新的动态流程。
-        steps:
-          - step: "Step 0（训练前）"
-            action: "用 Phase 3.1 的 CachedMNRL 模型对全部 258K 训练 query 做 dense 检索，取 top-50"
-            filter: "排除 qrels 中的正样本 pid"
-            output: "每 query 选出模型「误认为高分但实际不相关」的 5 个 passage 作为初始 hard negatives"
-            note: "这是 Dynamic Hard Negative Mining 的核心——挖掘模型自身的盲点"
-          - step: "Step 1（Epoch 1）"
-            action: "加载 Phase 3.1 的 CachedMNRL 模型作为起点"
-            loss: "TripletLoss, margin=0.5"
-            negatives: "Dense hard negatives（5 个/query）+ in-batch negatives"
-            purpose: "用 Dense hard negatives 训练，让模型修正在硬区域的表现"
-          - step: "Step 2（Epoch 1 结束 → 更新 Dense Hard Negative）"
-            action: "用当前模型重新检索，挖掘新的盲点"
-            filter: "排除 qrels 正样本，替换上一轮的 Dense hard negatives"
-            output: "每 query 选出新的 5 个 hard negative passage"
-            note: "旧 hard negatives 必须丢弃——模型已经学会区分它们了"
-          - step: "Step 3（Epoch 2）"
-            action: "用更新后的 hard negatives 继续 TripletLoss 训练"
-            loss: "TripletLoss, margin=0.3（模型更强后 margin 略小，做精细调整）"
-            purpose: "面对新的盲点，持续修正"
-          - step: "Step 4（Epoch 2 结束 → 再一次更新）"
-            action: "重复 Step 2——用当前模型重新检索"
-          - step: "Step 5（Epoch 3）"
-            action: "用更新后的 hard negatives 继续 TripletLoss 训练最后 1 个 epoch"
+          每个 epoch 是一个「挖掘 → 训练 → 保存」的完整周期。共 3 个 epoch，
+          每次训练的 hard negatives 都来自**上一轮训练后的最新模型**。
+        epoch_cycle:
+          - epoch: 0（挖掘阶段——不训练）
+            model: "Phase 1 模型（models/m3e-base-t2ranking-phase1）"
+            action: |
+              1. 用 Phase 1 模型编码全部 2.3M passages → FAISS IndexFlatIP
+              2. 对 258K 训练 query 做 top-50 dense 检索
+              3. 排除 qrels 正样本，取 top-5 作为初始 hard negatives
+              4. 构建 (query, positive, hard_negative) 三元组训练数据
+            output: "exp007_hard_neg_epoch0.jsonl"
+            time_estimate: "~7 分钟（2.3M passages 编码 + FAISS 检索，4090 GPU）"
+          - epoch: 1
+            model_start: "Phase 1 模型（加载 checkpoint）"
+            loss: "TripletLoss, margin=0.5, distance_metric=cosine"
+            data: "exp007_hard_neg_epoch0.jsonl（5 hard negs/query）"
+            negatives: "Dense hard negatives + in-batch negatives"
+            save: "models/m3e-base-t2ranking-phase3-2-ep1/"
+          - epoch: 2
+            model_start: "models/m3e-base-t2ranking-phase3-2-ep1/"
+            action_before_training: "用 ep1 模型重新编码 2.3M passages → FAISS → 挖掘新 hard negatives"
+            loss: "TripletLoss, margin=0.3（模型更强后 margin 减小，做精细调整）"
+            data: "exp007_hard_neg_epoch1.jsonl（5 hard negs/query，全新）"
+            save: "models/m3e-base-t2ranking-phase3-2-ep2/"
+          - epoch: 3
+            model_start: "models/m3e-base-t2ranking-phase3-2-ep2/"
+            action_before_training: "用 ep2 模型重新编码 → FAISS → 挖掘新 hard negatives"
             loss: "TripletLoss, margin=0.3"
-            purpose: "收尾——模型已在不断变化的 hard negatives 上完成 3 轮迭代"
-        key_design_decisions:
-          update_every_epoch: "每 1 个 epoch 更新一次 dense hard negatives，而非每 500 steps。原因：258K query 的全量 dense 检索需要 ~30 分钟，太频繁不值得"
-          replace_old_hard_negatives: "旧的 hard negatives 必须丢弃——模型已经学会区分它们了，继续用有「作弊」嫌疑"
-          pure_dense_only: "只用 Dense hard negatives，不引入 BM25 词汇层面的负样本。减少变量、聚焦语义混淆"
+            data: "exp007_hard_neg_epoch2.jsonl（5 hard negs/query，全新）"
+            save: "models/m3e-base-t2ranking-phase3-2-ep3/（最终模型）"
+
+      key_design_decisions:
+        start_from_phase1: "Phase 3.1（CachedMNRL）已废弃。Phase 1 模型（3 epoch MNRL）是当前 best model，Phase 3.2 直接从此起步。模型已收敛，无需额外 warmup"
+        hard_neg_before_not_after: "每个 epoch 的 hard negatives 在**训练前**挖掘（而非训练后）。epoch 0 用 Phase 1 模型挖掘 → epoch 1 用这些 HN 训练 → epoch 1 保存模型 → epoch 1 模型挖掘 epoch 2 的 HN → 以此类推"
+        save_every_epoch: "每个 epoch 结束后保存模型（ep1/ep2/ep3 三个 checkpoint），方便对比哪一轮效果最好，也便于中断恢复"
+        replace_not_accumulate: "每轮 hard negatives 完全替换上一轮的——旧 HN 已被模型学会，继续用浪费算力"
+        full_rebuild_per_epoch: "每 epoch 重新编码全部 2.3M passages。FAISS IndexFlatIP 是纯内存操作，重建快（~7min）。增量更新 ChromaDB 反而更慢且要处理删除"
+        pure_dense_only: "只用 Dense hard negatives，不引入 BM25。减少变量、聚焦语义混淆"
 
       loss: "TripletLoss"
       loss_params:
-        margin: 0.5
+        margin:
+          epoch_1: 0.5
+          epoch_2_and_3: 0.3
         distance_metric: "cosine"
       hyperparameters:
         epochs: 3
-        learning_rate: 1e-5
+        learning_rate: 1e-5  # 小 LR，防止灾难性遗忘（模型已收敛）
         batch_size: 32
-        hard_neg_per_query:
-          dense: 5
-      expected_gain_vs_phase3_1: "+1~3% Recall@10"
-      deliverable: "models/m3e-base-t2ranking-phase3-2"
+        hard_neg_per_query: 5
+        dense_search_top_k: 50  # 每 query 取 top-50，再从中选 top-5 非正样本
+
+      evaluation_per_epoch:
+        description: "每个 epoch 的模型都可以用 evaluate_embedding.py 独立评估"
+        command: |
+          # epoch 1
+          python scripts/exp007/build_index.py --model models/m3e-base-t2ranking-phase3-2-ep1 --device cuda
+          python scripts/exp007/evaluate_embedding.py --model models/m3e-base-t2ranking-phase3-2-ep1 --device cuda --offline --baseline-values
+          # epoch 2 同理...
+        best_model_selection: "选择验证集 Recall@10 最高的 epoch checkpoint 作为最终交付"
+
+      expected_gain_vs_phase1: "+1~3% Recall@10"
+      deliverable:
+        - "models/m3e-base-t2ranking-phase3-2-ep1/"
+        - "models/m3e-base-t2ranking-phase3-2-ep2/"
+        - "models/m3e-base-t2ranking-phase3-2-ep3/"
+        - "训练脚本: scripts/exp007/train_embedding_phase3_2.py"
+        - "Hard negative 挖掘脚本（集成在训练脚本中）"
 
     # ============================================================
     # Phase 3.3：Graded Label 精调（可选延伸）
@@ -467,13 +491,13 @@ training_plan:
 #     → 如果 Recall 满意，直接交付
 #
 # 路径 B（进阶优化）：训练策略驱动
-#   Phase 1（原始 query + MNRL）
-#     → Phase 3.1（原始 query + CachedMNRL）
-#     → Phase 3.2（原始 query + Hard Negatives + TripletLoss）
-#     → Phase 3.3（原始 query + Graded Labels + CosineSimilarityLoss）
+#   Phase 1（原始 query + MNRL）—— 当前 best model (Recall@10=0.4539)
+#     → ~~Phase 3.1~~ 已废弃
+#     → Phase 3.2（Dynamic Dense Hard Negatives + TripletLoss）
+#     → Phase 3.3（Graded Labels + CosineSimilarityLoss）
 #
 # 两条路径最后可以汇合：
-#   Phase 1 → Phase 2 → Phase 3.1 → Phase 3.2
+#   Phase 1 → Phase 2 → Phase 3.2
 #   （数据扩充 + 训练策略叠加，预期达成最优效果）
 
 

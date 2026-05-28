@@ -120,23 +120,18 @@ data:
       bm25_candidate_pool: "可选：用 BM25 取 top-1000 作为候选池缩小评估范围，评估速度提升 2000 倍，指标偏差 <0.5%"
 
   negative_samples:
-    strategy: "自己构建，不下载官方 train.bm25.tsv 和 train.mined.tsv"
+    strategy: "自己构建，不下载官方 train.mined.tsv（ANCE 模型挖掘，与 M3E-base 不匹配）"
     rationale:
-      - "train.bm25.tsv（2.5GB）太大但信息密度低——对每条 query 实际只需 5-15 个 hard negatives"
-      - "train.mined.tsv 是用 ANCE 模型挖掘的，与 M3E-base/BGE-M3 不匹配"
-      - "项目已有 BM25 索引（src/retrieval/bm25_store.py），自己跑一遍 BM25 只需几十分钟，且可控 top-K 和过滤策略"
+      - "Phase 3.2 采用 Dynamic Dense Hard Negative Mining：用 Phase 3.1 模型做 dense 检索，周期性更新 hard negatives"
+      - "不引入 BM25 hard negatives——减少变量，专注语义层面的混淆"
     types:
       in_batch_negatives:
         source: "训练时自动产生（同一 batch 内其他 query 的正样本作为负样本）"
         cost: "零成本"
         benefit: "提供大量简单负样本，保证训练稳定性"
-      bm25_hard_negatives:
-        source: "用项目现有 BM25 索引对每条训练 query 检索 top-100，排除 qrels 中的正样本后采样"
-        cost: "本地计算，~30-60 分钟"
-        benefit: "覆盖词汇层面的混淆（BM25 高分但不相关的 passage）"
       dynamic_dense_hard_negatives:
-        source: "训练过程中周期性用当前模型做 dense 检索，取模型高分但不在 qrels 中的 passage"
-        cost: "周期性额外推理，每 1-2 个 epoch 更新一次"
+        source: "训练过程中周期性用当前模型做 dense 检索，取模型高分但不在 qrels 中的 passage。Phase 3.2 的核心负样本策略"
+        cost: "周期性额外推理，每 1 个 epoch 更新一次"
         benefit: "挖掘模型自身的盲点，针对性修正"
 
 
@@ -349,10 +344,14 @@ training_plan:
     # ============================================================
     sub_phase_3_1:
       name: "CachedMNRL 主训练"
+      model_start: "Phase 1 微调后的模型（models/m3e-base-t2ranking-phase1）"
       rationale: |
         MNRL 的瓶颈在于负样本量受 batch_size 限制（bs=64 → 4032 个负样本/step）。
         CachedMNRL 通过跨 mini-batch 缓存 passage 向量，在相同显存下将有效负样本量
         放大 5-10 倍（bs=64 → 20,000+ 个负样本/step）。
+        
+        从 Phase 1 模型起步（已训 3 epoch MNRL），Phase 3.1 只需 2 epoch 的
+        CachedMNRL 即可完成负样本量的过渡，节省训练时间。
       loss: "CachedMultipleNegativesRankingLoss"
       loss_params:
         mini_batch_size: 32
@@ -365,7 +364,7 @@ training_plan:
           6. 实际效果：每个 query 面对的负样本量 = 32 + N×32（N=缓存的 mini-batch 数）
       negatives: "仅 in-batch + cached negatives（无显式 hard negatives）"
       hyperparameters:
-        epochs: 3
+        epochs: 2
         learning_rate: 2e-5
         batch_size: 64
         warmup_ratio: 0.1
@@ -385,58 +384,54 @@ training_plan:
         CachedMNRL 虽然负样本多了，但仍是「随机负样本」——模型已经能轻松区分
         它们和正样本的区别。真正的提升来自 Hard Negatives：
         
-        BM25 hard negatives  → 覆盖词汇层面的混淆
-          「BM25 检索到，词面匹配度高，但内容不相关」的 passage
         Dense hard negatives  → 覆盖语义层面的混淆
           「当前 embedding 模型给高分，但实际不相关」的 passage
         
-        两类结合 + TripletLoss margin，让模型在困难区域做精细调整。
+        Dynamic Hard Negative Mining + TripletLoss margin，让模型修正自身盲点。
 
       dynamic_hard_negative_mining_workflow:
         description: |
           这不是一次性构建完就固定的数据集，而是训练过程中周期性刷新的动态流程。
         steps:
           - step: "Step 0（训练前）"
-            action: "用项目现有 BM25 索引对每条训练 query 检索 top-100"
-            filter: "排除已在 qrels 中的 pid"
-            output: "每 query 预留 20 个 BM25 hard negative 候选，训练时每条 query 随机采 5 个"
-          - step: "Step 1（Epoch 1 Warmup）"
+            action: "用 Phase 3.1 的 CachedMNRL 模型对全部 258K 训练 query 做 dense 检索，取 top-50"
+            filter: "排除 qrels 中的正样本 pid"
+            output: "每 query 选出模型「误认为高分但实际不相关」的 5 个 passage 作为初始 hard negatives"
+            note: "这是 Dynamic Hard Negative Mining 的核心——挖掘模型自身的盲点"
+          - step: "Step 1（Epoch 1）"
             action: "加载 Phase 3.1 的 CachedMNRL 模型作为起点"
             loss: "TripletLoss, margin=0.5"
-            negatives: "BM25 hard negatives（5 个/query）+ in-batch negatives"
-            purpose: "让模型先适应 BM25 层面的 hard negatives，不引入过多变量"
-          - step: "Step 2（Epoch 1 结束 → 首次 Dense Hard Negative 挖掘）"
-            action: "用当前模型对全部 258K 训练 query 做 dense 检索，取 top-50"
-            filter: "排除 qrels 正样本，排除 pass 过已有 BM25 hard negatives（去重）"
-            output: "每 query 选出模型当前「误认为高分但实际不相关」的 5 个 passage"
-            note: "这是 Dynamic Hard Negative Mining 的核心——挖掘模型自身的盲点"
+            negatives: "Dense hard negatives（5 个/query）+ in-batch negatives"
+            purpose: "用 Dense hard negatives 训练，让模型修正在硬区域的表现"
+          - step: "Step 2（Epoch 1 结束 → 更新 Dense Hard Negative）"
+            action: "用当前模型重新检索，挖掘新的盲点"
+            filter: "排除 qrels 正样本，替换上一轮的 Dense hard negatives"
+            output: "每 query 选出新的 5 个 hard negative passage"
+            note: "旧 hard negatives 必须丢弃——模型已经学会区分它们了"
           - step: "Step 3（Epoch 2）"
-            action: "用「BM25 hard（5 个）+ Dense hard（5 个）」组合继续 TripletLoss 训练"
-            loss: "TripletLoss, margin=0.3（因为 hard negatives 更难，margin 略小）"
-            purpose: "同时面对词汇混淆和语义混淆，全面修正"
-          - step: "Step 4（Epoch 2 结束 → 第二次 Dense Hard Negative 更新）"
-            action: "重复 Step 2——用当前模型重新检索，挖掘新的盲点"
-            filter: "替换上一轮的 Dense hard negatives"
+            action: "用更新后的 hard negatives 继续 TripletLoss 训练"
+            loss: "TripletLoss, margin=0.3（模型更强后 margin 略小，做精细调整）"
+            purpose: "面对新的盲点，持续修正"
+          - step: "Step 4（Epoch 2 结束 → 再一次更新）"
+            action: "重复 Step 2——用当前模型重新检索"
           - step: "Step 5（Epoch 3）"
             action: "用更新后的 hard negatives 继续 TripletLoss 训练最后 1 个 epoch"
             loss: "TripletLoss, margin=0.3"
             purpose: "收尾——模型已在不断变化的 hard negatives 上完成 3 轮迭代"
         key_design_decisions:
-          warmup_with_bm25_first: "先只用 BM25 hard negatives 训 1 个 epoch，让模型平稳过渡。如果一上来就 BM25 + Dense 混合，梯度信号太杂，训练不稳定"
-          update_not_every_epoch: "每 1 个 epoch 更新一次 dense hard negatives，而非每 500 steps。原因：258K query 的全量 dense 检索需要 ~30 分钟，太频繁不值得"
+          update_every_epoch: "每 1 个 epoch 更新一次 dense hard negatives，而非每 500 steps。原因：258K query 的全量 dense 检索需要 ~30 分钟，太频繁不值得"
           replace_old_hard_negatives: "旧的 hard negatives 必须丢弃——模型已经学会区分它们了，继续用有「作弊」嫌疑"
+          pure_dense_only: "只用 Dense hard negatives，不引入 BM25 词汇层面的负样本。减少变量、聚焦语义混淆"
 
       loss: "TripletLoss"
       loss_params:
-        margin_phase2_first: 0.5
-        margin_phase2_later: 0.3
+        margin: 0.5
         distance_metric: "cosine"
       hyperparameters:
         epochs: 3
         learning_rate: 1e-5
         batch_size: 32
         hard_neg_per_query:
-          bm25: 5
           dense: 5
       expected_gain_vs_phase3_1: "+1~3% Recall@10"
       deliverable: "models/m3e-base-t2ranking-phase3-2"

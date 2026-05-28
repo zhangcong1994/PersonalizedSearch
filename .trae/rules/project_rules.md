@@ -37,4 +37,4 @@ python app.py
 - 所有公开函数必须有类型注解
 - 日志使用 loguru
 - 配置通过 `config.yaml` 和 `src/utils/config.py` 读取
-- 开发机与服务器的数据盘路径不同，代码需要配置数据路径。所有数据、模型、实验结果都放到数据盘中。
+- **数据盘规则**：所有涉及文件落盘的操作（下载数据、下载模型、保存训练后模型、生成训练数据、保存实验结果、写入向量数据库等），必须从 `src.utils.config` 导入 `DATA_ROOT`，并以 `DATA_ROOT` 为根目录构建输出路径。`DATA_ROOT` 通过环境变量 `PERSONALIZEDSEARCH_DATA_ROOT` 配置，未设置时回退到项目根目录。禁止将模型、数据、实验结果写入项目代码目录。

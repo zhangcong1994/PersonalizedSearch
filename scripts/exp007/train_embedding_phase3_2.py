@@ -1,24 +1,35 @@
 """
-exp-007 Phase 3.2: Dynamic Dense Hard Negative Mining + TripletLoss.
+exp-007 Phase 3.2: Dynamic Dense Hard Negative Mining + TripletLoss + LoRA.
 
 Per-epoch workflow (matching the experiment plan):
   epoch 0 (mine only): Encode 2.3M passages → FAISS IndexFlatIP →
       retrieve top-50 per query → filter out positives → top-5 hard negatives
-  epoch 1: Train TripletLoss(margin=0.5) with epoch-0 hard negatives → save ep1
-  epoch 2: Re-mine hard negatives with ep1 model → TripletLoss(margin=0.3) → save ep2
-  epoch 3: Re-mine hard negatives with ep2 model → TripletLoss(margin=0.3) → save ep3
+  epoch 1: Load Phase 1 → add LoRA adapter → TripletLoss(margin=0.05) + MNRL
+      → merge_and_unload → save merged → re-mine hard negatives for epoch 2
+  epoch 2: Load ep1 merged → add fresh LoRA → TripletLoss(margin=0.03) + MNRL
+      → merge_and_unload → save → re-mine for epoch 3
+  epoch 3: Load ep2 merged → add fresh LoRA → TripletLoss(margin=0.03) + MNRL
+      → merge_and_unload → save final
+
+LoRA (default ON): trains only ~1.2% of parameters (attention projections),
+prevents catastrophic forgetting on the already-converged Phase 1 model.
+Each epoch creates a fresh adapter, then merges into full weights for
+evaluation and next-epoch mining.
 
 Usage:
   # Quick local test (100 queries, 5K passages, 1 epoch)
   python scripts/exp007/train_embedding_phase3_2.py \
       --sample-queries 100 --sample-passages 5000 --device cpu --batch-size 8
 
-  # Full training on GPU
+  # Full training on GPU (LoRA enabled by default)
   python scripts/exp007/train_embedding_phase3_2.py --device cuda --offline
+
+  # Full fine-tuning without LoRA
+  python scripts/exp007/train_embedding_phase3_2.py --device cuda --offline --no-lora
 
   # Start from a specific epoch checkpoint (resume)
   python scripts/exp007/train_embedding_phase3_2.py \
-      --start-from models/m3e-base-t2ranking-phase3-2-ep2 --device cuda --offline
+      --start-from models/m3e-base-t2ranking-phase3-2/ep1/merged --device cuda --offline
 """
 
 import os
@@ -63,11 +74,26 @@ LEARNING_RATE = 1e-5
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
-MARGIN_EPOCH1 = 0.5
-MARGIN_LATER = 0.3
+MARGIN_EPOCH1 = 0.05
+MARGIN_LATER = 0.03
+# Margin rationale: hard negatives are passages the model already finds very similar
+# to the query. For TripletLoss with COSINE_DISTANCE:
+#   loss = max(0, cos_dist(q,p) - cos_dist(q,n) + margin)
+# If cos(q,n)=0.7 (typical for mined HN), cos_dist(q,n)=0.3.
+# margin=0.5 requires cos_dist(q,p)<-0.2 → IMPOSSIBLE → model never converges.
+# margin=0.05 only requires cos(q,p)>cos(q,n), i.e. positive marginally better
+# than hard negative. This is achievable and stable.
 DENSE_SEARCH_TOP_K = 50
 NUM_HARD_NEGS_PER_QUERY = 5
 ENCODE_BATCH_SIZE = 1024
+ENCODE_BATCH_SIZE_FP16 = 4096  # FP16 halves memory, can 4x batch size
+
+# LoRA: 只训练 ~1.2% 参数，防止灾难性遗忘
+# target_modules: BERT-base 的 attention 投影矩阵
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.1
+LORA_TARGET_MODULES = ["query", "key", "value", "dense"]
 
 HTML_RE = re.compile(r"<[^>]*>")
 URL_RE = re.compile(r"https?://\S+")
@@ -187,6 +213,17 @@ def encode_batched(model, texts: list[str], batch_size: int = ENCODE_BATCH_SIZE)
     return np.concatenate(all_vectors, axis=0)
 
 
+def _load_model_for_mining(model_path: str, device: str, fp16: bool = False):
+    model = SentenceTransformer(model_path, device=device)
+    if fp16:
+        model.half()
+        dtype = str(next(model.parameters()).dtype)
+        logger.info(f"Mining model FP16: {model_path} (dtype={dtype})")
+    else:
+        logger.info(f"Mining model FP32: {model_path}")
+    return model
+
+
 def mine_hard_negatives(
     model,
     passage_pids: list[str],
@@ -195,13 +232,14 @@ def mine_hard_negatives(
     qrels: dict[str, set[str]],
     top_k: int = DENSE_SEARCH_TOP_K,
     num_hard_negs: int = NUM_HARD_NEGS_PER_QUERY,
+    encode_batch_size: int = ENCODE_BATCH_SIZE,
 ) -> dict[str, list[str]]:
     import numpy as np
     import faiss
 
     logger.info("Encoding passages...")
     t0 = time.time()
-    passage_vecs = encode_batched(model, passage_texts)
+    passage_vecs = encode_batched(model, passage_texts, batch_size=encode_batch_size)
     dim = passage_vecs.shape[1]
     logger.info(f"  {len(passage_texts):,} passages → {passage_vecs.shape} ({time.time() - t0:.0f}s)")
 
@@ -217,7 +255,7 @@ def mine_hard_negatives(
 
     logger.info(f"Encoding {len(query_texts):,} queries...")
     t0 = time.time()
-    query_vecs = encode_batched(model, query_texts)
+    query_vecs = encode_batched(model, query_texts, batch_size=encode_batch_size)
     logger.info(f"  {query_vecs.shape} ({time.time() - t0:.0f}s)")
 
     logger.info("Searching FAISS...")
@@ -397,12 +435,23 @@ def main():
         help="Disable mixed precision"
     )
     parser.add_argument(
+        "--no-lora", action="store_true",
+        help="Disable LoRA, do full fine-tuning instead (default: LoRA enabled)"
+    )
+    parser.add_argument(
+        "--encode-fp16", action="store_true",
+        help="Use FP16 for passage/query encoding during mining (faster, larger batch)"
+    )
+    parser.add_argument(
         "--offline", action="store_true",
         help="HF offline mode"
     )
     args = parser.parse_args()
 
     use_fp16 = args.fp16 and not args.no_fp16
+    use_lora = not args.no_lora
+    encode_fp16 = args.encode_fp16
+    mining_bs = ENCODE_BATCH_SIZE_FP16 if encode_fp16 else ENCODE_BATCH_SIZE
 
     if args.offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -425,6 +474,8 @@ def main():
     logger.info(f"  Epochs:         {args.epochs}")
     logger.info(f"  LR:             {args.lr}")
     logger.info(f"  FP16:           {use_fp16}")
+    logger.info(f"  LoRA:           {use_lora} (r={LORA_R}, alpha={LORA_ALPHA})")
+    logger.info(f"  Encode FP16:    {encode_fp16} (mining bs={mining_bs})")
     logger.info(f"  Offline:        {args.offline}")
     if args.start_from:
         logger.info(f"  Resume from:    {args.start_from}")
@@ -462,6 +513,14 @@ def main():
         from sentence_transformers import losses
     from torch.utils.data import DataLoader
 
+    # ── Build MNRL pairs (in-batch easy negatives) ──
+    mnrl_examples: list[InputExample] = []
+    for pair in training_pairs:
+        pos_text = passage_map.get(pair["pid"])
+        if pos_text is not None:
+            mnrl_examples.append(InputExample(texts=[pair["query"], pos_text]))
+    logger.info(f"MNRL training pairs: {len(mnrl_examples):,}")
+
     model_path_str = _resolve_model_path(str(args.model))
     logger.info(f"Loading Phase 1 model: {model_path_str}")
 
@@ -489,7 +548,7 @@ def main():
             logger.info(f"  EPOCH 0: Mining hard negatives (no training)")
             logger.info("=" * 60)
 
-            model = SentenceTransformer(current_model_path, device=args.device)
+            model = _load_model_for_mining(current_model_path, args.device, fp16=encode_fp16)
 
             if args.skip_mining and hard_neg_file.exists():
                 logger.info(f"  Skip mining: using existing {hard_neg_file}")
@@ -502,6 +561,7 @@ def main():
                     qrels,
                     top_k=DENSE_SEARCH_TOP_K,
                     num_hard_negs=NUM_HARD_NEGS_PER_QUERY,
+                    encode_batch_size=mining_bs,
                 )
                 triplets = build_triplets(
                     training_pairs, hard_negatives, passage_map,
@@ -525,10 +585,28 @@ def main():
         logger.info(f"  Training data: {prev_hard_neg_file.name}")
         logger.info("=" * 60)
 
-        # Load model from checkpoint
+        # Load model. For epoch 1: Phase 1 full model.
+        # For epochs 2+: previous epoch's merged model.
         model = SentenceTransformer(current_model_path, device=args.device)
         dim = model.get_embedding_dimension() if hasattr(model, "get_embedding_dimension") else model.get_sentence_embedding_dimension()
         logger.info(f"Model: {current_model_path} (dim={dim})")
+
+        # ── LoRA: add fresh adapter to prevent catastrophic forgetting ──
+        if use_lora:
+            from peft import LoraConfig, TaskType
+
+            peft_config = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                inference_mode=False,
+                r=LORA_R,
+                lora_alpha=LORA_ALPHA,
+                lora_dropout=LORA_DROPOUT,
+                target_modules=LORA_TARGET_MODULES,
+            )
+            model.add_adapter(peft_config)
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            logger.info(f"LoRA adapter added: {trainable:,}/{total:,} params trainable ({trainable/total*100:.1f}%)")
 
         # Load triplets from previous epoch's mining result
         triplets = load_triplets_jsonl(prev_hard_neg_file)
@@ -540,42 +618,67 @@ def main():
         random.seed(42 + epoch)
         random.shuffle(triplets)
 
+        # Sub-sample triplets to balance with MNRL pairs (avoid hard-neg domination)
+        if len(triplets) > len(mnrl_examples):
+            triplets = triplets[:len(mnrl_examples)]
+
         # Build InputExamples
-        train_examples = [
+        triplet_examples = [
             InputExample(texts=[t["query"], t["positive"], t["hard_negative"]])
             for t in triplets
         ]
 
-        total_steps = math.ceil(len(train_examples) / args.batch_size)
-        warmup_steps = int(total_steps * WARMUP_RATIO)
-        logger.info(f"Triplets:           {len(train_examples):,}")
-        logger.info(f"Steps this epoch:   {total_steps:,}")
-        logger.info(f"Warmup steps:       {warmup_steps}")
-        logger.info(f"Batch size:         {args.batch_size}")
-        logger.info(f"Margin:             {margin}")
-        logger.info(f"Output:             {output_dir}")
+        triplet_steps = math.ceil(len(triplet_examples) / args.batch_size)
+        mnrl_steps = math.ceil(len(mnrl_examples) / args.batch_size)
+        warmup_steps = int(max(triplet_steps, mnrl_steps) * WARMUP_RATIO)
+
+        hard_count = len(triplet_examples)
+        easy_per_step = args.batch_size - 1
+
+        logger.info(f"Triplets (hard negs):{hard_count:,} ({args.batch_size} hard/step)")
+        logger.info(f"MNRL pairs (easy):   {len(mnrl_examples):,} ({easy_per_step} in-batch/query)")
+        logger.info(f"Total negs/step:      hard={args.batch_size} + easy={args.batch_size * easy_per_step} ≈ {args.batch_size + args.batch_size * easy_per_step}")
+        logger.info(f"Hard ratio:           {args.batch_size}/{args.batch_size + args.batch_size * easy_per_step} = {args.batch_size / (args.batch_size + args.batch_size * easy_per_step) * 100:.0f}%")
+        logger.info(f"Triplet steps:        {triplet_steps:,}")
+        logger.info(f"MNRL steps:           {mnrl_steps:,}")
+        logger.info(f"Warmup steps:         {warmup_steps}")
+        logger.info(f"Batch size:           {args.batch_size}")
+        logger.info(f"Margin:               {margin}")
+        logger.info(f"Output:               {output_dir}")
         logger.info("-" * 60)
 
-        train_dataloader = DataLoader(
-            train_examples,
-            shuffle=True,
-            batch_size=args.batch_size,
+        triplet_dataloader = DataLoader(
+            triplet_examples, shuffle=True, batch_size=args.batch_size,
+        )
+        mnrl_dataloader = DataLoader(
+            mnrl_examples, shuffle=True, batch_size=args.batch_size,
         )
 
-        from sentence_transformers.losses import TripletLoss, SiameseDistanceMetric
+        try:
+            from sentence_transformers.sentence_transformer.losses import (
+                TripletLoss, SiameseDistanceMetric, MultipleNegativesRankingLoss,
+            )
+        except ImportError:
+            from sentence_transformers.losses import (
+                TripletLoss, SiameseDistanceMetric, MultipleNegativesRankingLoss,
+            )
 
-        train_loss = TripletLoss(
+        triplet_loss = TripletLoss(
             model,
             distance_metric=SiameseDistanceMetric.COSINE_DISTANCE,
             triplet_margin=margin,
         )
+        mnrl_loss = MultipleNegativesRankingLoss(model)
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("Training...")
         t_start = time.time()
         model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
+            train_objectives=[
+                (triplet_dataloader, triplet_loss),
+                (mnrl_dataloader, mnrl_loss),
+            ],
             epochs=1,
             warmup_steps=warmup_steps,
             optimizer_params={"lr": args.lr},
@@ -591,10 +694,25 @@ def main():
         )
         elapsed = time.time() - t_start
         logger.info(f"Epoch {epoch} training complete ({elapsed/60:.1f} min)")
-        logger.info(f"Model saved to: {output_dir}")
+
+        # ── Merge LoRA into full weights & save for evaluation/mining ──
+        if use_lora:
+            merged_model = model.merge_and_unload()
+            merged_dir = output_dir / "merged"
+            merged_model.save(str(merged_dir))
+            adapter_size = sum(
+                f.stat().st_size for f in output_dir.rglob("adapter_model*")
+            )
+            logger.info(f"LoRA adapter: {adapter_size/1024:.0f} KB")
+            logger.info(f"Merged model saved to: {merged_dir}")
+        else:
+            merged_dir = output_dir
+            merged_model = model
+
+        logger.info(f"Full model: {output_dir}")
 
         # Update current model path for next iteration
-        current_model_path = str(output_dir)
+        current_model_path = str(merged_dir)
 
         # Mine hard negatives for the NEXT epoch (if not the final epoch)
         if epoch < args.epochs:
@@ -602,22 +720,23 @@ def main():
             if args.skip_mining and next_hn_file.exists():
                 logger.info(f"  Skip mining for next epoch: using existing {next_hn_file}")
             else:
-                logger.info(f"  Mining hard negatives for epoch {epoch + 1} with ep{epoch} model...")
-                model_next = SentenceTransformer(current_model_path, device=args.device)
+                logger.info(f"  Mining hard negatives for epoch {epoch + 1} with ep{epoch} merged model...")
+                model_for_mining = _load_model_for_mining(current_model_path, args.device, fp16=encode_fp16)
                 hard_negatives = mine_hard_negatives(
-                    model_next,
+                    model_for_mining,
                     passage_pids,
                     passage_texts,
                     queries,
                     qrels,
                     top_k=DENSE_SEARCH_TOP_K,
                     num_hard_negs=NUM_HARD_NEGS_PER_QUERY,
+                    encode_batch_size=mining_bs,
                 )
                 triplets_next = build_triplets(
                     training_pairs, hard_negatives, passage_map,
                 )
                 save_triplets_jsonl(triplets_next, next_hn_file)
-                del model_next
+                del model_for_mining
 
     print()
     print("=" * 60)
@@ -625,13 +744,20 @@ def main():
     print("=" * 60)
     print(f"  Output base: {args.output_base}")
     for ep in range(max(1, start_epoch + 1), args.epochs + 1):
-        print(f"    ep{ep}: {args.output_base / f'ep{ep}'}")
+        ep_dir = args.output_base / f"ep{ep}"
+        eval_model = ep_dir / "merged" if use_lora else ep_dir
+        print(f"    ep{ep}: {ep_dir}")
+        if use_lora:
+            print(f"      adapter: {ep_dir} ({ep_dir}/adapter_model.safetensors)")
+            print(f"      merged:  {eval_model}  (full model)")
     print()
     print("  Evaluate each checkpoint:")
     for ep in range(max(1, start_epoch + 1), args.epochs + 1):
-        ep_model = args.output_base / f"ep{ep}"
-        print(f"    python scripts/exp007/build_index.py --model {ep_model} --device cuda")
-        print(f"    python scripts/exp007/evaluate_embedding.py --model {ep_model} \\")
+        ep_dir = args.output_base / f"ep{ep}"
+        eval_model = ep_dir / "merged" if use_lora else ep_dir
+        print(f"    # Epoch {ep}")
+        print(f"    python scripts/exp007/build_index.py --model {eval_model} --device cuda")
+        print(f"    python scripts/exp007/evaluate_embedding.py --model {eval_model} \\")
         print(f"        --device cuda --offline --baseline-values")
     print("=" * 60)
 

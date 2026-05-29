@@ -41,94 +41,156 @@ class APIClientFactory:
     """
     API客户端工厂类 - 使用LangChain创建LLM客户端
     """
-    
+
     @staticmethod
     def create(client_type: str, **kwargs) -> LangChainLLMClient:
         """
         创建LLM客户端
-        
+
         Args:
-            client_type: 客户端类型 ("openai" 或 "deepseek")
-            **kwargs: 额外参数（api_key, model, max_tokens, temperature等）
-            
+            client_type: 客户端类型 ("openai", "deepseek", "zhipu")
+            **kwargs: 额外参数（api_key, model, max_tokens, temperature, thinking, base_url 等）
+
         Returns:
             LangChainLLMClient实例
-            
+
         Raises:
             ValueError: 不支持的客户端类型
         """
         client_type = client_type.lower().strip()
-        
-        # 提取参数，适配LangChain的参数命名
+
         api_key = kwargs.get('api_key')
         model = kwargs.get('model')
         max_tokens = kwargs.get('max_tokens', 512)
         temperature = kwargs.get('temperature', 0.7)
-        
+        thinking = kwargs.get('thinking', False)
+        extra_body = kwargs.get('extra_body', None)
+
         if client_type == "openai":
             return APIClientFactory._create_openai_client(
                 api_key=api_key,
                 model=model,
                 max_tokens=max_tokens,
-                temperature=temperature
+                temperature=temperature,
+                extra_body=extra_body,
             )
         elif client_type == "deepseek":
             return APIClientFactory._create_deepseek_client(
                 api_key=api_key,
                 model=model,
                 max_tokens=max_tokens,
-                temperature=temperature
+                temperature=temperature,
+                thinking=thinking,
+                extra_body=extra_body,
+            )
+        elif client_type == "zhipu":
+            return APIClientFactory._create_zhipu_client(
+                api_key=api_key,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking=thinking,
+                extra_body=extra_body,
             )
         else:
             raise ValueError(f"Unsupported client type: {client_type}. "
-                           f"Supported types: ['openai', 'deepseek']")
+                           f"Supported types: ['openai', 'deepseek', 'zhipu']")
     
     @staticmethod
     def _create_openai_client(
         api_key: Optional[str] = None,
         model: str = "gpt-3.5-turbo",
         max_tokens: int = 512,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        extra_body: Optional[dict] = None,
     ) -> LangChainLLMClient:
         """创建OpenAI客户端"""
         openai_api_key = api_key or os.getenv("OPENAI_API_KEY")
-        
+
         if not openai_api_key:
             raise ValueError("OpenAI API key is required. "
                            "Set OPENAI_API_KEY environment variable or pass api_key parameter.")
-        
-        llm = ChatOpenAI(
+
+        kwargs = dict(
             model=model,
             api_key=openai_api_key,
             max_tokens=max_tokens,
             temperature=temperature,
-            verbose=False
+            verbose=False,
         )
-        
+        if extra_body:
+            kwargs["model_kwargs"] = extra_body
+
+        llm = ChatOpenAI(**kwargs)
         return LangChainLLMClient(llm)
-    
+
     @staticmethod
     def _create_deepseek_client(
         api_key: Optional[str] = None,
         model: str = "deepseek-chat",
         max_tokens: int = 512,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        thinking: bool = False,
+        extra_body: Optional[dict] = None,
     ) -> LangChainLLMClient:
         """创建DeepSeek客户端（使用OpenAI兼容API）"""
         deepseek_api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-        
+
         if not deepseek_api_key:
             raise ValueError("DeepSeek API key is required. "
                            "Set DEEPSEEK_API_KEY environment variable or pass api_key parameter.")
-        
-        # DeepSeek提供OpenAI兼容的API接口
-        llm = ChatOpenAI(
+
+        kwargs = dict(
             model=model,
             api_key=deepseek_api_key,
             base_url="https://api.deepseek.com/v1",
             max_tokens=max_tokens,
-            temperature=temperature,
-            verbose=False
+            verbose=False,
         )
-        
+
+        if thinking:
+            kwargs["temperature"] = 1.0
+        else:
+            kwargs["temperature"] = temperature
+
+        if extra_body:
+            kwargs["model_kwargs"] = extra_body
+
+        llm = ChatOpenAI(**kwargs)
+        return LangChainLLMClient(llm)
+
+    @staticmethod
+    def _create_zhipu_client(
+        api_key: Optional[str] = None,
+        model: str = "glm-4-flash",
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        thinking: bool = False,
+        extra_body: Optional[dict] = None,
+    ) -> LangChainLLMClient:
+        """创建智谱 GLM 客户端（使用 OpenAI 兼容 API）"""
+        zhipu_api_key = api_key or os.getenv("ZHIPU_API_KEY")
+
+        if not zhipu_api_key:
+            raise ValueError("Zhipu API key is required. "
+                           "Set ZHIPU_API_KEY environment variable or pass api_key parameter.")
+
+        if extra_body is None:
+            extra_body = {}
+
+        if thinking:
+            extra_body["thinking"] = {"type": "enabled"}
+
+        kwargs = dict(
+            model=model,
+            api_key=zhipu_api_key,
+            base_url="https://api.z.ai/api/paas/v4/",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            verbose=False,
+        )
+        if extra_body:
+            kwargs["model_kwargs"] = extra_body
+
+        llm = ChatOpenAI(**kwargs)
         return LangChainLLMClient(llm)

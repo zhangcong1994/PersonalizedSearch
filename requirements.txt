@@ -12,6 +12,7 @@ gradio
 transformers
 torch
 accelerate
+peft
 openai
 lightgbm
 loguru

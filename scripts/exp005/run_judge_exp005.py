@@ -47,6 +47,37 @@ RESULTS_DIR = DATA_ROOT / "results" / "exp005"
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 
+JUDGE_MODEL_CONFIGS = {
+    "deepseek-reasoner": {
+        "client_type": "deepseek",
+        "env_key": "DEEPSEEK_API_KEY",
+        "thinking": True,
+        "max_tokens": 4096,
+        "temperature": 1.0,
+    },
+    "deepseek-chat": {
+        "client_type": "deepseek",
+        "env_key": "DEEPSEEK_API_KEY",
+        "thinking": False,
+        "max_tokens": 2048,
+        "temperature": 0.0,
+    },
+    "glm-4.7": {
+        "client_type": "zhipu",
+        "env_key": "ZHIPU_API_KEY",
+        "thinking": True,
+        "max_tokens": 4096,
+        "temperature": 0.0,
+    },
+    "glm-4-flash": {
+        "client_type": "zhipu",
+        "env_key": "ZHIPU_API_KEY",
+        "thinking": False,
+        "max_tokens": 2048,
+        "temperature": 0.0,
+    },
+}
+
 
 def load_generations(filepath: Path) -> list[dict]:
     results = []
@@ -173,12 +204,21 @@ def run_judge(
                 qid = r.get("query_id", "")
                 existing_results[qid] = r
 
+    config = JUDGE_MODEL_CONFIGS.get(judge_model)
+    if config is None:
+        logger.warning(
+            f"Unknown judge model '{judge_model}', falling back to deepseek-chat defaults. "
+            f"Known models: {list(JUDGE_MODEL_CONFIGS.keys())}"
+        )
+        config = JUDGE_MODEL_CONFIGS["deepseek-chat"]
+
     client = APIClientFactory.create(
-        "deepseek" if "deepseek" in judge_model else "openai",
-        api_key=judge_api_key,
+        config["client_type"],
+        api_key=judge_api_key or os.getenv(config["env_key"]),
         model=judge_model,
-        max_tokens=2048,
-        temperature=0.0,
+        max_tokens=config["max_tokens"],
+        temperature=config["temperature"],
+        thinking=config["thinking"],
     )
 
     processed = 0

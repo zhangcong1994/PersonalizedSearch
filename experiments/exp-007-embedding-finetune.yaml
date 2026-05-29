@@ -552,20 +552,20 @@ training_plan:
             time_estimate: "~7 分钟（2.3M passages 编码 + FAISS 检索，4090 GPU）"
           - epoch: 1
             model_start: "Phase 1 模型（加载 checkpoint）"
-            loss: "TripletLoss, margin=0.5, distance_metric=cosine"
+            loss: "TripletLoss, margin=0.05, distance_metric=cosine"
             data: "exp007_hard_neg_epoch0.jsonl（5 hard negs/query）"
             negatives: "Dense hard negatives + in-batch negatives"
             save: "models/m3e-base-t2ranking-phase3-2-ep1/"
           - epoch: 2
             model_start: "models/m3e-base-t2ranking-phase3-2-ep1/"
             action_before_training: "用 ep1 模型重新编码 2.3M passages → FAISS → 挖掘新 hard negatives"
-            loss: "TripletLoss, margin=0.3（模型更强后 margin 减小，做精细调整）"
+            loss: "TripletLoss, margin=0.03（模型更强后 margin 减小，做精细调整）"
             data: "exp007_hard_neg_epoch1.jsonl（5 hard negs/query，全新）"
             save: "models/m3e-base-t2ranking-phase3-2-ep2/"
           - epoch: 3
             model_start: "models/m3e-base-t2ranking-phase3-2-ep2/"
             action_before_training: "用 ep2 模型重新编码 → FAISS → 挖掘新 hard negatives"
-            loss: "TripletLoss, margin=0.3"
+            loss: "TripletLoss, margin=0.03"
             data: "exp007_hard_neg_epoch2.jsonl（5 hard negs/query，全新）"
             save: "models/m3e-base-t2ranking-phase3-2-ep3/（最终模型）"
 
@@ -577,12 +577,49 @@ training_plan:
         full_rebuild_per_epoch: "每 epoch 重新编码全部 2.3M passages。FAISS IndexFlatIP 是纯内存操作，重建快（~7min）。增量更新 ChromaDB 反而更慢且要处理删除"
         pure_dense_only: "只用 Dense hard negatives，不引入 BM25。减少变量、聚焦语义混淆"
 
-      loss: "TripletLoss"
+      loss: "TripletLoss + MultipleNegativesRankingLoss (dual objective)"
       loss_params:
         margin:
-          epoch_1: 0.5
-          epoch_2_and_3: 0.3
+          epoch_1: 0.05
+          epoch_2_and_3: 0.03
         distance_metric: "cosine"
+      loss_rationale: |
+        纯 TripletLoss: 100% hard negatives，0 简单负样本 → 梯度太激进，容易崩溃
+        
+        TripletLoss + MNRL 双 objective:
+        - TripletLoss: 每个 step 32 个 hard negatives（来自 FAISS 挖掘）
+        - MNRL: 每个 step 32 × 31 ≈ 992 个 in-batch easy negatives
+        - 混合比例: hard ≈ 32/(32+992) ≈ 3% per step
+        - 由于 triplet 数量 ≈ MNRL pair 数量（做了 sub-sampling），两种
+          loss 的梯度 step 数相同 → 整体 hard gradient 占比约 50%
+        
+        效果: easy negatives 稳定模型不崩溃，hard negatives 针对性修正盲点。
+        Phase 1 已用 MNRL 收敛到好 local minimum，此阶段是温和微调。
+
+      lora:
+        enabled: true
+        rationale: |
+          模型已收敛到好的 local minimum。全量微调 hard negatives 风险高
+          （Phase 3.2 第一次运行 margin=0.5 导致 Recall 从 0.39 崩溃到 0.02）。
+          
+          LoRA 只训练 attention 投影矩阵（~1.2% 参数），即使此阶段设计有瑕疵
+          也最多训坏 adapter（5MB），不会摧毁 base model 的 embedding 空间。
+          
+          每个 epoch 独立创建新 adapter → 训练 → merge_and_unload → 全量模型
+          用于 mining 和下一 epoch 起点。adapter 权重轻量保存，方便回溯。
+        config:
+          r: 16
+          alpha: 32
+          dropout: 0.1
+          target_modules: ["query", "key", "value", "dense"]
+        trainable_ratio: "~1.2% (约 1.3M / 110M 参数)"
+        adapter_size: "~5MB (vs 409MB 全量模型)"
+      margin_rationale: |
+        Hard negatives 是模型认为与 query 最相似的 passage。如果 miner 质量好，
+        这些 HN 的 cos(q,n) 通常在 0.5-0.8 范围内。cosine distance = 1-cos → 
+        cos_dist(q,n) ≈ 0.2-0.5。TripletLoss 要求 cos_dist(q,p) + margin < cos_dist(q,n)。
+        margin=0.5 需要 cos_dist(q,p) < -0.2（不可能！），导致模型永不收敛、embedding 崩溃。
+        margin=0.05 仅要求 positive 略好于 hard negative，对已收敛模型来说是温和的微调。
       hyperparameters:
         epochs: 3
         learning_rate: 1e-5  # 小 LR，防止灾难性遗忘（模型已收敛）
@@ -593,19 +630,19 @@ training_plan:
       evaluation_per_epoch:
         description: "每个 epoch 的模型都可以用 evaluate_embedding.py 独立评估"
         command: |
-          # epoch 1
-          python scripts/exp007/build_index.py --model models/m3e-base-t2ranking-phase3-2-ep1 --device cuda
-          python scripts/exp007/evaluate_embedding.py --model models/m3e-base-t2ranking-phase3-2-ep1 --device cuda --offline --baseline-values
+          # epoch 1 (评估 merged 全量模型)
+          python scripts/exp007/build_index.py --model models/m3e-base-t2ranking-phase3-2/ep1/merged --device cuda
+          python scripts/exp007/evaluate_embedding.py \
+              --model models/m3e-base-t2ranking-phase3-2/ep1/merged \
+              --device cuda --offline --baseline-values
           # epoch 2 同理...
         best_model_selection: "选择验证集 Recall@10 最高的 epoch checkpoint 作为最终交付"
 
       expected_gain_vs_phase1: "+1~3% Recall@10"
       deliverable:
-        - "models/m3e-base-t2ranking-phase3-2-ep1/"
-        - "models/m3e-base-t2ranking-phase3-2-ep2/"
-        - "models/m3e-base-t2ranking-phase3-2-ep3/"
-        - "训练脚本: scripts/exp007/train_embedding_phase3_2.py"
-        - "Hard negative 挖掘脚本（集成在训练脚本中）"
+        - "models/m3e-base-t2ranking-phase3-2/ep1/  (adapter + merged 全量模型)"
+        - "models/m3e-base-t2ranking-phase3-2/ep2/  (adapter + merged 全量模型)"
+        - "models/m3e-base-t2ranking-phase3-2/ep3/  (adapter + merged 全量模型)"
 
     # ============================================================
     # Phase 3.3：Graded Label 精调（可选延伸）

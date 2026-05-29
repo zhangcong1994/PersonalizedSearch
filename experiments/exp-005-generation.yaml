@@ -193,16 +193,27 @@ evaluation:
       score_handler: "aggregate_gen_stage_scores()（见下文实现）"
 
   # ── Judge LLM 配置 ──
+  # 设计决策：两个 Judge 均开启 thinking 模式。
+  # 学术界证据（Jayarao et al. 2025, "Explicit Reasoning Makes Better Judges";
+  # Chen et al. 2025, "JudgeLRM"）一致表明 thinking/reasoning 模式在 judge 任务上
+  # 准确率高 ~10pp、抗偏置能力高 ~6%，开销仅 <2×。Judgment 本质上是 reasoning-heavy 任务。
   judge:
     primary:
-      model: "deepseek-chat"
-      reason: "项目已集成；中文能力强；成本低（¥0.002/1K input）"
-      temperature: 0.0
+      model: "deepseek-reasoner"
+      alias: "deepseek-v4-flash (thinking mode)"
+      reason: "DeepSeek thinking 模式；中文能力强；单价与 chat 端一致（¥2/1M input, ¥3/1M output），仅多输出 reasoning tokens"
+      api_endpoint: "deepseek-reasoner"
+      thinking_mode: "enabled (native)"
+      temperature: 0.0  # reasoner 端点忽略此参数（传参兼容但不生效）
+      cost_note: "单条输出从 ~400 tokens 增至 ~1200 tokens（含 thinking），200 条 × 6 模型 × 2 batch 总成本约 ¥50-70"
     fallback:
-      model: "gpt-4o-mini"
-      reason: "交叉验证 Judge 一致性（用于分析 deepseek-chat 作为 Judge 是否有系统性偏差）"
+      model: "glm-4.7"
+      provider: "Zhipu API"
+      reason: "GLM-4.7 + thinking 模式；与 DeepSeek 体系完全独立；中文评分能力强；thinking 模式成熟（支持交错式推理）"
+      thinking_mode: "thinking: { type: enabled }"
       temperature: 0.0
-      usage: "仅在人机校准阶段和最终报告的关键结论验证中使用（控制成本）"
+      cost_note: "¥0.001/千 tokens 输入 + ¥0.004/千 tokens 输出；200 条全量交叉验证约 ¥15-30"
+      usage: "全量 200 条 × 6 模型交叉验证，两个 thinking judge 互相对照；thinking vs non-thinking judge 差异分析见人机校准阶段"
 
   # ── 评分聚合（生成阶段 6 维核心）──
   aggregation_gen_stage:

@@ -1,10 +1,14 @@
 """
 Evaluate fine-tuned embedding models for exp-007.
 
-Loads pre-built ChromaDB vector indexes and runs retrieval evaluation
-on T2Ranking dev set. Reports Recall@k, MRR, NDCG side-by-side with deltas.
+Loads pre-built ChromaDB or FAISS vector indexes and runs retrieval
+evaluation on T2Ranking dev set. Reports Recall@k, MRR, NDCG.
 
-Index convention (same as build_t2ranking_index.py):
+Auto-detects index type:
+  - FAISS:  index.faiss + pids.json  (built by build_faiss_index.py)
+  - ChromaDB: chroma.sqlite3          (built by build_index.py)
+
+Index convention:
   {VECTOR_DB_DIR}/t2ranking/{model_short_name}/
 
 Usage:
@@ -70,6 +74,47 @@ BASELINE_METRICS = {
 EVAL_K_VALUES = [10, 20, 50]
 
 
+class _FAISSDoc:
+    __slots__ = ("metadata",)
+
+    def __init__(self, pid: str):
+        self.metadata = {"pid": pid}
+
+
+class _FAISSRetriever:
+    def __init__(self, index, pids: list[str], model, top_k: int):
+        self._index = index
+        self._pids = pids
+        self._model = model
+        self._top_k = top_k
+
+    def invoke(self, query_text: str) -> list:
+        import numpy as np
+        vec = self._model.encode(
+            [query_text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).astype(np.float32)
+        scores, indices = self._index.search(vec, self._top_k)
+        docs = []
+        for idx in indices[0]:
+            if idx < 0:
+                break
+            docs.append(_FAISSDoc(pid=self._pids[idx]))
+        return docs
+
+
+class _FAISSVectorStore:
+    def __init__(self, index, pids: list[str], model):
+        self._index = index
+        self._pids = pids
+        self._model = model
+
+    def as_retriever(self, search_type: str = "similarity", search_kwargs: dict | None = None):
+        k = search_kwargs.get("k", 50) if search_kwargs else 50
+        return _FAISSRetriever(self._index, self._pids, self._model, k)
+
+
 def _resolve_index_path(model_id: str) -> Path:
     return VECTOR_DB_DIR / "t2ranking" / model_short_name(model_id)
 
@@ -100,17 +145,74 @@ def _resolve_model_path(model_id_or_path: str) -> str:
     return model_id_or_path
 
 
-def load_index(model_id_or_path: str, vector_db_dir: str, device: str):
-    from langchain_chroma import Chroma
-    from langchain_huggingface import HuggingFaceEmbeddings
+def load_faiss_index(model_id_or_path: str, index_dir: str, device: str):
+    import json
+    import faiss
+    from sentence_transformers import SentenceTransformer
 
+    index_path = Path(index_dir)
+    faiss_file = index_path / "index.faiss"
+    pids_file = index_path / "pids.json"
+
+    if not faiss_file.exists():
+        raise FileNotFoundError(
+            f"FAISS index not found: {faiss_file}\n"
+            f"  Build it first: python scripts/exp007/build_faiss_index.py "
+            f"--model {model_id_or_path} --device {device}"
+        )
+
+    if not pids_file.exists():
+        raise FileNotFoundError(
+            f"PIDs file not found: {pids_file}\n"
+            f"  Rebuild the FAISS index"
+        )
+
+    model_path = _resolve_model_path(model_id_or_path)
+    logger.info(f"Loading embedding model: {model_path}")
+    model = SentenceTransformer(model_path, device=device)
+
+    logger.info(f"Loading pids from {pids_file}...")
+    with open(pids_file, "r", encoding="utf-8") as f:
+        pids: list[str] = json.load(f)
+    logger.info(f"  {len(pids):,} pids loaded")
+
+    logger.info(f"Loading FAISS index from {faiss_file}...")
+    index = faiss.read_index(str(faiss_file))
+    count = index.ntotal
+    logger.info(f"FAISS index loaded: {count:,} docs (dim={index.d})")
+
+    try:
+        res = faiss.StandardGpuResources()
+        gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+        index = gpu_index
+        logger.info("FAISS index moved to GPU (faiss-gpu detected)")
+    except Exception:
+        logger.info("FAISS GPU not available, using CPU search")
+
+    if count == 0:
+        raise RuntimeError(
+            f"FAISS index at {index_path} is empty (0 documents). Rebuild it."
+        )
+
+    return _FAISSVectorStore(index, pids, model), count
+
+
+def load_index(model_id_or_path: str, vector_db_dir: str, device: str):
     index_path = Path(vector_db_dir)
     if not index_path.is_dir():
         raise FileNotFoundError(
             f"Vector index not found: {index_path}\n"
-            f"  Build it first: python scripts/build_t2ranking_index.py "
+            f"  Build it first: python scripts/exp007/build_faiss_index.py "
             f"--model {model_id_or_path} --device {device}"
         )
+
+    faiss_index_file = index_path / "index.faiss"
+    if faiss_index_file.exists():
+        logger.info(f"Detected FAISS index at {index_path}")
+        return load_faiss_index(model_id_or_path, vector_db_dir, device)
+
+    from langchain_chroma import Chroma
+    from langchain_huggingface import HuggingFaceEmbeddings
 
     chroma_sqlite = index_path / "chroma.sqlite3"
     if not chroma_sqlite.exists():

@@ -63,10 +63,14 @@ DEFAULT_OUTPUT_BASE = DATA_ROOT / "models" / "m3e-base-t2ranking-phase3-2"
 T2RANKING_DIR = RAW_DATA_DIR / "t2ranking"
 QUERIES_TRAIN_FILE = T2RANKING_DIR / "queries.train.tsv"
 QRELS_TRAIN_FILE = T2RANKING_DIR / "qrels.retrieval.train.tsv"
+QUERIES_DEV_FILE = T2RANKING_DIR / "queries.dev.tsv"
+QRELS_DEV_FILE = T2RANKING_DIR / "qrels.retrieval.dev.tsv"
 COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
 
 TRAIN_DATA_DIR = DATA_ROOT / "data" / "processed"
 HARD_NEG_FILE_TEMPLATE = "exp007_hard_neg_epoch{epoch}.jsonl"
+
+DEV_MONITOR_SAMPLE_SIZE = 500
 
 BATCH_SIZE = 32
 EPOCHS = 3
@@ -85,6 +89,7 @@ MARGIN_LATER = 0.03
 # than hard negative. This is achievable and stable.
 DENSE_SEARCH_TOP_K = 50
 NUM_HARD_NEGS_PER_QUERY = 5
+HARD_NEG_SKIP_TOP = 10
 ENCODE_BATCH_SIZE = 1024
 ENCODE_BATCH_SIZE_FP16 = 4096  # FP16 halves memory, can 4x batch size
 
@@ -232,6 +237,7 @@ def mine_hard_negatives(
     qrels: dict[str, set[str]],
     top_k: int = DENSE_SEARCH_TOP_K,
     num_hard_negs: int = NUM_HARD_NEGS_PER_QUERY,
+    skip_top: int = HARD_NEG_SKIP_TOP,
     encode_batch_size: int = ENCODE_BATCH_SIZE,
 ) -> dict[str, list[str]]:
     import numpy as np
@@ -258,9 +264,13 @@ def mine_hard_negatives(
     query_vecs = encode_batched(model, query_texts, batch_size=encode_batch_size)
     logger.info(f"  {query_vecs.shape} ({time.time() - t0:.0f}s)")
 
-    logger.info("Searching FAISS...")
+    search_k = top_k + max(150, skip_top + num_hard_negs * 30)
+    logger.info(
+        f"Searching FAISS (top_k={search_k}, skip_top={skip_top}, "
+        f"num_hard_negs={num_hard_negs})..."
+    )
     t0 = time.time()
-    scores, indices = index.search(query_vecs.astype(np.float32), top_k + 100)
+    scores, indices = index.search(query_vecs.astype(np.float32), search_k)
     logger.info(f"  search complete ({time.time() - t0:.0f}s)")
 
     hard_negatives: dict[str, list[str]] = {}
@@ -273,19 +283,24 @@ def mine_hard_negatives(
             skipped_no_pos += 1
             continue
 
-        hn_pids = []
-        for j in range(len(indices[i])):
+        neg_candidates = []
+        for j in range(skip_top, len(indices[i])):
             pid = passage_pids[indices[i][j]]
             if pid not in positive_pids:
-                hn_pids.append(pid)
-                if len(hn_pids) >= num_hard_negs:
-                    break
+                neg_candidates.append(pid)
 
-        if len(hn_pids) < num_hard_negs:
+        if len(neg_candidates) < num_hard_negs:
             skipped_insufficient += 1
-            if hn_pids:
-                hard_negatives[qid] = hn_pids
+            if neg_candidates:
+                hard_negatives[qid] = neg_candidates[:num_hard_negs]
             continue
+
+        hn_pids = []
+        segment_size = len(neg_candidates) // num_hard_negs
+        for s in range(num_hard_negs):
+            start = s * segment_size
+            end = start + segment_size if s < num_hard_negs - 1 else len(neg_candidates)
+            hn_pids.append(neg_candidates[start])
 
         hard_negatives[qid] = hn_pids
 
@@ -314,6 +329,98 @@ def load_passage_texts(pids: list[str], passage_map: dict[str, str] | None = Non
                 if len(result) >= len(target):
                     break
     return result
+
+
+def load_dev_pairs(
+    sample_size: int = DEV_MONITOR_SAMPLE_SIZE,
+) -> list[dict[str, str]]:
+    dev_queries: dict[str, str] = {}
+    with open(QUERIES_DEV_FILE, "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                dev_queries[parts[0]] = parts[1]
+
+    dev_qrels: dict[str, set[str]] = {}
+    with open(QRELS_DEV_FILE, "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 2:
+                continue
+            qid, pid = parts[0], parts[1]
+            if qid in dev_queries:
+                dev_qrels.setdefault(qid, set()).add(pid)
+
+    pair_list: list[tuple[str, str]] = []
+    for qid, pid_set in dev_qrels.items():
+        query_text = dev_queries[qid]
+        for pid in pid_set:
+            pair_list.append((query_text, pid))
+
+    random.seed(42)
+    random.shuffle(pair_list)
+    pair_list = pair_list[:sample_size]
+
+    all_needed_pids = {pid for _, pid in pair_list}
+    pid_to_text: dict[str, str] = {}
+    with open(COLLECTION_FILE, "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            parts = line.strip().split("\t", 1)
+            if len(parts) < 2:
+                continue
+            pid = parts[0]
+            if pid in all_needed_pids:
+                pid_to_text[pid] = clean_text(parts[1])[:2000]
+                if len(pid_to_text) >= len(all_needed_pids):
+                    break
+
+    pairs: list[dict[str, str]] = []
+    for query_text, pid in pair_list:
+        pos_text = pid_to_text.get(pid)
+        if pos_text:
+            pairs.append({"query": query_text, "positive": pos_text})
+
+    logger.info(
+        f"Dev monitor pairs loaded: {len(pairs):,} (requested {sample_size})"
+    )
+    return pairs
+
+
+def evaluate_dev_cosine_similarity(
+    model,
+    dev_pairs: list[dict[str, str]],
+) -> tuple[float, float]:
+    import numpy as np
+
+    queries = [p["query"] for p in dev_pairs]
+    positives = [p["positive"] for p in dev_pairs]
+
+    q_vecs = model.encode(
+        queries,
+        batch_size=64,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    p_vecs = model.encode(
+        positives,
+        batch_size=64,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+
+    sims = np.sum(q_vecs * p_vecs, axis=1)
+    mean_sim = float(np.mean(sims))
+    std_sim = float(np.std(sims))
+
+    return mean_sim, std_sim
 
 
 def build_triplets(
@@ -446,6 +553,10 @@ def main():
         "--offline", action="store_true",
         help="HF offline mode"
     )
+    parser.add_argument(
+        "--dev-monitor-size", type=int, default=DEV_MONITOR_SAMPLE_SIZE,
+        help=f"Number of dev (query, positive) pairs for training stability monitoring (default: {DEV_MONITOR_SAMPLE_SIZE}, 0 to disable)"
+    )
     args = parser.parse_args()
 
     use_fp16 = args.fp16 and not args.no_fp16
@@ -520,6 +631,11 @@ def main():
         if pos_text is not None:
             mnrl_examples.append(InputExample(texts=[pair["query"], pos_text]))
     logger.info(f"MNRL training pairs: {len(mnrl_examples):,}")
+
+    dev_pairs: list[dict[str, str]] = []
+    if args.dev_monitor_size > 0:
+        dev_pairs = load_dev_pairs(sample_size=args.dev_monitor_size)
+        dev_sim_history: list[tuple[float, float]] = []
 
     model_path_str = _resolve_model_path(str(args.model))
     logger.info(f"Loading Phase 1 model: {model_path_str}")
@@ -672,6 +788,14 @@ def main():
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        if dev_pairs and not dev_sim_history:
+            dev_mean, dev_std = evaluate_dev_cosine_similarity(model, dev_pairs)
+            dev_sim_history.append((dev_mean, dev_std))
+            logger.info(
+                f"[DEV BASELINE] {len(dev_pairs)} pairs: "
+                f"cos_sim={dev_mean:.4f} ± {dev_std:.4f}  (before epoch {epoch} training)"
+            )
+
         logger.info("Training...")
         t_start = time.time()
         model.fit(
@@ -694,6 +818,22 @@ def main():
         )
         elapsed = time.time() - t_start
         logger.info(f"Epoch {epoch} training complete ({elapsed/60:.1f} min)")
+
+        if dev_pairs:
+            dev_mean, dev_std = evaluate_dev_cosine_similarity(
+                model, dev_pairs,
+            )
+            prev_str = ""
+            if dev_sim_history:
+                prev_mean, _ = dev_sim_history[-1]
+                delta = dev_mean - prev_mean
+                arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+                prev_str = f"  (prev={prev_mean:.4f} {arrow}{abs(delta):.4f})"
+            dev_sim_history.append((dev_mean, dev_std))
+            logger.info(
+                f"[DEV MONITOR] {len(dev_pairs)} pairs: "
+                f"cos_sim={dev_mean:.4f} ± {dev_std:.4f}{prev_str}"
+            )
 
         # ── Merge LoRA into full weights & save for evaluation/mining ──
         if use_lora:

@@ -65,7 +65,7 @@ def clean_text(text: str) -> str:
 
 
 def resolve_model_path(model_id_or_path: str) -> str:
-    if os.path.isdir(model_id_or_path):
+    if os.path.isabs(model_id_or_path) and os.path.isdir(model_id_or_path):
         return os.path.abspath(model_id_or_path)
 
     local_path = resolve_model_local_path(model_id_or_path)
@@ -78,11 +78,10 @@ def resolve_model_path(model_id_or_path: str) -> str:
         logger.info(f"Resolved via DATA_ROOT: {model_id_or_path} → {relative}")
         return str(relative)
 
-    if not os.path.isabs(model_id_or_path):
-        candidate = (Path.cwd() / model_id_or_path).resolve()
-        if candidate.is_dir():
-            logger.info(f"Resolved via CWD: {model_id_or_path} → {candidate}")
-            return str(candidate)
+    candidate = (Path.cwd() / model_id_or_path).resolve()
+    if candidate.is_dir():
+        logger.info(f"Resolved via CWD: {model_id_or_path} → {candidate}")
+        return str(candidate)
 
     return model_id_or_path
 

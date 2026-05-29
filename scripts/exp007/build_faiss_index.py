@@ -94,6 +94,12 @@ def resolve_model_path(model_id_or_path: str) -> str:
 def load_all_passages(max_passages: int = 0) -> tuple[list[str], list[str]]:
     pids: list[str] = []
     texts: list[str] = []
+    total_expected = max_passages if max_passages > 0 else 2_300_000
+
+    logger.info(f"Reading collection.tsv (target: {'all ~2.3M' if max_passages <= 0 else f'{max_passages:,}'})...")
+    t_start = time.time()
+    last_log_line = 0
+    log_interval = 500_000
 
     with open(COLLECTION_FILE, "r", encoding="utf-8") as f:
         f.readline()
@@ -112,10 +118,22 @@ def load_all_passages(max_passages: int = 0) -> tuple[list[str], list[str]]:
             pids.append(pid)
             texts.append(text)
 
-            if max_passages > 0 and len(pids) >= max_passages:
+            n = len(pids)
+            if n - last_log_line >= log_interval:
+                elapsed = time.time() - t_start
+                speed = n / elapsed
+                remaining = (total_expected - n) / speed if speed > 0 else 0
+                logger.info(
+                    f"  loaded {n:>10,} / ~{total_expected:,} passages "
+                    f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining, {speed:,.0f} docs/s)"
+                )
+                last_log_line = n
+
+            if max_passages > 0 and n >= max_passages:
                 break
 
-    logger.info(f"Loaded {len(pids):,} passages from collection")
+    elapsed = time.time() - t_start
+    logger.info(f"Total: {len(pids):,} passages loaded in {elapsed:.0f}s ({len(pids)/elapsed:,.0f} docs/s)")
     return pids, texts
 
 
@@ -128,26 +146,39 @@ def encode_all_passages(
 
     all_vectors: list[np.ndarray] = []
     total = len(texts)
+    num_batches = (total + batch_size - 1) // batch_size
 
-    logger.info(f"Encoding {total:,} passages (batch_size={batch_size})...")
+    logger.info(f"Encoding {total:,} passages ({num_batches:,} batches × {batch_size})...")
     t_start = time.time()
+    last_log = 0
 
-    for i in range(0, total, batch_size):
-        batch = texts[i:i + batch_size]
+    for i, batch_start in enumerate(range(0, total, batch_size)):
+        batch = texts[batch_start:batch_start + batch_size]
         vecs = model.encode(
             batch,
             batch_size=batch_size,
-            show_progress_bar=True,
+            show_progress_bar=False,
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
         all_vectors.append(vecs)
 
+        n_done = batch_start + len(batch)
+        if i == 0 or n_done - last_log >= 200_000 or batch_start + len(batch) >= total:
+            elapsed = time.time() - t_start
+            speed = n_done / elapsed if elapsed > 0 else 0
+            remaining = (total - n_done) / speed if speed > 0 else 0
+            pct = n_done / total * 100
+            logger.info(
+                f"  batch {i + 1:>5,}/{num_batches:,} | "
+                f"{n_done:>10,}/{total:,} ({pct:.0f}%) | "
+                f"~{remaining:.0f}s remaining | {speed:,.0f} docs/s"
+            )
+            last_log = n_done
+
     result = np.concatenate(all_vectors, axis=0)
     elapsed = time.time() - t_start
-    speed = total / elapsed if elapsed > 0 else 0
-    logger.info(f"Encoded {total:,} passages → {result.shape} in {elapsed:.0f}s ({speed:.0f} docs/s)")
-
+    logger.info(f"Encoded {total:,} passages → {result.shape} in {elapsed:.0f}s ({total/elapsed:,.0f} docs/s)")
     return result
 
 
@@ -217,37 +248,40 @@ def main():
     logger.info(f"  Save vectors:   {not args.no_save_vectors}")
     logger.info("-" * 60)
 
-    logger.info("Loading embedding model...")
+    logger.info("[1/5] Loading embedding model...")
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(model_path, device=args.device)
     dim = model.get_sentence_embedding_dimension()
-    logger.info(f"Embedding dim: {dim}")
+    logger.info(f"  Embedding dim: {dim}")
 
+    logger.info("[2/5] Reading passages from collection.tsv...")
     pids, texts = load_all_passages(max_passages=args.max_passages)
 
+    logger.info("[3/5] Encoding all passages to vectors...")
     vectors = encode_all_passages(model, texts, batch_size=args.encode_batch_size)
 
     os.makedirs(index_dir, exist_ok=True)
 
     if not args.no_save_vectors:
         import numpy as np
-        logger.info(f"Saving vectors to {vectors_file}...")
+        logger.info(f"  Saving vectors to {vectors_file}...")
         t0 = time.time()
         np.save(vectors_file, vectors)
         vsize_mb = vectors_file.stat().st_size / (1024 * 1024)
         logger.info(f"  saved {vectors.shape} ({vsize_mb:.0f} MB) in {time.time() - t0:.0f}s")
 
-    logger.info(f"Saving pids to {pids_file}...")
+    logger.info(f"  Saving pids to {pids_file}...")
     with open(pids_file, "w", encoding="utf-8") as f:
         json.dump(pids, f, ensure_ascii=False)
     logger.info(f"  {len(pids):,} pids saved")
 
-    logger.info("Building FAISS index...")
+    logger.info("[4/5] Building FAISS index and saving to disk...")
     import numpy as np
     import faiss
 
     t0 = time.time()
+    logger.info(f"  Converting to float32 ({vectors.shape[0]:,} × {vectors.shape[1]})...")
     vectors_f32 = vectors.astype(np.float32)
     index = faiss.IndexFlatIP(dim)
     index.add(vectors_f32)
@@ -262,6 +296,7 @@ def main():
 
     del vectors_f32, vectors
 
+    logger.info("[5/5] Done!")
     print()
     print("=" * 60)
     print("  FAISS INDEX BUILD COMPLETE")

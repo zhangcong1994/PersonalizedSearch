@@ -273,53 +273,200 @@ training_plan:
 
   phase2:
     name: "多输入分布对齐"
-    objective: "引入改写 query 和 HyDE 假文本共同训练，消除离线训练（仅原始 query）与线上推理（三种输入）之间的分布偏移"
-    prerequisite: "Phase 1 已完成，baseline 模型可加载"
+    objective: |
+      引入改写 query 和 HyDE 假文本共同训练，消除离线训练（仅原始 query）
+      与线上推理（三种输入）之间的分布偏移。核心设计原则：训练和推理使用
+      **完全同源**的 query 改写和 HyDE 生成——同一个本地模型、
+      同一个 prompt、temperature=0。
+
+    # ── 前置实验证据 ──
+
+    evidence_from_previous_experiments:
+      exp002:
+        rewriting: |
+          E2a-P2（领域 few-shot）是 7 组单查询改写消融中最优方案。
+          Dense R@50=0.6531，比基线 +4.0%。改写 prompt 的核心特征是
+          用 T2Ranking 真实查询做 few-shot，让 LLM 模仿领域内的
+          改写风格（补全术语 + 扩展概念词，但不编造新信息）。
+        hyde: |
+          E2c-H2（HyDE + 原查询 RRF）是全部 16 组实验中最优方案。
+          Dense R@50=0.6819，比基线 +8.6%。HyDE prompt 让 LLM 生成
+          100-150 字百科条目式假答案，包含专业术语和关键概念。
+          原查询 + HyDE RRF 融合 = 精确匹配 + 语义扩展，完美互补。
+      exp003:
+        s4_optimal: |
+          S4（D-B0 + D-P2 + D-HyDE + B-B0）经 18 组消融验证为最优粗排方案。
+          测试集 R@50=0.6912，比基线 +13.5%。**这意味着三种输入（原查询、
+          P2 改写、HyDE 假答案）在 Dense 空间中有互补的召回覆盖**——三路 RRF
+          融合效果远超任何单路。
+        implication_for_phase2: |
+          exp-003 S4 证明了 D-B0、D-P2、D-HyDE 三路互补。但这是
+          **不改模型**的 prompt 工程上限。Phase 2 的假设是：如果把这三类
+          输入都塞进训练数据，让模型在训练时见过改写和 HyDE 的输入分布，
+          那么推理时改写和 HyDE 各路的独立 Recall 应该大幅提升——进而
+          RRF 融合后的上限也会水涨船高。
+
+    # ── Prompt 设计（沿用 exp-002 验证过的最优 prompt）──
+
+    prompts:
+      source: "src/intent/query_rewrite_prompts.py（REGISTRY dict）"
+      rationale: |
+        不重新设计 prompt——直接复用 exp-002 中消融验证过的最优方案。
+        内部 prompt 是模型无关的，切换 LLM 后端（DeepSeek → Qwen3-4B）
+        只需修改 LangChain ChatOpenAI 的 api_key/base_url。
+
+      rewrite_prompt:
+        experiment_id: "E2a-P2（domain few-shot）"
+        registry_key: "E2a-P2"
+        strategy: "single"
+        code_reference: |
+          # 见 scripts/exp002/evaluate_exp002.py L100-110
+          # 调用方式：ChatPromptTemplate.from_messages([
+          #     ("system", system_prompt),
+          #     ("human", "原始: {query}\n改写:"),
+          # ]) | llm
+          # {query} 为训练查询文本
+        prompt_template: |
+          [system] 你是一个搜索查询优化器。用户输入的是真实搜索引擎中的短查询，
+            请将其扩展为更完整、更具体的搜索词，以提高信息检索的召回率。
+            规则：
+            1. 缩写/口语化/省略 → 补全为完整的疑问句或陈述句
+            2. 补充正式术语和同义词，扩展核心概念词
+            3. 一行纯文本，不加引号、编号、解释
+            4. 不编造信息
+            5. **始终输出改写版本**——原查询已单独作为一路检索，
+               改写路必须产生不同的表述才能贡献 RRF 融合增益
+            示例使用 T2Ranking 真实查询（8 条领域 few-shot）：
+            - 为什么脸上老长痘痘 → 面部反复长痘的原因 痤疮成因 皮肤护理方法
+            - 怎么看电脑配置 → 如何查看电脑硬件配置 查看CPU型号内存大小显卡型号方法
+            - ...（完整 8 条示例见 src/intent/query_rewrite_prompts.py:85-111）
+
+          [human] 原始: {query}
+                   改写:
+
+      rewrite_prompt_note: |
+        exp-002 时期这条规则是合理的——当时只有一条改写 query 做检索，
+        对已足够清晰的查询再做改写反而可能引入噪声。但 Phase 2 的推理
+        架构是多路 RRF 融合（exp-003 S4），原查询已有独立的 D-B0 路。
+        改写路如果也输出原查询，两路完全重复，RRF 融合零增益。
+        因此去掉">15字返回原查询"的规则，让改写路始终产出不同表述。
+
+      hyde_prompt:
+        experiment_id: "E2c-H2 / E2c-H1"
+        registry_key: "E2c-H2"
+        strategy: "hyde_rrf"
+        code_reference: |
+          # 见 scripts/exp002/evaluate_exp002.py L102
+          # HyDE 只用 system message（query 嵌入 system prompt 中）：
+          # ChatPromptTemplate.from_messages([("system", system_prompt)]) | llm
+          # {query} 直接注入 system prompt
+        prompt_template: |
+          [system] 你是一个知识渊博的助手。请根据用户的问题，生成一段 100-150 字
+            的回答。不需要保证完全准确，但应包含与该问题相关的关键概念、术语和背景信息。
+            要求：
+            1. 使用正式、信息丰富的语言
+            2. 包含与问题相关的专业术语和关键概念
+            3. 回答长度为 100-150 字
+            4. 就像你在写一个百科全书条目
+
+            用户问题: {query}
+            回答:
+
+    # ── 生成模型（本地部署替代 API）──
+
+    generation_model:
+      model: "Qwen/Qwen2.5-7B-Instruct"  # 或 Qwen/Qwen3-4B（更轻量）
+      deployment: "vLLM（OpenAI-compatible API）"
+      gpu_memory: "~14GB（7B, BF16）或 ~8GB（4B）"
+      batch_size: 32
+      temperature: 0
+      total_inference: "~117K 条（65K 改写 + 52K HyDE），预计 12-16 小时"
+      integration: |
+        复用 exp-002 的 LLM 调用框架（evaluate_exp002.py 的 _ensure_llm_output 函数）：
+        - LangChain ChatOpenAI + ChatPromptTemplate
+        - API key 和 base_url 指向本地 vLLM 服务（http://localhost:8000/v1）
+        - 改写用 2-message chain（system + human），HyDE 用 1-message chain（system only）
+        - 批量推理 + 缓存到 JSONL，避免重复调用
+
+    # ── 质量过滤策略（关键设计决策） ──
+
+    quality_filter_policy:
+      principle: "不过滤语义偏离的输出——线上没有质检员帮你过滤"
+      rationale: |
+        Phase 2 的目标是让模型学会「线上输入分布 → passage 语义空间」的映射。
+        如果训练时只保留"好"的改写/HyDE，模型在线上遇到"差"输入时反而不会处理。
+
+        正确做法：让训练数据包含线上推理时 Qwen3-4B 真实产出的所有输出
+        （仅过滤掉格式错误），这样训练分布 ≡ 推理分布。
+
+      only_filter:
+        - condition: "空输出 / 纯空格 / 纯换行"
+          reason: "模型推理失败，无信息量"
+        - condition: "完全非中文"
+          reason: "M3E-base 是中文模型，非中文输入无意义"
+        - condition: "改写 query 长度 > 100 字"
+          reason: "可能是 hallucination，超出合理 query 长度"
+        - condition: "HyDE 文本长度 < 10 字或 > 1500 字"
+          reason: "过短无信息量，过长超出 embedding 输入窗口"
+
+    # ── 训练数据 ──
+
     training_data:
       query_sources:
         original_query:
           ratio: "55%"
-          source: "T2Ranking queries.train.tsv"
-          mapping: "直接使用 qrels.retrieval.train.tsv 中的标注"
+          source: "T2Ranking queries.train.tsv（258K query）"
+          count: "~410K 训练对（258K × 0.55 × 2.9 avg-pairs/query）"
+          # 2.9 = avg positives per query in training qrels
         rewritten_query:
           ratio: "25%"
-          source: "exp-002 中 D-P2 路线的改写结果（约 2000 条改写 query 的样本可作为种子）"
-          construction: "用 DeepSeek API 对训练集 query 做批量改写（基础改写模板），生成 (rewritten_query, original_positive_pid) 对"
-          quality_filter: "用 LLM Judge 判断改写语义保真度，保留 fidelity > 0.8 的改写"
-          rationale: "对齐 D-P2 推理路线"
+          source: "258K query → P2 prompt → 本地 LLM 改写 → 格式检查"
+          count: "~187K 训练对（258K × 0.25 × 2.9）"
+          reason_for_25pct: |
+            exp-003 中 D-P2 单路 R@50=0.6450 强于 D-B0 的 0.6089，
+            改写信号质量高。但原始 query 仍占线上最大比重（55%）。
+          construction: "vLLM 批量推理 → 格式检查 → 与原始 (qid, pid) 配对"
         hyde_text:
           ratio: "20%"
-          source: "exp-002 中 D-HyDE 路线的 HyDE 结果"
-          construction: "用 DeepSeek API 对训练集 query 生成 HyDE 假答案，生成 (hyde_text, original_positive_pid) 对"
-          quality_filter: "用 HyDE 文本与正样本 passage 的 embedding 相似度过滤（相似度 < 0.5 的丢弃，表明生成的假答案偏得太远）"
-          rationale: "对齐 D-HyDE 推理路线"
-      positives: "所有三种 query 类型共享 T2Ranking qrels 中的正样本标注"
-      negatives: "in-batch negatives（默认）"
+          source: "258K query → H2 prompt → 本地 LLM 生成假答案 → 格式检查"
+          count: "~149K 训练对（258K × 0.2 × 2.9）"
+          reason_for_20pct: |
+            HyDE 假答案长度（100-150 字）远长于 query（5-15 字），
+            信息密度更高但可能引入幻觉。20% 是平衡质量和覆盖的折中。
+          construction: "vLLM 批量推理 → 格式检查 → 与原始 (qid, pid) 配对"
+      positives: "三种 query 类型共享同一个 qrels 正样本集。改写/HyDE 不修改正负标注"
+      negatives: "in-batch negatives（MNRL 自动产生）。改写/HyDE 不引入新的负样本"
+
     instruction_prefix:
       enabled: true
       template: "为这个句子生成表示以用于检索相关文章："
-      note: "BGE/M3E 家族支持 instruction 前缀。训练和推理时 query 侧统一加此前缀，passage 侧不加。让模型知道「不管输入什么形式，目标都是用来做检索」"
-    model_options:
-      option_a:
-        base: "moka-ai/m3e-base（延续 Phase 1）"
-        advantage: "模型不变，纯粹的数据增强效果评估"
-      option_b:
-        base: "BAAI/bge-m3"
-        advantage: "参数更大、上限更高。用我们自己的数据微调后覆盖原有污染。支持 dense+sparse 混合"
-        risk: "训练时间更长，显存压力更大"
+      note: |
+        Query 侧统一加前缀（原始/改写/HyDE 都加），passage 侧不加。
+
+    base_model: "moka-ai/m3e-base（延续 Phase 1 基座）"
+
     hyperparameters:
-      epochs: 2  # 数据增强阶段 epoch 数可略少，因为已在 Phase 1 基座上微调
-      learning_rate: 1e-5  # 更小 LR，防止灾难性遗忘
+      epochs: 2
+      learning_rate: 1e-5
+
     expected_outcome:
-      phase2_vs_phase1:
-        original_query: "Recall 持平或小幅提升（因为增加了同分布数据）"
-        rewritten_query: "改写 query 的 Recall 应显著提升——这是 Phase 2 的核心目标"
-        hyde_text: "HyDE 假文本的 Recall 应大幅提升——段落式输入不再被模型「误解」"
-      optimization_path: "Phase 2 完成后，可叠加 Phase 3.2 的 Dynamic Dense Hard Negative Mining，在数据增强的基础上进一步压榨上限"
+      exp003_baseline: |
+        V0 不改模型的 S4（D-B0 + D-P2 + D-HyDE + B-B0）已在测试集上
+        达到 R@50=0.6912。但每路独立 R@50 仍有巨大差距：
+        D-P2=0.6450 vs D-HyDE=0.6087，差了 3.6%。
+      phase2_hypothesis: |
+        训练后，改写 query 和 HyDE 文本的独立 R@50 应接近或持平原始 query。
+        三条 Dense 路各自提升后，RRF 融合的 R@50 有望突破 0.72。
+        original_query 可能因数据量增加（745K vs 原来 744K）而小幅提升。
+      key_metric: "Phase 2 特征：改写 query 和 HyDE 文本的独立 R@50 ≈ 原始 query 的独立 R@50"
+
     deliverable:
-      - "训练脚本 scripts/train_embedding_phase2.py"
-      - "改写 query + HyDE 生成脚本 scripts/generate_training_augmentations.py"
-      - "微调后的模型 model_path: models/m3e-base-t2ranking-phase2"
+      - "Prompt 代码: src/intent/query_rewrite_prompts.py（已存在，复用 E2a-P2 / E2c-H2）"
+      - "改写生成脚本: scripts/exp007/generate_rewritten_queries.py"
+      - "HyDE 生成脚本: scripts/exp007/generate_hyde_texts.py"
+      - "数据合并脚本: scripts/exp007/merge_training_data_phase2.py"
+      - "训练脚本: scripts/exp007/train_embedding_phase2.py"
+      - "微调后的模型: models/m3e-base-t2ranking-phase2"
 
   # ─────────────────────────────────────────────────────────
   # Phase 3：高级训练策略（可选，追求极致上限）

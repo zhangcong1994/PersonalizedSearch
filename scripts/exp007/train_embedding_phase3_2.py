@@ -713,7 +713,7 @@ def main():
 
         # ── LoRA: add fresh adapter to prevent catastrophic forgetting ──
         if use_lora:
-            from peft import LoraConfig, TaskType
+            from peft import LoraConfig, TaskType, get_peft_model
 
             peft_config = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
@@ -723,7 +723,13 @@ def main():
                 lora_dropout=LORA_DROPOUT,
                 target_modules=LORA_TARGET_MODULES,
             )
-            model.add_adapter(peft_config)
+            if hasattr(model, "add_adapter"):
+                model.add_adapter(peft_config)
+            else:
+                transformer = model[0]
+                transformer.auto_model = get_peft_model(
+                    transformer.auto_model, peft_config,
+                )
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in model.parameters())
             logger.info(f"LoRA adapter added: {trainable:,}/{total:,} params trainable ({trainable/total*100:.1f}%)")
@@ -841,7 +847,12 @@ def main():
 
         # ── Merge LoRA into full weights & save for evaluation/mining ──
         if use_lora:
-            merged_model = model.merge_and_unload()
+            if hasattr(model, "merge_and_unload"):
+                merged_model = model.merge_and_unload()
+            else:
+                merged = model[0].auto_model.merge_and_unload()
+                model[0].auto_model = merged
+                merged_model = model
             merged_dir = output_dir / "merged"
             merged_model.save(str(merged_dir))
             adapter_size = sum(

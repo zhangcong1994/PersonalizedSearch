@@ -219,6 +219,7 @@ def encode_batched(model, texts: list[str], batch_size: int = ENCODE_BATCH_SIZE)
 
 
 def _load_model_for_mining(model_path: str, device: str, fp16: bool = False):
+    from sentence_transformers import SentenceTransformer
     model = SentenceTransformer(model_path, device=device)
     if fp16:
         model.half()

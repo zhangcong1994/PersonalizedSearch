@@ -44,6 +44,8 @@ import logging
 import random
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.config import (
@@ -90,8 +92,8 @@ MARGIN_LATER = 0.03
 DENSE_SEARCH_TOP_K = 50
 NUM_HARD_NEGS_PER_QUERY = 5
 HARD_NEG_SKIP_TOP = 10
-ENCODE_BATCH_SIZE = 1024
-ENCODE_BATCH_SIZE_FP16 = 4096  # FP16 halves memory, can 4x batch size
+ENCODE_BATCH_SIZE = 256
+ENCODE_BATCH_SIZE_FP16 = 1024  # FP16 halves memory, can 4x batch size
 
 # LoRA: 只训练 ~1.2% 参数，防止灾难性遗忘
 # target_modules: BERT-base 的 attention 投影矩阵
@@ -686,6 +688,7 @@ def main():
                 save_triplets_jsonl(triplets, hard_neg_file)
 
             del model
+            torch.cuda.empty_cache()
             continue
 
         # ── Epochs 1-3: Train with previous epoch's hard negatives → Save → Mine for next ──
@@ -854,6 +857,11 @@ def main():
 
         # Update current model path for next iteration
         current_model_path = str(merged_dir)
+
+        # Free training model GPU memory before loading mining model
+        del model
+        del merged_model
+        torch.cuda.empty_cache()
 
         # Mine hard negatives for the NEXT epoch (if not the final epoch)
         if epoch < args.epochs:

@@ -170,6 +170,9 @@ def load_faiss_index(model_id_or_path: str, index_dir: str, device: str):
     model_path = _resolve_model_path(model_id_or_path)
     logger.info(f"Loading embedding model: {model_path}")
     model = SentenceTransformer(model_path, device=device)
+    if device != "cpu":
+        model.half()
+        logger.info("  Model converted to FP16")
 
     logger.info(f"Loading pids from {pids_file}...")
     with open(pids_file, "r", encoding="utf-8") as f:

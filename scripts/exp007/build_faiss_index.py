@@ -147,10 +147,10 @@ def encode_all_passages(
     all_vectors: list[np.ndarray] = []
     total = len(texts)
     num_batches = (total + batch_size - 1) // batch_size
+    log_every_n_batches = max(1, min(30, 30_000 // batch_size))
 
     logger.info(f"Encoding {total:,} passages ({num_batches:,} batches × {batch_size})...")
     t_start = time.time()
-    last_log = 0
 
     for i, batch_start in enumerate(range(0, total, batch_size)):
         batch = texts[batch_start:batch_start + batch_size]
@@ -164,7 +164,13 @@ def encode_all_passages(
         all_vectors.append(vecs)
 
         n_done = batch_start + len(batch)
-        if i == 0 or n_done - last_log >= 200_000 or batch_start + len(batch) >= total:
+        is_final = n_done >= total
+        should_log = (
+            (i + 1) % log_every_n_batches == 0
+            or is_final
+            or (i == 0 and num_batches > log_every_n_batches)
+        )
+        if should_log:
             elapsed = time.time() - t_start
             speed = n_done / elapsed if elapsed > 0 else 0
             remaining = (total - n_done) / speed if speed > 0 else 0
@@ -174,7 +180,6 @@ def encode_all_passages(
                 f"{n_done:>10,}/{total:,} ({pct:.0f}%) | "
                 f"~{remaining:.0f}s remaining | {speed:,.0f} docs/s"
             )
-            last_log = n_done
 
     result = np.concatenate(all_vectors, axis=0)
     elapsed = time.time() - t_start
@@ -214,11 +219,21 @@ def main():
         "--no-save-vectors", action="store_true",
         help="Skip saving vectors.npy (saves ~7GB disk space)"
     )
+    parser.add_argument(
+        "--fp16", action="store_true", default=True,
+        help="Use FP16 inference for ~2x speedup (default: on)"
+    )
+    parser.add_argument(
+        "--no-fp16", action="store_true",
+        help="Disable FP16, use full FP32 precision"
+    )
     args = parser.parse_args()
 
     if args.offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    use_fp16 = args.fp16 and not args.no_fp16
 
     index_dir = INDEX_BASE_DIR / model_short_name(args.model)
     model_path = resolve_model_path(args.model)
@@ -246,12 +261,16 @@ def main():
     logger.info(f"  Encode batch:   {args.encode_batch_size:,}")
     logger.info(f"  Max passages:   {args.max_passages if args.max_passages > 0 else 'all (~2.3M)'}")
     logger.info(f"  Save vectors:   {not args.no_save_vectors}")
+    logger.info(f"  FP16:           {use_fp16}")
     logger.info("-" * 60)
 
     logger.info("[1/5] Loading embedding model...")
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(model_path, device=args.device)
+    if use_fp16 and args.device != "cpu":
+        model.half()
+        logger.info("  Model converted to FP16 (half precision)")
     dim = model.get_sentence_embedding_dimension()
     logger.info(f"  Embedding dim: {dim}")
 

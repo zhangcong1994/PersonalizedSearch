@@ -6,7 +6,7 @@ meta:
   experiment_id: exp-007
   phase: "V1"
   objective: "在 T2Ranking 训练集上微调 Embedding 模型，提升 Dense 检索在中文 passage 场景下的召回能力。分三阶段渐进式推进，从简单基线到完整多输入对齐"
-  status: "in_progress (Phase 1 complete, Phase 3.1 abandoned, Phase 3.2 next)"
+  status: "in_progress (Phase 1 complete, Phase 3.1 abandoned, Phase 3.2 active, Phase 2 planning)"
   target_platform: "AutoDL (RTX 4090 24GB)"
   prerequisite: "下载 T2Ranking 训练集文件（queries.train.tsv + qrels.retrieval.train.tsv）"
   design_principle: "数据驱动·渐进式·分布对齐——先跑通最简管线验证提升，再逐步引入改写/HyDE 数据对齐线上推理分布，最后用高级 Loss 和 Hard Negative 压榨上限"
@@ -86,7 +86,7 @@ model_selection:
     option_b:
       model: "moka-ai/m3e-base"
       dim: 768
-      rationale: "延续 Phase 1 基座，仅做数据增强。如果 Phase 1 效果已足够，可跳过 Phase 2 的模型切换"
+      rationale: "不切换模型（继续用 m3e-base），仅做数据增强。Phase 1 已证明 m3e-base 在 T2Ranking 上是干净基座，且与 Phase 1 同模型便于 controlled comparison"
 
 
 # =============================================================================
@@ -438,16 +438,55 @@ training_plan:
       negatives: "in-batch negatives（MNRL 自动产生）。改写/HyDE 不引入新的负样本"
 
     instruction_prefix:
-      enabled: true
+      enabled: false
       template: "为这个句子生成表示以用于检索相关文章："
       note: |
-        Query 侧统一加前缀（原始/改写/HyDE 都加），passage 侧不加。
+        故意**不启用**。Phase 2 的核心问题是「多输入分布对齐是否有效」，
+        instruction 前缀不回答这个问题，反而引入额外变量污染归因。
+        如果 Phase 2 baseline 效果不够，可在后续消融中单独测试 instruction 前缀的增益。
+        （BGE/M3E 家族对 instruction 敏感，预期单独加前缀可提升 1-3% Recall。）
 
-    base_model: "moka-ai/m3e-base（延续 Phase 1 基座）"
+    base_model: "moka-ai/m3e-base（从 pretrained 权重起步，不用 Phase 1 checkpoint）"
+
+    design_decisions:
+      start_from_pretrained: |
+        从 pretrained m3e-base 起步，不使用 Phase 1 checkpoint。理由：
+        1. Phase 2 引入了 45% 的 LLM 生成文本——数据分布变化大
+        2. Phase 1 模型已在 MNRL 3 epoch 收敛，新数据注入大概率过拟合退化
+           （Phase 3.1 实证：同一份数据继续训练 → -1.5%）
+        3. 从 pretrained 起步，新旧数据在初始化阶段就一起训练，
+           模型从零建立三种输入的联合表示
+        Phase 1 的 pretrained→finetuned 对比证明了从零开始 3 epoch 的有效性，
+        Phase 2 沿用同一范式。
+      no_lora: |
+        不使用 LoRA。理由：
+        1. Phase 3.2 用 LoRA 是因为起点是已收敛模型、hard negatives 激进、
+           需要防灾难性遗忘。Phase 2 从 pretrained 起步，无此风险
+        2. LoRA 只训练 ~1.2% 参数，不足以让模型从零学习 T2Ranking 领域 +
+           三种输入分布的联合表示
+        3. LoRA 在 sentence-transformers 中不显著省显存（前向/反向仍要过全量模型）
+        4. Phase 1 全量微调已验证有效（+16.5% Recall）
+      single_sample_per_query: |
+        每个 query 在所有 epoch 中只以**一种**输入形式出现（55% 原始 / 25% 改写 /
+        20% HyDE）。不做 epoch 间重新采样。
+        如果需要模型显式学习「同一 query 的多种表述应映射到相同 passage」，
+        可在 Phase 2 后续消融中引入 per-epoch re-sampling（零额外 LLM 成本）。
+      m3e_only: |
+        不切换到 BGE-M3。原因：
+        1. BGE-M3 在 C-MTP 训练时见过 T2Ranking 原始 query-passage 对（数据污染）
+        2. 虽然我们生成的改写/HyDE 文本不在其训练集中，但原始 query 占比 55%，
+           无法完全排除污染对评估的干扰
+        3. 与 Phase 1 同模型（m3e-base），便于 controlled comparison
 
     hyperparameters:
-      epochs: 2
+      epochs: 3
       learning_rate: 1e-5
+      warmup_ratio: 0.1
+      optimizer: "AdamW"
+      scheduler: "cosine"
+      batch_size: 64
+      fp16: true
+      note: "lr=1e-5（Phase 1 的一半）补偿 LLM 生成文本的噪声；epochs=3（原计划 2）补偿 lr 减半的影响，使总学习量 ≈ Phase 1 的 1.5 epoch 等效量"
 
     expected_outcome:
       exp003_baseline: |
@@ -462,8 +501,7 @@ training_plan:
 
     deliverable:
       - "Prompt 代码: src/intent/query_rewrite_prompts.py（已存在，复用 E2a-P2 / E2c-H2）"
-      - "改写生成脚本: scripts/exp007/generate_rewritten_queries.py"
-      - "HyDE 生成脚本: scripts/exp007/generate_hyde_texts.py"
+      - "改写 + HyDE 生成脚本: scripts/exp007/generate_training_augmentations.py（已存在，--task rewrite/hyde/both 切换）"
       - "数据合并脚本: scripts/exp007/merge_training_data_phase2.py"
       - "训练脚本: scripts/exp007/train_embedding_phase2.py"
       - "微调后的模型: models/m3e-base-t2ranking-phase2"
@@ -722,6 +760,9 @@ evaluation:
       - "训练 query 数量对效果的影响：10% / 30% / 100% 训练集"
       - "正样本数量与质量：只用 label=3 的强正样本 vs 全部 label>0"
       - "batch size 影响：bs=32 vs 64 vs 96"
+    phase2_specific:
+      - "instruction 前缀消融：Phase 2 模型 + prefix vs 不加。BGE/M3E 对 instruction 敏感，预期 +1~3% Recall。先跑出 Phase 2 baseline 再测此项"
+      - "epoch 间重新采样 55/25/20 vs 固定分配。验证模型是否从 '同一 query 的多种表述' 中获益"
 
 
 # =============================================================================
@@ -732,42 +773,73 @@ implementation:
 
   step1_data_download:
     description: "下载 T2Ranking 训练集文件到本机/服务器"
-    command: "python scripts/download_t2ranking.py --files queries.train.tsv qrels.retrieval.train.tsv"
     files:
       - "queries.train.tsv (258,042 条, ~15MB)"
       - "qrels.retrieval.train.tsv (744,663 条, ~9MB)"
     total_size: "~25MB"
-    status: "pending"
+    status: "done"
 
   step2_build_training_data:
     description: "将原始 TSV 文件转换为 sentence-transformers 训练格式"
-    script: "scripts/prepare_embedding_training_data.py"
-    output: "data/processed/embedding_train_phase1.jsonl"
+    script: "scripts/exp007/prepare_training_data.py"
+    output: "data/processed/embedding_train_phase1.jsonl（744K query-positive 对）"
     format: "每行 {'query': str, 'positive': str}"
-    status: "pending"
+    status: "done"
 
   step3_train_phase1:
-    description: "Phase 1 原始 Query 基线微调"
-    script: "scripts/train_embedding_phase1.py"
-    gpu_time_estimate: "~2-3 小时（258K query × 3 epochs, bs=64, RTX 4090）"
-    status: "pending"
+    description: "Phase 1 原始 Query 基线微调（M3E-base + MNRL）"
+    script: "scripts/exp007/train_embedding_phase1.py"
+    gpu_time_estimate: "~2-3 小时（744K pairs × 3 epochs, bs=64, RTX 5090）"
+    actual_result: "Recall@10=0.4539 (+16.5%), Recall@50=0.7003"
+    output: "models/m3e-base-t2ranking-phase1/"
+    status: "done"
 
   step4_evaluate_phase1:
     description: "在 T2Ranking dev 集上评估 Phase 1 模型"
-    script: "scripts/evaluate_embedding.py"
+    script: "scripts/exp007/evaluate_embedding.py"
+    status: "done"
+
+  step5_train_phase3_1:
+    description: "Phase 3.1 CachedMNRL 继续训练（从 Phase 1 checkpoint 起步）"
+    script: "scripts/exp007/train_embedding_phase3_1.py"
+    actual_result: "全指标退化 -1.5%，已废弃"
+    output: "models/m3e-base-t2ranking-phase3-1/（废弃）"
+    status: "done (abandoned)"
+
+  step6_train_phase3_2:
+    description: "Phase 3.2 Dynamic Dense Hard Negative Mining + TripletLoss + LoRA"
+    script: "scripts/exp007/train_embedding_phase3_2.py"
+    output: "models/m3e-base-t2ranking-phase3-2/"
+    status: "active"
+
+  step7_generate_augmentations:
+    description: "Phase 2 前置：生成改写 query 和 HyDE 文本（需 vLLM 本地部署）"
+    script: "scripts/exp007/generate_training_augmentations.py"
+    llm_estimate: "258K × 2 任务 ≈ 516K 次 vLLM 推理，Qwen3-4B 预估 3-4 小时"
+    output:
+      - "data/processed/exp007_rewritten_queries.jsonl"
+      - "data/processed/exp007_hyde_answers.jsonl"
     status: "pending"
 
-  step5_train_phase2:
-    description: "Phase 2 多输入数据增强（需先生成改写 query 和 HyDE 数据）"
-    prerequisite: "Phase 1 验证通过 + 改写/HyDE 数据生成完毕"
-    script: "scripts/train_embedding_phase2.py"
+  step8_merge_phase2_data:
+    description: "合并 Phase 2 训练数据（原始 55% + 改写 25% + HyDE 20%）"
+    script: "scripts/exp007/merge_training_data_phase2.py"
+    output: "data/processed/embedding_train_phase2.jsonl"
+    status: "ready"
+
+  step9_train_phase2:
+    description: "Phase 2 多输入分布对齐训练（M3E-base pretrained 起步 + MNRL）"
+    script: "scripts/exp007/train_embedding_phase2.py"
+    gpu_time_estimate: "~2-3 小时（746K pairs × 3 epochs, bs=64）"
+    output: "models/m3e-base-t2ranking-phase2/"
     status: "pending"
 
-  step6_evaluate_phase2:
-    description: "评估 Phase 2 模型在三种 query 类型上的 Recall"
+  step10_evaluate_phase2:
+    description: "在 T2Ranking dev 集上评估 Phase 2 模型（三种 query 类型）"
+    script: "scripts/exp007/evaluate_embedding.py"
     status: "pending"
 
-  step7_full_pipeline_eval:
+  step11_full_pipeline_eval:
     description: "用最优模型替换 exp-003 中的 Dense 路由，跑全链路评估"
     status: "pending"
 

@@ -14,7 +14,9 @@ import sys
 import json
 import time
 import logging
+import threading
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -110,7 +112,8 @@ def judge_single_batch(
 
     for attempt in range(MAX_RETRIES):
         try:
-            raw_response = client.generate(full_prompt)
+            result = client.generate_with_reasoning(full_prompt)
+            raw_response = result["content"]
             parsed = parse_judge_response(raw_response)
 
             if parsed is None:
@@ -122,7 +125,11 @@ def judge_single_batch(
                     time.sleep(RETRY_DELAY_BASE ** (attempt + 1))
                 continue
 
-            return {"scores": parsed, "raw_response": raw_response}
+            return {
+                "scores": parsed,
+                "raw_response": raw_response,
+                "reasoning_content": result["reasoning_content"],
+            }
 
         except Exception as e:
             logger.warning(f"Batch{batch} API error (attempt {attempt + 1}): {e}")
@@ -147,7 +154,9 @@ def judge_both_batches(
             "scores": {all 6 dims merged},
             "aggregation": aggregate_core6_scores result,
             "batch1_raw": "...",
+            "batch1_reasoning": "...",
             "batch2_raw": "...",
+            "batch2_reasoning": "...",
             "error": bool,
         }
     """
@@ -171,8 +180,66 @@ def judge_both_batches(
         "scores": all_scores,
         "aggregation": aggregation,
         "batch1_raw": result1.get("raw_response", ""),
+        "batch1_reasoning": result1.get("reasoning_content", ""),
         "batch2_raw": result2.get("raw_response", ""),
+        "batch2_reasoning": result2.get("reasoning_content", ""),
         "error": False,
+    }
+
+
+def _judge_one_query(
+    gen: dict,
+    judge_model: str,
+    judge_api_key: str | None,
+    stagger_delay: float = 0.5,
+) -> dict | None:
+    """对单条 query 执行双批评分，创建独立的 client 实例。"""
+    import time as _time
+    import random as _random
+
+    if stagger_delay > 0:
+        _time.sleep(_random.uniform(0, stagger_delay))
+
+    config = JUDGE_MODEL_CONFIGS.get(judge_model)
+    if config is None:
+        config = JUDGE_MODEL_CONFIGS["deepseek-chat"]
+
+    client = APIClientFactory.create(
+        config["client_type"],
+        api_key=judge_api_key or os.getenv(config["env_key"]),
+        model=judge_model,
+        max_tokens=config["max_tokens"],
+        temperature=config["temperature"],
+        thinking=config["thinking"],
+    )
+
+    qid = gen.get("query_id", "")
+    query_text = gen.get("query_text", gen.get("query", ""))
+    passages = gen.get("passages", gen.get("context_docs", []))
+    if isinstance(passages, list) and passages and not isinstance(passages[0], dict):
+        passages = [
+            {"pid": f"doc-{j}", "text": str(p), "rank": j + 1}
+            for j, p in enumerate(passages)
+        ]
+    answer = gen.get("answer", "")
+    model_name = gen.get("model_id", gen.get("model", "unknown"))
+
+    judge_result = judge_both_batches(client, query_text, passages, answer)
+
+    if judge_result["error"]:
+        return None
+
+    return {
+        "query_id": qid,
+        "query_text": query_text,
+        "model": model_name,
+        "judge_model": judge_model,
+        "scores": judge_result.get("scores", {}),
+        "aggregation": judge_result.get("aggregation", {}),
+        "batch1_raw": judge_result.get("batch1_raw", ""),
+        "batch1_reasoning": judge_result.get("batch1_reasoning", ""),
+        "batch2_raw": judge_result.get("batch2_raw", ""),
+        "batch2_reasoning": judge_result.get("batch2_reasoning", ""),
     }
 
 
@@ -184,6 +251,8 @@ def run_judge(
     start_idx: int = 0,
     max_queries: int = 0,
     force: bool = False,
+    concurrency: int = 3,
+    stagger_delay: float = 0.5,
 ):
     generations = load_generations(generations_file)
     total = len(generations)
@@ -201,85 +270,57 @@ def run_judge(
                 if not line:
                     continue
                 r = json.loads(line)
-                qid = r.get("query_id", "")
-                existing_results[qid] = r
+                ignore = r  # suppress unused warning
+                existing_results[r.get("query_id", "")] = r
 
-    config = JUDGE_MODEL_CONFIGS.get(judge_model)
-    if config is None:
-        logger.warning(
-            f"Unknown judge model '{judge_model}', falling back to deepseek-chat defaults. "
-            f"Known models: {list(JUDGE_MODEL_CONFIGS.keys())}"
-        )
-        config = JUDGE_MODEL_CONFIGS["deepseek-chat"]
-
-    client = APIClientFactory.create(
-        config["client_type"],
-        api_key=judge_api_key or os.getenv(config["env_key"]),
-        model=judge_model,
-        max_tokens=config["max_tokens"],
-        temperature=config["temperature"],
-        thinking=config["thinking"],
-    )
-
-    processed = 0
+    pending = []
     skipped = 0
-    failed = 0
+    for i, gen in enumerate(generations):
+        qid = gen.get("query_id", f"unknown-{i}")
+        if qid in existing_results:
+            skipped += 1
+            continue
+        pending.append(gen)
+
+    if not pending:
+        logger.info("All queries already cached, nothing to do.")
+        return
 
     logger.info(
-        f"Starting 2-batch judge: {len(generations)} queries, "
-        f"judge={judge_model}, 2 calls/query → ~{len(generations) * 2} calls"
+        f"Starting 2-batch judge: {len(pending)} pending queries, "
+        f"judge={judge_model}, concurrency={concurrency}, stagger={stagger_delay}s, "
+        f"2 calls/query → ~{len(pending) * 2} calls (skipped {skipped} cached)"
     )
 
     os.makedirs(output_file.parent, exist_ok=True)
 
+    lock = threading.Lock()
+    processed = 0
+    failed = 0
+
     with open(output_file, "a", encoding="utf-8") as out_f:
-        for i, gen in enumerate(generations):
-            qid = gen.get("query_id", f"unknown-{i}")
-            query_text = gen.get("query_text", gen.get("query", ""))
-
-            if qid in existing_results:
-                skipped += 1
-                if skipped % 50 == 0:
-                    logger.info(f"  Skipped {skipped} cached results so far...")
-                continue
-
-            passages = gen.get("passages", gen.get("context_docs", []))
-            if isinstance(passages, list) and passages and not isinstance(passages[0], dict):
-                passages = [
-                    {"pid": f"doc-{j}", "text": str(p), "rank": j + 1}
-                    for j, p in enumerate(passages)
-                ]
-
-            answer = gen.get("answer", "")
-            model_name = gen.get("model_id", gen.get("model", "unknown"))
-
-            judge_result = judge_both_batches(
-                client, query_text, passages, answer,
-            )
-
-            if judge_result["error"]:
-                failed += 1
-
-            output = {
-                "query_id": qid,
-                "query_text": query_text,
-                "model": model_name,
-                "judge_model": judge_model,
-                "scores": judge_result.get("scores", {}),
-                "aggregation": judge_result.get("aggregation", {}),
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(_judge_one_query, gen, judge_model, judge_api_key, stagger_delay): gen
+                for gen in pending
             }
 
-            out_f.write(json.dumps(output, ensure_ascii=False) + "\n")
-            out_f.flush()
-
-            processed += 1
-            if processed % 5 == 0:
-                logger.info(
-                    f"  Processed {processed}/{len(generations)} "
-                    f"(skipped {skipped}, failed {failed})"
-                )
-            if processed % 25 == 0:
-                _print_progress_summary(output_file)
+            for future in as_completed(futures):
+                result = future.result()
+                with lock:
+                    if result is None:
+                        failed += 1
+                    else:
+                        out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        out_f.flush()
+                    processed += 1
+                    if processed % 10 == 0:
+                        logger.info(
+                            f"  Processed {processed}/{len(pending)} "
+                            f"(skipped {skipped}, failed {failed})"
+                        )
+                    if processed % 25 == 0:
+                        _print_progress_summary(output_file)
 
     logger.info(
         f"Judge complete: {processed} processed, "
@@ -368,6 +409,14 @@ if __name__ == "__main__":
         "--force", action="store_true",
         help="强制重新评估（忽略已有缓存）",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=3,
+        help="并发请求数（每个 worker 独立创建 client）",
+    )
+    parser.add_argument(
+        "--stagger-delay", type=float, default=0.5,
+        help="并发请求的随机错峰延迟上限（秒），避免触发 API 限流",
+    )
 
     args = parser.parse_args()
 
@@ -389,4 +438,6 @@ if __name__ == "__main__":
         start_idx=args.start,
         max_queries=args.max,
         force=args.force,
+        concurrency=args.concurrency,
+        stagger_delay=args.stagger_delay,
     )

@@ -2,17 +2,14 @@
 Exp-005 双 Judge 校准脚本。
 
 工作流程：
-  1. 从 exp-004 精排结果中采样 qid >= 2000 的查询（避开 exp-001~004 已用数据）
-  2. 拆分为人类校准集（默认 50 条）+ 双 Judge 验证集（默认 100 条）
-  3. 使用参考模型生成答案（deepseek-chat）
-  4. 双 Judge 评分：Judge A (deepseek-reasoner, thinking) + Judge B (glm-4.7, thinking)
-  5. 计算 Judge-Judge 一致性 + Judge-Human 一致性（人工标注后）
-  6. 生成人类标注 CSV 模板
+  1. 从已有答案文件中采样，拆分为人类校准集 + 双 Judge 验证集
+  2. 双 Judge 评分：Judge A (deepseek-reasoner, thinking) + Judge B (glm-4.7, thinking)
+  3. 计算 Judge-Judge 一致性 + Judge-Human 一致性（人工标注后）
+  4. 生成人类标注 CSV 模板
 
 输出目录结构:
   {results_dir}/exp005/calibration/
-    sampled_manifest.json       # 采样清单（所有 sampled qid, 标注角色）
-    answers.jsonl               # 生成的答案
+    sampled_manifest.json       # 采样清单（校准/验证集 qid）
     judge_a_scores.jsonl        # Judge A 评分结果
     judge_b_scores.jsonl        # Judge B 评分结果
     judge_agreement_report.json # Judge-Judge 一致性报告
@@ -20,7 +17,7 @@ Exp-005 双 Judge 校准脚本。
 
 用法:
   python scripts/exp005/dual_judge_calibration.py \
-    --reranker-file {exp004_reranker_results.jsonl} \
+    --answers-file {已有生成结果的.jsonl} \
     --calibration-size 50 \
     --verification-size 100 \
     --judge-a deepseek-reasoner \
@@ -28,7 +25,7 @@ Exp-005 双 Judge 校准脚本。
     --seed 42
 
   # 仅执行某个步骤
-  python scripts/exp005/dual_judge_calibration.py ... --skip-sample --skip-generate
+  python scripts/exp005/dual_judge_calibration.py ... --skip-sample --skip-judge
 """
 
 import os
@@ -38,7 +35,9 @@ import csv
 import time
 import random
 import logging
+import threading
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 from collections import Counter
@@ -49,7 +48,6 @@ load_dotenv()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.intent.api_client import APIClientFactory
-from src.generation.prompts import PromptManager, get_default_prompts
 from src.evaluation.judge_prompts import (
     get_batch_system_prompt,
     build_gen_stage_judge_input,
@@ -71,7 +69,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = DATA_ROOT / "results" / "exp005" / "calibration"
-QID_EXCLUSION_CUTOFF = 2000
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 
@@ -114,206 +111,56 @@ def classify_query(query_text: str) -> str:
 # ===========================================================================
 
 def sample_queries(
-    reranker_file: Path,
+    answers_file: Path,
     calibration_size: int = 50,
     verification_size: int = 100,
     seed: int = 42,
 ) -> dict:
     """
-    从 exp-004 精排结果中采样查询。
-
-    过滤条件:
-      - qid >= QID_EXCLUSION_CUTOFF (2000)，避开 exp-001~004 已反复使用的数据
-
-    采样策略:
-      - 先按 query_type 分层
-      - 每层按比例分配到 calibration 和 verification 两个集合
-      - 不够的层全取，多的层随机采样
+    从已有答案文件中简单随机采样，拆分为校准集和验证集。
 
     Returns:
         {
-            "calibration": [{"qid": str, "query_text": str, "passages": [...], "type": str}, ...],
+            "calibration": [{"qid": str, "query_text": str, "type": str}, ...],
             "verification": [...],
             "all_qids": [str, ...],
         }
     """
-    logger.info(f"Loading reranker results from {reranker_file}")
-    with open(reranker_file, "r", encoding="utf-8") as f:
-        reranker_data = [json.loads(line) for line in f if line.strip()]
-    logger.info(f"Loaded {len(reranker_data)} reranker results")
+    logger.info(f"Loading answers from {answers_file}")
+    answers = load_generations(answers_file)
+    logger.info(f"Loaded {len(answers)} answers")
 
-    eligible = []
-    excluded_count = 0
-    for item in reranker_data:
-        qid_str = str(item.get("qid", item.get("query_id", "")))
-        if not qid_str:
+    entries = []
+    for item in answers:
+        qid = item.get("query_id", "")
+        if not qid:
             continue
-        qid_int = int(qid_str)
-        if qid_int < QID_EXCLUSION_CUTOFF:
-            excluded_count += 1
-            continue
-
-        query_text = item.get("query", item.get("query_text", ""))
-        passages = item.get("retrievals", item.get("passages", []))
-        if isinstance(passages, dict):
-            passages = list(passages.values())[0] if passages else []
-
-        if not query_text or not passages:
-            continue
-
-        qtype = classify_query(query_text)
-        eligible.append({
-            "qid": qid_str,
-            "query_text": query_text,
-            "passages": passages,
-            "type": qtype,
+        entries.append({
+            "qid": qid,
+            "query_text": item.get("query_text", item.get("query", "")),
+            "type": item.get("query_type", classify_query(item.get("query_text", item.get("query", "")))),
         })
 
-    logger.info(
-        f"qid >= {QID_EXCLUSION_CUTOFF}: {len(eligible)} eligible "
-        f"(excluded {excluded_count} with qid < {QID_EXCLUSION_CUTOFF})"
-    )
-
-    by_type = {}
-    for item in eligible:
-        t = item["type"]
-        if t not in by_type:
-            by_type[t] = []
-        by_type[t].append(item)
-
-    logger.info("Eligible queries by type:")
-    for t, items in sorted(by_type.items()):
-        logger.info(f"  {t}: {len(items)}")
-
     total_needed = calibration_size + verification_size
-    total_eligible = len(eligible)
-    actual_total = min(total_needed, total_eligible)
-
-    num_types = len(by_type)
-    if num_types == 0:
-        logger.error("No eligible queries found!")
-        return {"calibration": [], "verification": [], "all_qids": []}
-
-    per_type_target = max(1, actual_total // num_types)
-    cal_ratio = calibration_size / max(total_needed, 1)
+    if len(entries) < total_needed:
+        logger.warning(f"Only {len(entries)} answers, need {total_needed}. Using all.")
+        total_needed = len(entries)
+        calibration_size = min(calibration_size, total_needed)
 
     random.seed(seed)
-    calibration = []
-    verification = []
+    sampled = random.sample(entries, total_needed)
 
-    for t, items in sorted(by_type.items()):
-        random.shuffle(items)
-        take = min(len(items), per_type_target)
-        selected = items[:take]
-        cal_n = max(1, int(len(selected) * cal_ratio))
-        cal_n = min(cal_n, len(selected))
-        calibration.extend(selected[:cal_n])
-        verification.extend(selected[cal_n:])
+    calibration = sampled[:calibration_size]
+    verification = sampled[calibration_size:]
 
-    random.shuffle(calibration)
-    random.shuffle(verification)
-    calibration = calibration[:calibration_size]
-    verification = verification[:verification_size]
-
-    all_qids = [item["qid"] for item in calibration] + [item["qid"] for item in verification]
+    all_qids = [item["qid"] for item in sampled]
 
     logger.info(
         f"Sampled: calibration={len(calibration)}, "
         f"verification={len(verification)}, total={len(calibration) + len(verification)}"
     )
 
-    cal_types = Counter(item["type"] for item in calibration)
-    ver_types = Counter(item["type"] for item in verification)
-    logger.info(f"Calibration type distribution: {dict(cal_types)}")
-    logger.info(f"Verification type distribution: {dict(ver_types)}")
-
     return {"calibration": calibration, "verification": verification, "all_qids": all_qids}
-
-
-# ===========================================================================
-# Step 2: 答案生成
-# ===========================================================================
-
-def generate_answers(
-    queries: list[dict],
-    output_file: Path,
-    generation_model: str = "deepseek-chat",
-    force: bool = False,
-):
-    """为采样查询生成答案（使用参考模型）。"""
-    if output_file.exists() and not force:
-        existing_qids = set()
-        with open(output_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                existing_qids.add(item.get("query_id", ""))
-        pending = [q for q in queries if q["qid"] not in existing_qids]
-        if not pending:
-            logger.info(f"All {len(queries)} answers already cached in {output_file.name}")
-            return
-        queries = pending
-
-    if not queries:
-        return
-
-    logger.info(f"Generating answers for {len(queries)} queries (model={generation_model})")
-
-    client = APIClientFactory.create(
-        "deepseek" if "deepseek" in generation_model else "openai",
-        model=generation_model,
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        max_tokens=1024,
-        temperature=0.3,
-    )
-
-    prompt_manager = PromptManager(get_default_prompts())
-
-    os.makedirs(output_file.parent, exist_ok=True)
-
-    with open(output_file, "a", encoding="utf-8") as out_f:
-        for i, item in enumerate(queries):
-            qid = item["qid"]
-            query_text = item["query_text"]
-            passages = item["passages"]
-
-            system_prompt = prompt_manager.get_system_prompt()
-
-            context_parts = []
-            for j, p in enumerate(passages):
-                pid = p.get("pid", f"doc-{j}")
-                rank = p.get("rank", j + 1)
-                text = p.get("text", "")
-                text_truncated = text[:800]
-                context_parts.append(f"[{rank}] 来源: {pid}\n{text_truncated}")
-            context = "\n\n".join(context_parts)
-            user_prompt = prompt_manager.build_user_prompt(query_text, context)
-
-            full_prompt = system_prompt + "\n\n" + user_prompt
-
-            try:
-                answer = client.generate(full_prompt)
-            except Exception as e:
-                logger.error(f"Generation failed for qid={qid}: {e}")
-                answer = ""
-
-            out = {
-                "query_id": qid,
-                "query_text": query_text,
-                "passages": passages,
-                "answer": answer,
-                "generation_model": generation_model,
-                "query_type": item.get("type", ""),
-            }
-            out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
-            out_f.flush()
-
-            if (i + 1) % 10 == 0:
-                logger.info(f"  Generated {i + 1}/{len(queries)} answers")
-
-    logger.info(f"Answers saved to {output_file}")
 
 
 def load_generations(filepath: Path) -> list[dict]:
@@ -322,7 +169,7 @@ def load_generations(filepath: Path) -> list[dict]:
 
 
 # ===========================================================================
-# Step 3: 双 Judge 评分
+# Step 2: 双 Judge 评分
 # ===========================================================================
 
 JUDGE_CONFIGS = {
@@ -338,7 +185,7 @@ JUDGE_CONFIGS = {
         "env_key": "ZHIPU_API_KEY",
         "thinking": True,
         "max_tokens": 4096,
-        "temperature": 0.0,
+        "temperature": 1.0,
     },
     "glm-4-flash": {
         "client_type": "zhipu",
@@ -382,7 +229,8 @@ def judge_single_batch(client, query: str, passages: list[dict], answer: str, ba
 
     for attempt in range(MAX_RETRIES):
         try:
-            raw_response = client.generate(full_prompt)
+            result = client.generate_with_reasoning(full_prompt)
+            raw_response = result["content"]
             parsed = parse_judge_response(raw_response)
 
             if parsed is None:
@@ -394,7 +242,11 @@ def judge_single_batch(client, query: str, passages: list[dict], answer: str, ba
                     time.sleep(RETRY_DELAY_BASE ** (attempt + 1))
                 continue
 
-            return {"scores": parsed, "raw_response": raw_response}
+            return {
+                "scores": parsed,
+                "raw_response": raw_response,
+                "reasoning_content": result["reasoning_content"],
+            }
 
         except Exception as e:
             logger.warning(f"Batch{batch} API error (attempt {attempt + 1}): {e}")
@@ -405,16 +257,71 @@ def judge_single_batch(client, query: str, passages: list[dict], answer: str, ba
     return None
 
 
+def _judge_one_item(
+    item: dict,
+    judge_model: str,
+    stagger_delay: float = 0.5,
+) -> dict | None:
+    """对单条 query 执行双批评分，返回输出 dict，失败返回 None。"""
+    import os as _os
+    import time as _time
+    import random as _random
+
+    if stagger_delay > 0:
+        _time.sleep(_random.uniform(0, stagger_delay))
+
+    client = _create_judge_client(judge_model)
+
+    qid = item.get("query_id", "")
+    query_text = item.get("query_text", item.get("query", ""))
+    passages = item.get("passages", [])
+    answer = item.get("answer", "")
+
+    if isinstance(passages, list) and passages and not isinstance(passages[0], dict):
+        passages = [
+            {"pid": f"doc-{j}", "text": str(p), "rank": j + 1}
+            for j, p in enumerate(passages)
+        ]
+
+    result1 = judge_single_batch(client, query_text, passages, answer, batch=1)
+    result2 = judge_single_batch(client, query_text, passages, answer, batch=2)
+
+    if not result1 or not result2:
+        return None
+
+    all_scores = {}
+    all_scores.update(result1.get("scores", {}))
+    all_scores.update(result2.get("scores", {}))
+    aggregation = aggregate_core6_scores(all_scores)
+
+    return {
+        "query_id": qid,
+        "query_text": query_text,
+        "judge_model": judge_model,
+        "scores": all_scores,
+        "aggregation": aggregation,
+        "batch1_raw": result1.get("raw_response", ""),
+        "batch1_reasoning": result1.get("reasoning_content", ""),
+        "batch2_raw": result2.get("raw_response", ""),
+        "batch2_reasoning": result2.get("reasoning_content", ""),
+    }
+
+
 def run_single_judge(
     judge_model: str,
     judge_label: str,
     answers_file: Path,
     output_file: Path,
     force: bool = False,
+    qid_filter: set[str] | None = None,
+    concurrency: int = 3,
+    stagger_delay: float = 0.5,
 ):
-    """运行单个 Judge 对所有答案评分。"""
+    """运行单个 Judge 对答案评分。如提供 qid_filter 则仅评分指定 qid。"""
     answers = load_generations(answers_file)
-    logger.info(f"Running Judge {judge_label} ({judge_model}) on {len(answers)} answers")
+    if qid_filter is not None:
+        answers = [a for a in answers if a.get("query_id", "") in qid_filter]
+    logger.info(f"Running Judge {judge_label} ({judge_model}) on {len(answers)} answers (concurrency={concurrency}, stagger={stagger_delay}s)")
 
     existing = {}
     if output_file.exists() and not force:
@@ -431,54 +338,29 @@ def run_single_judge(
         logger.info(f"  All already cached in {output_file.name}")
         return
 
-    client = _create_judge_client(judge_model)
-
-    processed = 0
-    failed = 0
-
     os.makedirs(output_file.parent, exist_ok=True)
 
+    lock = threading.Lock()
+    processed = 0
+    failed = 0
+    total = len(pending)
+
     with open(output_file, "a", encoding="utf-8") as out_f:
-        for item in pending:
-            qid = item.get("query_id", "")
-            query_text = item.get("query_text", item.get("query", ""))
-            passages = item.get("passages", [])
-            answer = item.get("answer", "")
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(_judge_one_item, item, judge_model, stagger_delay): item for item in pending}
 
-            if isinstance(passages, list) and passages and not isinstance(passages[0], dict):
-                passages = [
-                    {"pid": f"doc-{j}", "text": str(p), "rank": j + 1}
-                    for j, p in enumerate(passages)
-                ]
-
-            result1 = judge_single_batch(client, query_text, passages, answer, batch=1)
-            result2 = judge_single_batch(client, query_text, passages, answer, batch=2)
-
-            all_scores = {}
-            if result1:
-                all_scores.update(result1.get("scores", {}))
-            if result2:
-                all_scores.update(result2.get("scores", {}))
-
-            if not result1 or not result2:
-                failed += 1
-
-            aggregation = aggregate_core6_scores(all_scores)
-
-            out = {
-                "query_id": qid,
-                "query_text": query_text,
-                "judge_model": judge_model,
-                "judge_label": judge_label,
-                "scores": all_scores,
-                "aggregation": aggregation,
-            }
-            out_f.write(json.dumps(out, ensure_ascii=False) + "\n")
-            out_f.flush()
-
-            processed += 1
-            if processed % 10 == 0:
-                logger.info(f"  {judge_label}: {processed}/{len(pending)} (failed {failed})")
+            for future in as_completed(futures):
+                result = future.result()
+                with lock:
+                    if result is None:
+                        failed += 1
+                    else:
+                        result["judge_label"] = judge_label
+                        out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        out_f.flush()
+                    processed += 1
+                    if processed % 10 == 0:
+                        logger.info(f"  {judge_label}: {processed}/{total} (failed {failed})")
 
     logger.info(f"Judge {judge_label} done: {processed} processed, {failed} failed")
 
@@ -490,14 +372,22 @@ def run_dual_judge(
     judge_a_output: Path,
     judge_b_output: Path,
     force: bool = False,
+    qid_filter: set[str] | None = None,
+    concurrency: int = 3,
+    stagger_delay: float = 0.5,
 ):
-    """运行双 Judge 评分。"""
-    run_single_judge(judge_a_model, "Judge-A", answers_file, judge_a_output, force)
-    run_single_judge(judge_b_model, "Judge-B", answers_file, judge_b_output, force)
+    """运行双 Judge 评分（Judge A 和 Judge B 并行执行）。"""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(run_single_judge, judge_a_model, "Judge-A", answers_file, judge_a_output, force, qid_filter, concurrency, stagger_delay),
+            executor.submit(run_single_judge, judge_b_model, "Judge-B", answers_file, judge_b_output, force, qid_filter, concurrency, stagger_delay),
+        ]
+        for future in as_completed(futures):
+            future.result()
 
 
 # ===========================================================================
-# Step 4: 一致性计算
+# Step 3: 一致性计算
 # ===========================================================================
 
 def _extract_scores(judge_results: list[dict], dims: list[str] | None = None) -> dict[str, dict[str, int]]:
@@ -789,7 +679,7 @@ def _print_agreement_summary(report: dict):
 
 
 # ===========================================================================
-# Step 5: 人类标注模板生成
+# Step 4: 人类标注模板生成
 # ===========================================================================
 
 def generate_annotation_template(
@@ -846,8 +736,8 @@ def generate_annotation_template(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Exp-005 Dual Judge Calibration")
 
-    parser.add_argument("--reranker-file", type=str, required=True,
-                        help="Exp-004 reranker results JSONL file")
+    parser.add_argument("--answers-file", type=str, required=True,
+                        help="已有的生成结果 JSONL 文件（如 results/exp005/generations/deepseek-chat.jsonl）")
     parser.add_argument("--output-dir", type=str, default=str(RESULTS_DIR),
                         help="Output directory for calibration results")
     parser.add_argument("--calibration-size", type=int, default=50,
@@ -858,15 +748,15 @@ if __name__ == "__main__":
                         help="Primary Judge model")
     parser.add_argument("--judge-b", type=str, default="glm-4.7",
                         help="Fallback Judge model")
-    parser.add_argument("--generation-model", type=str, default="deepseek-chat",
-                        help="Model used to generate answers for calibration")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--concurrency", type=int, default=3,
+                        help="每个 Judge 内部并发请求数（每个 Judge 独立创建 client）")
+    parser.add_argument("--stagger-delay", type=float, default=0.5,
+                        help="并发请求的随机错峰延迟上限（秒），避免触发 API 限流")
 
     parser.add_argument("--skip-sample", action="store_true",
                         help="Skip sampling step (use cached manifest)")
-    parser.add_argument("--skip-generate", action="store_true",
-                        help="Skip answer generation step")
     parser.add_argument("--skip-judge", action="store_true",
                         help="Skip judge evaluation step")
     parser.add_argument("--force", action="store_true",
@@ -874,10 +764,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    answers_file = Path(args.answers_file)
+    if not answers_file.exists():
+        logger.error(f"Answers file not found: {answers_file}")
+        sys.exit(1)
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     manifest_file = Path(args.output_dir) / "sampled_manifest.json"
-    answers_file = Path(args.output_dir) / "answers.jsonl"
     judge_a_cal_file = Path(args.output_dir) / "judge_a_scores.jsonl"
     judge_b_cal_file = Path(args.output_dir) / "judge_b_scores.jsonl"
     agreement_file = Path(args.output_dir) / "judge_agreement_report.json"
@@ -890,7 +784,7 @@ if __name__ == "__main__":
             manifest = json.load(f)
     else:
         manifest = sample_queries(
-            Path(args.reranker_file),
+            answers_file,
             args.calibration_size,
             args.verification_size,
             args.seed,
@@ -899,29 +793,25 @@ if __name__ == "__main__":
             json.dump(manifest, f, ensure_ascii=False, indent=2)
         logger.info(f"Manifest saved to {manifest_file}")
 
-    all_queries = manifest["calibration"] + manifest["verification"]
     cal_qids = set(item["qid"] for item in manifest["calibration"])
-    logger.info(f"Total queries: {len(all_queries)} "
-                f"(cal={len(manifest['calibration'])}, ver={len(manifest['verification'])})")
+    all_qids = set(manifest["all_qids"])
+    logger.info(f"Total queries: "
+                f"cal={len(manifest['calibration'])}, ver={len(manifest['verification'])}")
 
-    # Step 2: Generate answers
-    if not args.skip_generate:
-        generate_answers(all_queries, answers_file, args.generation_model, args.force)
-
-    # Step 3: Dual judge
+    # Step 2: Dual judge
     if not args.skip_judge:
         logger.info(f"Running dual judge: A={args.judge_a}, B={args.judge_b}")
         run_dual_judge(
             args.judge_a, args.judge_b,
             answers_file, judge_a_cal_file, judge_b_cal_file,
-            args.force,
+            args.force, all_qids, args.concurrency, args.stagger_delay,
         )
 
-    # Step 4: Compute agreement
+    # Step 3: Compute agreement
     if judge_a_cal_file.exists() and judge_b_cal_file.exists():
         compute_judge_agreement(judge_a_cal_file, judge_b_cal_file, agreement_file)
 
-    # Step 5: Generate human annotation template
+    # Step 4: Generate human annotation template
     if answers_file.exists():
         generate_annotation_template(answers_file, cal_qids, annotation_file)
 

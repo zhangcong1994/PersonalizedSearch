@@ -2,27 +2,36 @@
 Phase 2: Merge training data from three query sources.
 
 Reads original queries, rewritten queries, and HyDE pseudo-answers,
-then merges them into a single JSONL training file with the distribution:
-  55% original queries
-  25% rewritten queries
-  20% HyDE pseudo-answers
+then merges them into a single JSONL training file.
 
-Each query is assigned to exactly one input type (at the qid level),
-so all positive passages for a given query share the same input form.
-If a rewritten/HyDE text is not available (filtered or generation failed),
-the query falls back to its original form.
+Two modes:
+  random (default): Randomly assign each qid to exactly one input type
+    (55% original / 25% rewrite / 20% HyDE). If the assignment file from
+    generate_training_augmentations.py exists, it is reused directly.
+    Otherwise a local random assignment is performed.
+  read: Use the best available augmentation per qid — no ratio assignment.
+    For each qid: rewrite > HyDE > original. This is for use with a
+    partially-generated augmentation set (e.g. --sample in the generation
+    step). The resulting distribution reflects whatever was generated,
+    not a target ratio.
 
 Output format matches Phase 1: {"query": "...", "positive": "..."}
 for direct compatibility with train_embedding_phase2.py.
 
 Usage:
-  # Quick test with 500 queries
+  # Quick test with 500 queries (random mode)
   python scripts/exp007/merge_training_data_phase2.py --sample 500
 
-  # Full merge (requires augmentation files to exist)
+  # Full merge (random mode, 55/25/20)
   python scripts/exp007/merge_training_data_phase2.py
 
-  # Custom seed for different random assignment
+  # Read mode: use existing augmentations as-is, no ratio assignment
+  python scripts/exp007/merge_training_data_phase2.py --mode read
+
+  # Read mode with sampling
+  python scripts/exp007/merge_training_data_phase2.py --mode read --sample 5000
+
+  # Custom seed for random mode
   python scripts/exp007/merge_training_data_phase2.py --seed 123
 
 Output:
@@ -56,6 +65,7 @@ COLLECTION_FILE = T2RANKING_DIR / "collection.tsv"
 PROCESSED_DIR = DATA_ROOT / "data" / "processed"
 REWRITE_FILE = PROCESSED_DIR / "exp007_rewritten_queries.jsonl"
 HYDE_FILE = PROCESSED_DIR / "exp007_hyde_answers.jsonl"
+ASSIGNMENT_FILE = PROCESSED_DIR / "exp007_phase2_assignment.jsonl"
 
 DEFAULT_OUTPUT = PROCESSED_DIR / "embedding_train_phase2.jsonl"
 DEFAULT_SAMPLE_OUTPUT = PROCESSED_DIR / "embedding_train_phase2_sample.jsonl"
@@ -84,6 +94,21 @@ def _load_jsonl_dict(path: Path, key_field: str, value_field: str) -> dict[str, 
             if qid and val and val.strip():
                 result[qid] = val.strip()
     logger.info(f"Loaded {len(result)} entries from {path.name}")
+    return result
+
+
+def _load_assignment(path: Path) -> dict[str, str] | None:
+    if not path.exists():
+        return None
+    result: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            result[obj["qid"]] = obj["type"]
+    logger.info(f"Loaded {len(result)} query assignments from {path.name}")
     return result
 
 
@@ -216,7 +241,13 @@ def main():
     )
     parser.add_argument(
         "--sample", type=int, default=0,
-        help="Sample first N queries (0 = full dataset)"
+        help="Sample first N queries for testing (0 = full). In random mode, "
+             "ignored if assignment file from generate_training_augmentations exists."
+    )
+    parser.add_argument(
+        "--mode", choices=["random", "read"], default="random",
+        help="Merge mode: random=55/25/20 ratio assignment (default), "
+             "read=use best available augmentation per qid (rewrite > hyde > original)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -247,14 +278,42 @@ def main():
 
     logger.info("=" * 60)
     logger.info(f"  PHASE 2: Merge Training Data")
-    logger.info(f"  Mode:       {'SAMPLE' if is_sample else 'FULL'}")
-    logger.info(f"  Seed:       {args.seed}")
+    logger.info(f"  Mode:       {args.mode}")
     logger.info(f"  Rewrite:    {rewrite_file}")
     logger.info(f"  HyDE:       {hyde_file}")
     logger.info(f"  Output:     {output_path}")
+
+    if args.mode == "random":
+        pre_assigned = _load_assignment(ASSIGNMENT_FILE)
+    else:
+        pre_assigned = None
+
+    if pre_assigned is not None:
+        logger.info("  Assignment: from generate_training_augmentations.py")
+    elif args.mode == "random":
+        logger.info(f"  Assignment: local 55/25/20 (seed={args.seed})")
+    if is_sample:
+        logger.info(f"  Sample:     {args.sample}")
     logger.info("=" * 60)
 
-    queries = load_queries_dict(QUERIES_TRAIN_FILE, max_queries=args.sample)
+    all_queries = load_queries_dict(QUERIES_TRAIN_FILE, max_queries=0)
+
+    if pre_assigned is not None:
+        queries = {qid: text for qid, text in all_queries.items() if qid in pre_assigned}
+        assignments = pre_assigned
+    elif is_sample:
+        queries = load_queries_dict(QUERIES_TRAIN_FILE, max_queries=args.sample)
+        if args.mode == "random":
+            assignments = assign_query_types(list(queries.keys()), seed=args.seed)
+        else:
+            assignments = {}
+    else:
+        queries = all_queries
+        if args.mode == "random":
+            assignments = assign_query_types(list(queries.keys()), seed=args.seed)
+        else:
+            assignments = {}
+
     if not queries:
         logger.error("No queries loaded")
         return 1
@@ -272,8 +331,6 @@ def main():
         f"hyde={hyde_available}/{len(qids)} "
         f"({100*hyde_available/max(1,len(qids)):.1f}%)"
     )
-
-    assignments = assign_query_types(qids, seed=args.seed)
 
     qrels = load_qrels_for_queries(QRELS_RETRIEVAL_TRAIN_FILE, set(qids))
     if not qrels:
@@ -296,14 +353,23 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         for qid in qids:
             original_text = queries[qid]
-            assignment = assignments.get(qid, "original")
 
-            query_text, actual_type = resolve_query_text(
-                qid, original_text, assignment, rewritten_map, hyde_map
-            )
-
-            if actual_type.endswith("(fallback)"):
-                fallback_count += 1
+            if args.mode == "read":
+                rewrite_text = rewritten_map.get(qid)
+                hyde_text = hyde_map.get(qid)
+                if rewrite_text:
+                    query_text, actual_type = rewrite_text, "rewrite"
+                elif hyde_text:
+                    query_text, actual_type = hyde_text, "hyde"
+                else:
+                    query_text, actual_type = original_text, "original"
+            else:
+                assignment = assignments.get(qid, "original")
+                query_text, actual_type = resolve_query_text(
+                    qid, original_text, assignment, rewritten_map, hyde_map
+                )
+                if actual_type.endswith("(fallback)"):
+                    fallback_count += 1
 
             base_type = actual_type.split("(")[0]
             type_counts[base_type] = type_counts.get(base_type, 0) + 1
@@ -330,7 +396,8 @@ def main():
     logger.info(f"Output pairs:       {written}")
     logger.info(f"Skipped (missing):  {skipped_missing} (pid not in collection)")
     logger.info(f"Skipped (no pos):   {skipped_query} (query has no qrels)")
-    logger.info(f"Fallback to orig:   {fallback_count} (rewrite/HyDE not available)")
+    if args.mode != "read":
+        logger.info(f"Fallback to orig:   {fallback_count} (assigned augmentation not available)")
     logger.info(f"Final distribution:")
     logger.info(f"  original:          {type_counts['original']} queries")
     logger.info(f"  rewrite:           {type_counts['rewrite']} queries")
@@ -345,12 +412,18 @@ def main():
     print("=" * 60)
     print("  PHASE 2 DATA MERGE COMPLETE")
     print("=" * 60)
-    ratio_orig = 100 * type_counts["original"] / max(1, len(qids))
-    ratio_rewrite = 100 * type_counts["rewrite"] / max(1, len(qids))
-    ratio_hyde = 100 * type_counts["hyde"] / max(1, len(qids))
-    print(f"  Original:  {type_counts['original']} ({ratio_orig:.1f}%)")
-    print(f"  Rewrite:   {type_counts['rewrite']} ({ratio_rewrite:.1f}%)")
-    print(f"  HyDE:      {type_counts['hyde']} ({ratio_hyde:.1f}%)")
+    print(f"  Mode:      {args.mode}")
+    if args.mode == "random":
+        ratio_orig = 100 * type_counts["original"] / max(1, len(qids))
+        ratio_rewrite = 100 * type_counts["rewrite"] / max(1, len(qids))
+        ratio_hyde = 100 * type_counts["hyde"] / max(1, len(qids))
+        print(f"  Original:  {type_counts['original']} ({ratio_orig:.1f}%)")
+        print(f"  Rewrite:   {type_counts['rewrite']} ({ratio_rewrite:.1f}%)")
+        print(f"  HyDE:      {type_counts['hyde']} ({ratio_hyde:.1f}%)")
+    else:
+        print(f"  Rewrite avail:  {rewrite_available}/{len(qids)} queries")
+        print(f"  HyDE avail:     {hyde_available}/{len(qids)} queries")
+        print(f"  Final: original={type_counts['original']} rewrite={type_counts['rewrite']} hyde={type_counts['hyde']}")
     print(f"  Pairs:     {written}")
     print(f"  Output:    {output_path}")
     print(f"  Size:      {file_size_mb:.1f} MB")

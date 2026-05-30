@@ -489,15 +489,43 @@ training_plan:
       note: "lr=1e-5（Phase 1 的一半）补偿 LLM 生成文本的噪声；epochs=3（原计划 2）补偿 lr 减半的影响，使总学习量 ≈ Phase 1 的 1.5 epoch 等效量"
 
     expected_outcome:
-      exp003_baseline: |
-        V0 不改模型的 S4（D-B0 + D-P2 + D-HyDE + B-B0）已在测试集上
-        达到 R@50=0.6912。但每路独立 R@50 仍有巨大差距：
-        D-P2=0.6450 vs D-HyDE=0.6087，差了 3.6%。
-      phase2_hypothesis: |
-        训练后，改写 query 和 HyDE 文本的独立 R@50 应接近或持平原始 query。
-        三条 Dense 路各自提升后，RRF 融合的 R@50 有望突破 0.72。
-        original_query 可能因数据量增加（745K vs 原来 744K）而小幅提升。
-      key_metric: "Phase 2 特征：改写 query 和 HyDE 文本的独立 R@50 ≈ 原始 query 的独立 R@50"
+      evaluation_philosophy: |
+        Phase 2 的主评估维度是**准召指标的绝对提升**，不是各路间的一致性。
+        
+        AI 搜索系统的终端用户只关心搜索结果对不对，不关心三路检索是否"对齐"。
+        多路 RRF 融合的存在本身就是对"各路不一致"的补偿——exp-003 已证明三路
+        不一致才是 RRF 增益的来源。
+
+        分布对齐（per-route 指标对比）的价值在于诊断——当准召出问题时，
+        per-route 数据告诉你去哪修（某路数据质量问题 vs 模型整体过拟合）。
+        它是 debug tool，不是 target metric。
+
+      pretrained_baseline_per_route:
+        D-B0（原始 query）:    "R@50 约 0.628（exp-001 全量评估）"
+        D-P2（P2 改写）:       "R@50 约 0.645（exp-003 消融）"
+        D-HyDE（假答案）:       "R@50 约 0.609（exp-003 消融）"
+        RRF 三路融合（S4）:     "R@50 = 0.6912（exp-003 最优）"
+        note: "以上为 pretrained m3e-base 不改模型的 prompt 工程天花板"
+
+      phase2_l1_per_route:
+        description: "第一层评估：每路独立对比 Phase 2 模型 vs pretrained 模型"
+        hypothesis: |
+          训练数据中包含了改写和 HyDE 的输入分布，三路各自的 Recall@50
+          都应显著高于 pretrained 模型的同路：
+          - 原始 query 路：R@50 提升 +3~6%（数据量相近，主要靠领域自适应）
+          - 改写 query 路：R@50 提升 +5~10%（模型首次见过改写分布，提升空间最大）
+          - HyDE 文本路：  R@50 提升 +5~10%（同上，且 HyDE 信息密度高于短 query）
+
+      phase2_l2_rrf_fusion:
+        description: "第二层评估：三路 RRF 融合后的系统级 Recall@50"
+        hypothesis: |
+          三路各自提升后，RRF 融合的候选池覆盖更全面，融合后 R@50 有望突破 0.72。
+          这比 pretrained 的 0.6912 提升约 +3~4pp。
+        target: "R@50 > 0.72"
+
+      key_metric: |
+        主指标：三路 RRF 融合后 Recall@50（系统级交付指标）
+        诊断指标：三路各自 Recall@50 vs pretrained 同路（排查用）
 
     deliverable:
       - "Prompt 代码: src/intent/query_rewrite_prompts.py（已存在，复用 E2a-P2 / E2c-H2）"

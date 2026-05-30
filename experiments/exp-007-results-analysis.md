@@ -1,4 +1,4 @@
-# exp-007 Phase 1 实验结果与分析
+# exp-007 实验结果与分析
 
 > 实验目标：在 T2Ranking 训练集上微调 M3E-base，验证对比学习（MNRL）对中文 passage 检索的召回提升
 >
@@ -164,10 +164,113 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 
 ### Phase 3：高级训练策略
 
-如果 Phase 1 + 2 的 Recall@10 仍低于 0.50，启动 Phase 3：
-- 3.1: ~~CachedMNRL~~ → **已废弃（过拟合退化 -1.5%）**
-- 3.2: Dynamic Dense Hard Negative Mining + TripletLoss → 预期 +1~3%
-- 3.3: Graded Label (CosineSimilarityLoss + MNRL multi-task) → 预期 +1~2%
+#### Phase 3.1: ~~CachedMNRL~~ → **已废弃（过拟合退化 -1.5%）**
+
+#### Phase 3.2: Dynamic Dense Hard Negative Mining + TripletLoss + LoRA
+
+从 Phase 1 best model 起步（Recall@10=0.4539），每 epoch 用最新模型做全量 2.3M passages Dense 检索挖掘 hard negatives，配合 TripletLoss（margin 0.05/0.03） + MNRL 双 Loss，LoRA 防灾难性遗忘。
+
+**训练配置：**
+
+| 项目 | 配置 |
+|------|------|
+| 基座模型 | Phase 1 best model (models/m3e-base-t2ranking-phase1, Recall@10=0.4539) |
+| Hard Negative 来源 | 每 epoch 用当前模型编码 2.3M passages → FAISS IndexFlatIP → 取 top-5 非正样本 |
+| Loss | TripletLoss(COSINE_DISTANCE, margin) + MultipleNegativesRankingLoss |
+| Epochs | 3（ep0 仅挖掘，ep1-3 训练） |
+| Margin | ep1=0.05, ep2/3=0.03 |
+| LoRA | r=16, alpha=32, target_modules=["query","key","value","dense"], ~1.2% 参数 |
+| Learning Rate | 1e-5 |
+| Batch Size | 32 |
+| Warmup | 0.1 (warmupcosine) |
+| FP16 | 开启 |
+| 训练硬件 | NVIDIA GeForce RTX 5090 32GB |
+
+<details>
+<summary><b>📊 Phase 3.2 Epoch 1 结果（点击展开）</b></summary>
+
+**对比 Pretrained (m3e-base)：**
+
+| Metric | Pretrained | Phase 3.2 ep1 | Δ 绝对 | Δ 相对 |
+|--------|-----------|---------------|--------|--------|
+| **Recall@10** | 0.3896 | **0.5064** | +0.1168 | **+30.0%** |
+| Recall@20 | 0.5074 | 0.6359 | +0.1285 | +25.3% |
+| **Recall@50** | 0.6278 | **0.7452** | +0.1174 | **+18.7%** |
+| **MRR** | 0.4556 | **0.5549** | +0.0993 | **+21.8%** |
+| NDCG@10 | 0.3405 | 0.4396 | +0.0991 | +29.1% |
+| Hit@10 | 0.7350 | 0.8435 | +0.1085 | +14.8% |
+| Hit@50 | 0.8420 | 0.9280 | +0.0860 | +10.2% |
+| NDCG@10_graded | 0.3566 | 0.4617 | +0.1051 | +29.5% |
+
+**对比 Phase 1 (best model)：**
+
+| 指标 | Phase 1 | Phase 3.2 ep1 | Δ |
+|------|---------|---------------|-----|
+| Recall@10 | 0.4539 | 0.5064 | **+11.6%** |
+| Recall@50 | 0.7003 | 0.7452 | **+6.4%** |
+| MRR | 0.4976 | 0.5549 | **+11.5%** |
+
+</details>
+
+<details>
+<summary><b>📊 Phase 3.2 Epoch 2 结果（点击展开）</b></summary>
+
+**对比 Pretrained (m3e-base)：**
+
+| Metric | Pretrained | Phase 3.2 ep2 | Δ 绝对 | Δ 相对 |
+|--------|-----------|---------------|--------|--------|
+| **Recall@10** | 0.3896 | **0.4956** | +0.1060 | +27.2% |
+| Recall@20 | 0.5074 | 0.6246 | +0.1172 | +23.1% |
+| **Recall@50** | 0.6278 | **0.7363** | +0.1085 | +17.3% |
+| **MRR** | 0.4556 | **0.5371** | +0.0815 | +17.9% |
+| NDCG@10 | 0.3405 | 0.4279 | +0.0874 | +25.7% |
+| Hit@10 | 0.7350 | 0.8355 | +0.1005 | +13.7% |
+| Hit@50 | 0.8420 | 0.9240 | +0.0820 | +9.7% |
+| NDCG@10_graded | 0.3566 | 0.4504 | +0.0938 | +26.3% |
+
+</details>
+
+<details>
+<summary><b>📊 Phase 3.2 Epoch 3 结果（点击展开）</b></summary>
+
+**对比 Pretrained (m3e-base)：**
+
+| Metric | Pretrained | Phase 3.2 ep3 | Δ 绝对 | Δ 相对 |
+|--------|-----------|---------------|--------|--------|
+| **Recall@10** | 0.3896 | **0.5013** | +0.1117 | +28.7% |
+| Recall@20 | 0.5074 | 0.6353 | +0.1279 | +25.2% |
+| **Recall@50** | 0.6278 | **0.7406** | +0.1128 | +18.0% |
+| **MRR** | 0.4556 | **0.5461** | +0.0905 | +19.9% |
+| NDCG@10 | 0.3405 | 0.4340 | +0.0935 | +27.5% |
+| Hit@10 | 0.7350 | 0.8405 | +0.1055 | +14.4% |
+| Hit@50 | 0.8420 | 0.9255 | +0.0835 | +9.9% |
+| NDCG@10_graded | 0.3566 | 0.4562 | +0.0996 | +27.9% |
+
+</details>
+
+**跨 Epoch 对比（核心指标）：**
+
+| 指标 | Pretrained | Phase 1 | ep1 | ep2 | ep3 |
+|------|-----------|---------|-----|-----|-----|
+| **Recall@10** | 0.3896 | 0.4539 | **0.5064** ★ | 0.4956 | 0.5013 |
+| **Recall@50** | 0.6278 | 0.7003 | **0.7452** ★ | 0.7363 | 0.7406 |
+| **MRR** | 0.4556 | 0.4976 | **0.5549** ★ | 0.5371 | 0.5461 |
+
+| 指标 | ep1→ep2 Δ | ep2→ep3 Δ | ep1→ep3 Δ |
+|------|-----------|-----------|-----------|
+| Recall@10 | -0.0108 (-2.1%) | +0.0057 (+1.1%) | -0.0051 (-1.0%) |
+| Recall@50 | -0.0089 (-1.2%) | +0.0043 (+0.6%) | -0.0046 (-0.6%) |
+| MRR | -0.0178 (-3.2%) | +0.0090 (+1.7%) | -0.0088 (-1.6%) |
+
+> ★ = 当前最佳 checkpoint (ep1)
+
+**关键发现：**
+1. **ep1 仍然是不可撼动的最佳 checkpoint**——Recall@10=0.5064，唯一突破 0.50 的 epoch
+2. **ep3 相比 ep2 微幅回升**（Recall@10 +0.0057, MRR +0.0090），说明 margin=0.03 的第三轮训练没有继续恶化——margin 0.05→0.03 的降低影响很小
+3. 三 epoch 的 Recall@10 差异极窄（0.4956~0.5064，带宽仅 0.0108），说明模型在 ep1 后已达到收敛平台——后续 hard negative 重挖掘 + 重训练的边际收益几乎为零
+4. **结论：1 轮 Dynamic Hard Negative Mining 足够**——多轮重挖掘不带来增益，ep1 即为 Phase 3.2 最终交付模型
+
+#### Phase 3.3: Graded Label (CosineSimilarityLoss + MNRL multi-task) → 待评估
 
 ---
 
@@ -178,14 +281,19 @@ NDCG@10_graded 从 0.3566 → 0.4114（+15.4%），与 NDCG@10（binary）的 +1
 | `scripts/exp007/prepare_training_data.py` | 训练数据准备（TSV → JSONL） |
 | `scripts/exp007/train_embedding_phase1.py` | Phase 1 训练脚本 |
 | `scripts/exp007/train_embedding_phase3_1.py` | Phase 3.1 训练脚本（CachedMNRL，已废弃） |
+| `scripts/exp007/train_embedding_phase3_2.py` | Phase 3.2 训练脚本（Dynamic Hard Negatives + TripletLoss） |
+| `scripts/exp007/build_faiss_index.py` | FAISS 向量索引构建脚本 |
 | `scripts/exp007/evaluate_embedding.py` | 检索效果评估脚本 |
-| `scripts/exp007/build_index.py` | 向量索引构建脚本（实验七专用） |
-| `models/m3e-base-t2ranking-phase1/` | Phase 1 微调后的模型权重（当前 best model） |
+| `scripts/exp007/build_index.py` | ChromaDB 向量索引构建脚本（旧版） |
+| `models/m3e-base-t2ranking-phase1/` | Phase 1 微调后的模型权重 |
 | `models/m3e-base-t2ranking-phase3-1/` | Phase 3.1 微调后的模型权重（已过拟合，废弃） |
+| `models/m3e-base-t2ranking-phase3-2/ep1/merged/` | Phase 3.2 Epoch 1 模型（LoRA merged） |
+| `models/m3e-base-t2ranking-phase3-2/ep2/merged/` | Phase 3.2 Epoch 2 模型（LoRA merged） |
+| `models/m3e-base-t2ranking-phase3-2/ep3/merged/` | Phase 3.2 Epoch 3 模型（LoRA merged） |
 | `data/vector_db/t2ranking/m3e-base/` | Pretrained M3E 向量索引 |
 | `data/vector_db/t2ranking/m3e-base-t2ranking-phase1/` | Fine-tuned M3E Phase 1 向量索引 |
 | `data/vector_db/t2ranking/m3e-base-t2ranking-phase3-1/` | Fine-tuned M3E Phase 3.1 向量索引 |
 
 ---
 
-*实验日期: 2026-05-28 | 评估脚本: `scripts/exp007/evaluate_embedding.py`*
+*实验日期: 2026-05-28 ~ 2026-05-30 | 评估脚本: `scripts/exp007/evaluate_embedding.py`*

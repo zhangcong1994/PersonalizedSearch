@@ -7,34 +7,80 @@ from langchain_core.language_models.chat_models import BaseChatModel
 class LangChainLLMClient:
     """
     LangChain LLM客户端封装类
-    
+
     使用LangChain的统一接口封装不同的LLM提供商，
     提供统一的generate方法调用接口。
+    同时保留原始API参数，供 generate_with_reasoning 使用原生 OpenAI client
+    来捕获 reasoning_content（LangChain ChatOpenAI 会丢弃此字段）。
     """
-    
-    def __init__(self, llm: BaseChatModel):
+
+    def __init__(self, llm: BaseChatModel, raw_params: Optional[dict] = None):
         """
         初始化客户端
-        
+
         Args:
             llm: LangChain的BaseChatModel实例
+            raw_params: 原始API参数，用于原生 OpenAI client 调用
+                {"api_key", "base_url", "model", "max_tokens", "temperature", "extra_body"}
         """
         self.llm = llm
-    
+        self._raw_params = raw_params or {}
+
     def generate(self, prompt: str) -> str:
         """
         调用LLM生成响应
-        
+
         Args:
             prompt: 输入的Prompt文本
-            
+
         Returns:
             LLM生成的响应文本
         """
         from langchain_core.messages import HumanMessage
-        
+
         response = self.llm.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
+
+    def generate_with_reasoning(self, prompt: str) -> dict[str, str]:
+        """
+        调用LLM生成响应，同时返回 thinking 和 content。
+
+        使用原生 OpenAI client 直接调用，以捕获 LangChain ChatOpenAI
+        会丢弃的 reasoning_content 字段。
+
+        Args:
+            prompt: 输入的Prompt文本
+
+        Returns:
+            {"content": "最终评分结果", "reasoning_content": "推理过程"}
+            对于不支持 thinking 的模型，reasoning_content 为空字符串
+        """
+        if not self._raw_params:
+            content = self.generate(prompt)
+            return {"content": content, "reasoning_content": ""}
+
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=self._raw_params["api_key"],
+            base_url=self._raw_params["base_url"],
+        )
+
+        kwargs = dict(
+            model=self._raw_params["model"],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=self._raw_params.get("max_tokens", 4096),
+            temperature=self._raw_params.get("temperature", 1.0),
+        )
+        if self._raw_params.get("extra_body"):
+            kwargs["extra_body"] = self._raw_params["extra_body"]
+
+        response = client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        reasoning = getattr(choice.message, "reasoning_content", "") or ""
+
+        return {"content": content.strip(), "reasoning_content": reasoning}
 
 
 class APIClientFactory:
@@ -119,10 +165,18 @@ class APIClientFactory:
             verbose=False,
         )
         if extra_body:
-            kwargs["model_kwargs"] = extra_body
+            kwargs["extra_body"] = extra_body
 
         llm = ChatOpenAI(**kwargs)
-        return LangChainLLMClient(llm)
+        raw_params = {
+            "api_key": openai_api_key,
+            "base_url": "https://api.openai.com/v1",
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "extra_body": extra_body,
+        }
+        return LangChainLLMClient(llm, raw_params=raw_params)
 
     @staticmethod
     def _create_deepseek_client(
@@ -154,10 +208,19 @@ class APIClientFactory:
             kwargs["temperature"] = temperature
 
         if extra_body:
-            kwargs["model_kwargs"] = extra_body
+            kwargs["extra_body"] = extra_body
 
         llm = ChatOpenAI(**kwargs)
-        return LangChainLLMClient(llm)
+        effective_temp = 1.0 if thinking else temperature
+        raw_params = {
+            "api_key": deepseek_api_key,
+            "base_url": "https://api.deepseek.com/v1",
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": effective_temp,
+            "extra_body": extra_body,
+        }
+        return LangChainLLMClient(llm, raw_params=raw_params)
 
     @staticmethod
     def _create_zhipu_client(
@@ -184,13 +247,21 @@ class APIClientFactory:
         kwargs = dict(
             model=model,
             api_key=zhipu_api_key,
-            base_url="https://api.z.ai/api/paas/v4/",
+            base_url="https://open.bigmodel.cn/api/paas/v4/",
             max_tokens=max_tokens,
             temperature=temperature,
             verbose=False,
         )
         if extra_body:
-            kwargs["model_kwargs"] = extra_body
+            kwargs["extra_body"] = extra_body
 
         llm = ChatOpenAI(**kwargs)
-        return LangChainLLMClient(llm)
+        raw_params = {
+            "api_key": zhipu_api_key,
+            "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "extra_body": extra_body if extra_body else None,
+        }
+        return LangChainLLMClient(llm, raw_params=raw_params)

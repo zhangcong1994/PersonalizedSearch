@@ -1,9 +1,22 @@
 """
 Phase 2: Query Rewriting + HyDE Pseudo-Answer Generation
 
-Generates rewritten queries and HyDE pseudo-answers for all training queries
+Generates rewritten queries and HyDE pseudo-answers for training queries
 using local vLLM (OpenAI-compatible API). Results are cached to JSONL files
 for idempotent re-runs and consumed by merge_training_data_phase2.py.
+
+Sampling mode (--sample N):
+  Randomly samples N queries from the full 258K set.
+
+Assignment mode (--assign):
+  Assigns each loaded query to original/rewrite/hyde by 55/25/20 ratio,
+  then ONLY generates LLM augmentations for queries assigned to rewrite
+  (25%) or hyde (20%). Original-assigned queries (55%) need no LLM.
+  The assignment is saved to {OUTPUT_DIR}/exp007_phase2_assignment.jsonl
+  for merge_training_data_phase2.py to consume.
+
+Without --assign:
+  Generates both rewrite and hyde for ALL loaded queries.
 
 Prompt sources:
   - Rewrite: adapted from exp-002 E2a-P2 (domain few-shot), with one change:
@@ -16,30 +29,32 @@ Quality filter: only format checks (empty, too long, no Chinese), no semantic
 filtering — training distribution must match online inference distribution.
 
 Usage:
-  # Quick test with 10 queries (dry-run)
-  python scripts/exp007/generate_training_augmentations.py --sample 10
+  # Sample 10K, assign 55/25/20, only generate for rewrite+hyde (~4.5K LLM calls)
+  python scripts/exp007/generate_training_augmentations.py --sample 10000 --assign
 
-  # Full generation on server (vLLM must be running on port 8000)
+  # Sample 5K, generate BOTH for all (10K LLM calls)
+  python scripts/exp007/generate_training_augmentations.py --sample 5000
+
+  # Full 258K, assign 55/25/20 (reduces to ~116K LLM calls vs 516K)
+  python scripts/exp007/generate_training_augmentations.py --assign --llm-url http://localhost:8000/v1
+
+  # Full 258K, generate both for all (516K LLM calls — slowest)
   python scripts/exp007/generate_training_augmentations.py --llm-url http://localhost:8000/v1
 
-  # Only rewrite queries
-  python scripts/exp007/generate_training_augmentations.py --task rewrite
-
-  # Only HyDE
-  python scripts/exp007/generate_training_augmentations.py --task hyde
+  # Only rewrite on a sample
+  python scripts/exp007/generate_training_augmentations.py --task rewrite --sample 10000
 
 Output:
   {DATA_ROOT}/data/processed/exp007_rewritten_queries.jsonl
   {DATA_ROOT}/data/processed/exp007_hyde_answers.jsonl
-
-  Each line: {"qid": "xxx", "original": "原始查询", "rewritten": "改写查询"}
-  Each line: {"qid": "xxx", "original": "原始查询", "hyde": "假答案文本"}
+  {DATA_ROOT}/data/processed/exp007_phase2_assignment.jsonl  (--assign only)
 """
 
 import os
 import sys
 import json
 import time
+import random
 import argparse
 import logging
 from pathlib import Path
@@ -62,6 +77,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 REWRITE_OUTPUT = OUTPUT_DIR / "exp007_rewritten_queries.jsonl"
 HYDE_OUTPUT = OUTPUT_DIR / "exp007_hyde_answers.jsonl"
+ASSIGNMENT_FILE = OUTPUT_DIR / "exp007_phase2_assignment.jsonl"
+
+ORIGINAL_RATIO = 0.55
+REWRITE_RATIO = 0.25
+HYDE_RATIO = 0.20
 
 # ── Prompts ──────────────────────────────────────────────
 
@@ -162,10 +182,13 @@ def _append_jsonl(path: Path, entry: dict):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-# ── Query loading ────────────────────────────────────────
+# ── Query loading & sampling ─────────────────────────────
 
-def load_train_queries(sample: int = 0) -> list[tuple[str, str]]:
-    queries = []
+def _load_queries(
+    sample: int = 0,
+    seed: int = 42,
+) -> list[tuple[str, str]]:
+    all_q: list[tuple[str, str]] = []
     with open(QUERIES_TRAIN_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -173,11 +196,59 @@ def load_train_queries(sample: int = 0) -> list[tuple[str, str]]:
                 continue
             parts = line.split("\t")
             if len(parts) >= 2:
-                queries.append((parts[0].strip(), parts[1].strip()))
-    if sample > 0 and sample < len(queries):
-        queries = queries[:sample]
-    logger.info(f"Loaded {len(queries)} training queries" + (" (sampled)" if sample > 0 else ""))
-    return queries
+                all_q.append((parts[0].strip(), parts[1].strip()))
+
+    if sample > 0 and sample < len(all_q):
+        rng = random.Random(seed)
+        queries = rng.sample(all_q, sample)
+        logger.info(f"Loaded {len(queries)} queries (random sample from {len(all_q)} total)")
+        return queries
+
+    logger.info(f"Loaded {len(all_q)} training queries (full)")
+    return all_q
+
+
+def _assign_and_save(
+    queries: list[tuple[str, str]],
+    seed: int = 42,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    rng = random.Random(seed)
+    shuffled = list(queries)
+    rng.shuffle(shuffled)
+
+    n = len(shuffled)
+    n_rewrite = int(n * REWRITE_RATIO)
+    n_hyde = int(n * HYDE_RATIO)
+
+    assigns: list[dict] = []
+    rewrites: list[tuple[str, str]] = []
+    hydes: list[tuple[str, str]] = []
+    originals = 0
+
+    for i, (qid, text) in enumerate(shuffled):
+        if i < n_rewrite:
+            assigns.append({"qid": qid, "type": "rewrite"})
+            rewrites.append((qid, text))
+        elif i < n_rewrite + n_hyde:
+            assigns.append({"qid": qid, "type": "hyde"})
+            hydes.append((qid, text))
+        else:
+            assigns.append({"qid": qid, "type": "original"})
+            originals += 1
+
+    with open(ASSIGNMENT_FILE, "w", encoding="utf-8") as f:
+        for entry in assigns:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    logger.info(
+        f"Assigned {n} queries: "
+        f"original={originals} ({100*originals/n:.1f}%), "
+        f"rewrite={len(rewrites)} ({100*len(rewrites)/n:.1f}%), "
+        f"hyde={len(hydes)} ({100*len(hydes)/n:.1f}%)"
+    )
+    logger.info(f"Assignment saved: {ASSIGNMENT_FILE}")
+
+    return rewrites, hydes
 
 
 # ── LLM generation ───────────────────────────────────────
@@ -356,7 +427,17 @@ def main():
     )
     parser.add_argument(
         "--sample", type=int, default=0,
-        help="Sample N queries (0 = all). Use for dry-run testing.",
+        help="Randomly sample N queries (0 = all 258K)",
+    )
+    parser.add_argument(
+        "--assign", action="store_true",
+        help="Assign queries 55/25/20 and only generate augmentations "
+             "for assigned types (saves assignment file). Without this, "
+             "generate both rewrite and hyde for ALL loaded queries.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for sampling and assignment (default: 42)",
     )
     parser.add_argument(
         "--llm-url", type=str, default="http://localhost:8000/v1",
@@ -371,36 +452,44 @@ def main():
     logger.info("=" * 60)
     logger.info("  PHASE 2: Training Data Augmentation")
     logger.info("  Tasks:    " + args.task)
-    logger.info("  LLM URL:  " + args.llm_url)
     logger.info("  Sample:   " + (str(args.sample) if args.sample else "all (258K)"))
+    logger.info("  Assign:   " + ("55/25/20" if args.assign else "none (generate both)"))
+    logger.info("  LLM URL:  " + args.llm_url)
     logger.info("=" * 60)
 
-    queries = load_train_queries(sample=args.sample)
-    total_queries = len(queries)
+    queries = _load_queries(sample=args.sample, seed=args.seed)
 
-    if not queries:
-        logger.error("No queries loaded")
-        return 1
+    if args.assign:
+        rewrites, hydes = _assign_and_save(queries, seed=args.seed)
+    else:
+        rewrites = queries
+        hydes = queries
 
     if args.task in ("rewrite", "both"):
-        logger.info("-" * 40)
-        logger.info(f"  Generating rewritten queries for {total_queries} queries...")
-        _ = generate_rewrites(queries, args.llm_url, args.batch_size)
-        logger.info(f"  Output: {REWRITE_OUTPUT}")
+        if not rewrites:
+            logger.info("Skipping rewrite: no queries assigned to rewrite")
+        else:
+            logger.info("-" * 40)
+            logger.info(f"  Generating rewritten queries for {len(rewrites)} queries...")
+            _ = generate_rewrites(rewrites, args.llm_url, args.batch_size)
+            logger.info(f"  Output: {REWRITE_OUTPUT}")
 
     if args.task in ("hyde", "both"):
-        logger.info("-" * 40)
-        logger.info(f"  Generating HyDE answers for {total_queries} queries...")
-        _ = generate_hyde(queries, args.llm_url, args.batch_size)
-        logger.info(f"  Output: {HYDE_OUTPUT}")
+        if not hydes:
+            logger.info("Skipping HyDE: no queries assigned to hyde")
+        else:
+            logger.info("-" * 40)
+            logger.info(f"  Generating HyDE answers for {len(hydes)} queries...")
+            _ = generate_hyde(hydes, args.llm_url, args.batch_size)
+            logger.info(f"  Output: {HYDE_OUTPUT}")
 
     logger.info("=" * 60)
     if args.task in ("rewrite", "both"):
-        n = sum(1 for _ in open(REWRITE_OUTPUT, "r", encoding="utf-8"))
-        logger.info(f"  Rewrite cache: {n} entries → {REWRITE_OUTPUT}")
+        n = sum(1 for _ in open(REWRITE_OUTPUT, "r", encoding="utf-8")) if REWRITE_OUTPUT.exists() else 0
+        logger.info(f"  Rewrite cache: {n} entries -> {REWRITE_OUTPUT}")
     if args.task in ("hyde", "both"):
-        n = sum(1 for _ in open(HYDE_OUTPUT, "r", encoding="utf-8"))
-        logger.info(f"  HyDE cache:    {n} entries → {HYDE_OUTPUT}")
+        n = sum(1 for _ in open(HYDE_OUTPUT, "r", encoding="utf-8")) if HYDE_OUTPUT.exists() else 0
+        logger.info(f"  HyDE cache:    {n} entries -> {HYDE_OUTPUT}")
     logger.info("=" * 60)
     logger.info("  Next: python scripts/exp007/merge_training_data_phase2.py")
     logger.info("        python scripts/exp007/train_embedding_phase2.py")

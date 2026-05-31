@@ -23,7 +23,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from src.intent.api_client import APIClientFactory
 from src.evaluation.judge_prompts import (

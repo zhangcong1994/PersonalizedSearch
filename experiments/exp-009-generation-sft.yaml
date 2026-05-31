@@ -1,0 +1,738 @@
+# 实验计划：V1 生成模型监督微调（SFT）
+# exp-009: Qwen3-4B 在 AI 搜索场景下的教师蒸馏监督微调
+# 创建日期：2026-05-31
+# 最后更新：2026-05-31
+#
+# 注：
+#   - exp-008 预留给精排模型微调（Reranker Fine-tuning）
+#   - exp-009 Phase 1 仅做 SFT，DPO 偏好对齐留给 exp-010
+#   - 本实验只涉及 T2Ranking train split，dev/test 集不参与训练
+
+meta:
+  experiment_id: exp-009
+  phase: "V1"
+  objective: "以 qwen3-max 为教师，在 AI 搜索专用 SFT 数据上微调 Qwen3-4B（QLoRA），缩小本地模型与 API 模型的生成质量差距"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite: "exp-005 评估体系已验证（Judge 可靠性 + 多模型分数基线）"
+  design_principle: "诊断驱动 —— 从 exp-005 的失败模式反推训练数据配比，不盲目追求数据量"
+  key_references:
+    - "exp-005 阶段性结果：Qwen3-4B 60.2 vs qwen3-max 72.7（差距 12.5 分）"
+    - "exp-005 双 Judge 交叉验证：±1 一致率 0.92-1.00"
+    - "exp-007 Phase 3.2：LoRA 在双塔微调中验证了参数高效训练的可行性"
+  what_this_experiment_does_not_do:
+    - "不做 DPO 偏好对齐（留给 exp-010）"
+    - "不修改检索 pipeline（exp-003 S4 + exp-004 reranker 固定）"
+    - "不动 dev/test 集（queries.dev.tsv / queries.test.tsv 仅用于评估）"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么必须做 SFT
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    retrieval_ceiling:
+      best_rough_rank: "exp-003 S4: R@50 = 0.6912（4 路 RRF 融合）"
+      best_reranker: "exp-004: bge-reranker-v2-m3 NDCG@10 = 0.4717"
+      best_embedding: "exp-007 Phase 3.2: R@10 = 0.5064, R@50 = 0.7452（微调 M3E-base +30%）"
+      conclusion: "检索端已有详细实验，生成端尚未优化"
+    generation_gap:
+      description: "exp-005 在固定检索输入下的多模型对比结果"
+      models:
+        - {id: "qwen3-max", score: 72.7, pass_pct: "81.2%", type: "API 上界"}
+        - {id: "Qwen3-4B-nonthink", score: 60.2, pass_pct: "58.6%", type: "最佳本地"}
+        - {id: "Qwen2.5-7B", score: 56.0, pass_pct: "39.4%", type: "本地基准"}
+        - {id: "Qwen2.5-1.5B", score: 22.5, pass_pct: "6.0%", type: "不可用"}
+      gap: "本地最佳 vs API 差距 12.5 分"
+
+  why_sft:
+    reason: "12.5 分的差距不可能仅靠 prompt 工程弥补。prompt 可以改变行为的方向，但不能填补能力的鸿沟。SFT 是让本地模型逼近 API 水平的最直接路径"
+    why_not_just_use_api: "qwen3-max 成本约 ¥0.005/次生成，日活 1000 用户 × 日均 5 次搜索 = ¥25/天 = ¥750/月。如果 SFT 能让本地模型从 60 分逼近 68-72 分，长期部署成本降低 100 倍"
+    why_student_is_4B_not_7B: "exp-005 证实 Qwen3-4B（60.2）已全面超越 Qwen2.5-7B（56.0）。4B 参数量减少 43%、VRAM 减半、推理延迟更低。SFT 后如果 4B 能达到 68+ 分，就是生产部署的最优性价比点"
+
+  failure_mode_analysis:
+    description: "SFT 数据的配比来自 exp-005 各维度的失败模式反推"
+    dimensions:
+      - dimension: "引文质量"
+        qwen3_max: 2.75
+        qwen3_4B: 2.45
+        qwen2_5_7B: 2.08
+        gap: "max-7B = 0.67（最大单项差距）"
+        root_cause: "本地模型知道要引用但做不精确——7B 的 63% 答案引文停在 2 分区（'有但粗糙'），而 max 的 76% 在 3 分区（'可靠'）"
+        sft_implication: "需要引文强调类别（12%）——刻意展示精确引用的范式"
+      - dimension: "D 级占比（不可用率）"
+        qwen3_4B: "38.4%（76/198 条）"
+        qwen2_5_7B: "58.6%（116/198 条）"
+        root_cause: "模型在信息不足时强行编造，而非诚实拒答——这是 RLHF 对齐训练'总要帮助用户'偏置的结果"
+        sft_implication: "需要信息不足/拒答类别（17%）——对抗 helpfulness 偏置，教会模型说'无法确定'"
+      - dimension: "整合质量"
+        all_models: "无人得 4 分，连 qwen3-max 最高也只能拿 3 分"
+        root_cause: "多文档深度融合是当前所有 LLM 的硬天花板，单靠 SFT 可能无法突破"
+        sft_implication: "需要矛盾处理类别（8%）——至少让模型学会识别和标注文档间分歧"
+
+    caveat_on_rubric_strictness: |
+      引文质量和整合质量整体偏低，存在两种解读：
+      1. 模型能力不足（SFT 要修的目标）
+      2. Rubric 本身对'4 分'的定义相对于 T2Ranking 的实际搜索场景可能偏严——
+         并非每条查询都涉及多文档矛盾或需要典范级引文，模型拿不到 4 分
+         未必代表答案不可用，更可能是 rubric 的满分档位本身就极少被触发。
+         同理，7B 的引文大量停在 2 分区，部分原因可能是搜索场景本身不复杂到
+         需要多来源精确引用——模型做了'基本够用'的引用但在 rubric 下只拿到 2 分。
+      
+      但无论如何，模型间的**相对差距**是真实信号：qwen3-max 在同一条 rubric
+      下的引文质量（2.75）明显高于 7B（2.08），说明 rubric 是能区分好坏的。
+      SFT 的目标不是人人都拿满分，而是让本地模型在这个 rubric 下的表现向
+      API 模型逼近——弥补的是相对差距，而非追求 rubic 定义意义上的绝对完美。
+
+  data_philosophy:
+    core_insight: "SFT 的价值不在数据量，而在数据覆盖了哪些行为模式"
+    why_not_full_trainset: "T2Ranking 训练集 258K 条 query。如果 80% 的 query 检索结果很好、教师答案也很标准，QLoRA 训练 3000 条和 20000 条的差异可能不到 1 分。且 QLoRA 仅训练 ~1.2% 参数，过多样本反而容易过拟合到教师模型的风格细节"
+    quantity_vs_quality: "针对窄任务（AI 搜索生成）+ QLoRA，1500-3000 条高质量、多场景覆盖的样本远胜 10000 条单一场景样本"
+    prior_art:
+      - "LIMA (2023): 65B 模型仅需 1000 条高质量指令样本即可有效微调"
+      - "RAFT (2024): 7B 模型在 RAG 问答上 1000-5000 条样本即可达到商业可用水平"
+      - "领域 SFT 实践: 窄领域单任务 QLoRA 适配通常 500-2000 条即可"
+
+
+# =============================================================================
+# 第二部分：模型选型
+# =============================================================================
+
+model_selection:
+
+  student_model:
+    id: "Qwen3-4B"
+    hf_id: "Qwen/Qwen3-4B"
+    params: "4B"
+    vram_fp16: "~8GB"
+    vram_4bit: "~2.5GB"
+    context_len: 32768
+    chat_template: "qwen3"
+    thinking_mode: "OFF（exp-005 证实 thinking 在 AI 搜索有害，-2.8 分）"
+    max_tokens_generation: 1024
+    selection_rationale: |
+      exp-005 证明：
+      1. Qwen3-4B-nonthink（60.2）全面超越 Qwen2.5-7B（56.0）
+      2. 以 57% 参数量和 ~50% VRAM 实现 +4.2 分显著优势
+      3. thinking 模式在 AI 搜索中 -2.8 分，与 Qwen3 官方 RULER 结论一致
+      4. 4B 是 RTX 4090 上可舒适训练的最大 Qwen3 模型
+
+  teacher_model:
+    id: "qwen3-max"
+    provider: "阿里云 API"
+    thinking_mode: "OFF"
+    temperature: 0.3
+    max_tokens: 1024
+    selection_rationale: |
+      exp-005 证明：
+      1. 总分 72.7，81.2% Pass%，在所有维度上碾压所有本地模型
+      2. 用户体验 +0.47（vs 最佳本地）——在回答结构、措辞、可读性上的系统性领先
+      3. 引文质量 +0.30——引用更精准、更可靠
+      4. 准确性 +0.33——更少事实偏差
+      5. 是目前可用的最佳教师模型
+
+  training_method:
+    method: "QLoRA"
+    rationale: |
+      - RTX 4090 24GB 无法承受 4B 模型的全参数微调（FP16 需 ~16GB + optimizer states 远超 24GB）
+      - QLoRA 仅训练 ~1.2% 参数，显存需求 ~8-10GB
+      - exp-007 Phase 3.2 已用 LoRA 在双塔模型上验证了参数高效训练的可行性
+      - QLoRA 在指令微调领域是最成熟、坑最少的方案
+    quantization: "4-bit NF4（bitsandbytes）"
+    lora_config:
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    framework: "推荐 unsloth（Qwen3 原生支持，训练速度 2×）或 trl.SFTTrainer"
+    alternative: "全参数微调（需 A100 80GB，AutoDL 约 ¥8-10/小时，不推荐 V1 阶段）"
+
+
+# =============================================================================
+# 第三部分：训练数据构造 —— 六阶段 Pipeline
+# =============================================================================
+
+data:
+
+  data_sources:
+    train_queries: "data/raw/t2ranking/queries.train.tsv（258,042 条训练查询）"
+    retrieval_qrels: "data/raw/t2ranking/qrels.retrieval.train.tsv（744,663 对二元 qrels）"
+    graded_qrels: "data/raw/t2ranking/qrels.train.tsv（1,613,421 对 4 级标注 qrels，0-3）"
+    passage_collection: "data/raw/t2ranking/collection.tsv（2,303,643 条 passage）"
+    off_limits: "queries.dev.tsv / queries.test.tsv —— 纯粹用于最终评估，不参与任何训练数据构造"
+
+  pipeline_overview: |
+    阶段一（分层抽样）→ 阶段二（检索管道）→ 阶段三（教师生成）→
+    阶段四（质量过滤）→ 阶段五（检索质量分桶）→ 阶段六（类别构造）
+    → 最终 SFT 训练数据 2000-3000 条
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段一：分层抽样
+  # ─────────────────────────────────────────────────────────
+
+  stage1_sampling:
+    objective: "从 258K 条训练查询中抽出 5000 条，保证检索困难查询被充分代表"
+    why_stratified: |
+      简单随机抽样会系统性欠采样'检索困难'的查询（因为大多数 query 有丰富的相关 passage），
+      而这些恰恰是 SFT 中最有价值的——拒答、噪声类别只能从它们中构造
+
+    # ── 前置步骤：数据统计（必须先于抽样执行）──
+    prerequisite_stats:
+      status: "DONE（2026-05-31 执行）"
+      script: "scripts/exp009/sample_training_queries.py --mode stats"
+      key_findings:
+        - "num_positive 中位数 = 2，均值 = 2.9，最大值 = 16"
+        - "num_positive > 0 时 max_grade 全部 ≥ 2（不存在 grade=1 的 query）"
+        - "max_grade 在 num_positive > 0 时无区分度——分层只需看 num_positive"
+        - "num_positive 分布比预期'瘦'得多：52% 的 query 只有 0-2 个相关 passage"
+        - "原估计 np≥10 对于 T1 完全错误——仅 0.9% 的 query 满足"
+      distribution:
+        - {np: "0", count: 57666, pct: "22.3%", max_grade_dist: "全部 grade=0"}
+        - {np: "1-2", count: 77041, pct: "29.9%", max_grade_dist: "~51% grade=2, ~49% grade=3"}
+        - {np: "3-4", count: 49095, pct: "19.0%", max_grade_dist: "~37% grade=2, ~63% grade=3"}
+        - {np: "5-9", count: 72022, pct: "27.9%", max_grade_dist: "~27% grade=2, ~73% grade=3"}
+        - {np: "10-19", count: 2218, pct: "0.9%", max_grade_dist: "~19% grade=2, ~81% grade=3"}
+        - {np: "20+", count: 0, pct: "0.0%"}
+      decision: |
+        根据实际分布，分层阈值修正为：
+        - T3: num_positive = 0（22.3%，查无相关 passage）—— 唯一合理的"贫信息"定义
+        - T2: num_positive = 1-2（29.9%）—— 有少量相关，但可能不足以支撑完整回答
+        - T1: num_positive ≥ 3（47.8%）—— 有充足相关 passage
+        max_grade 不再纳入分层条件（在 num_positive > 0 时无区分度）
+
+    difficulty_proxy:
+      primary: "num_positive（qrels.retrieval.train 中有标注的 passage 数）"
+      note: "max_grade 和 avg_grade 在 num_positive > 0 时无区分度，仅用于交叉验证"
+
+    strata:
+      - name: "T1 富信息"
+        definition: "num_positive ≥ 3 [数据驱动：2026-05-31 统计确认]"
+        description: "有 3 个及以上相关 passage"
+        natural_pct: "47.8%（123,335 条）"
+        target_sample_pct: "35%（~1750 条）"
+        rationale: "从 48% 降采样——数据多、价值低，避免淹没困难样本"
+      - name: "T2 中等"
+        definition: "num_positive = 1-2 [数据驱动：2026-05-31 统计确认]"
+        description: "有 1-2 个相关 passage"
+        natural_pct: "29.9%（77,041 条）"
+        target_sample_pct: "25%（~1250 条）"
+        rationale: "保持接近自然比例"
+      - name: "T3 贫信息"
+        definition: "num_positive = 0 [数据驱动：2026-05-31 统计确认]"
+        description: "无任何标注相关 passage——**拒答和噪声类别的唯一来源**"
+        natural_pct: "22.3%（57,666 条）"
+        target_sample_pct: "40%（~2000 条）"
+        rationale: "从 22% 过采样到 40%——用数量换价值"
+    total_sampled: 5000
+    why_5000: "预估过滤率 ~60%，最终目标 2000-3000 条。如过滤后不足 2000 条，补抽一批"
+
+    # ── 抽样后的后验检查 ──
+    post_sampling_check:
+      description: "分层抽样完成后，对抽取的 5000 条做快速统计，确认结构合理"
+      checks:
+        - "T1/T2/T3 的实际条数是否接近目标配比"
+        - "各层内 query 文本长度的分布（排除极端短/长 query 集中现象）"
+        - "各层内 num_positive 的均值和标准差（确保层内同质性）"
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段二：走检索管道
+  # ─────────────────────────────────────────────────────────
+
+  stage2_retrieval:
+    objective: "为 5000 条训练查询获取 top-10 精排 passages"
+    pipeline:
+      dense_backend: "exp-007 Phase 3.2 微调 M3E-base（R@10=0.5064，比原始提升 30%）"
+      query_augmentation_model:
+        primary: "Qwen3-4B（本地 vLLM 部署，non-thinking，temperature=0）"
+        fallback: "DeepSeek API（本地部署不顺利时的降级方案）"
+        design_rationale: |
+          选择 Qwen3-4B 作为查询改写和 HyDE 的生成模型，有三个层面的考量：
+          1. **一致性叙事**：查询改写（Qwen3-4B）、HyDE（Qwen3-4B）、最终答案生成（Qwen3-4B SFT 后）
+             三者使用同一个模型家族。这形成一条完整的'本地模型全链路'故事线——
+             不是'用 API 做增强 → 用本地模型做生成'的割裂方案，而是'同一个模型
+             既懂怎么搜、也懂怎么答'。
+          2. **成本归零**：5000 条 × 2 次调用（改写 + HyDE），全部本地推理，¥0。
+             不需要为检索增强环节调任何外部 API。
+          3. **现实考量**：本地部署 LLM（vLLM + Qwen3-4B）的环境配置可能不顺利。
+             如果折腾超过半天仍未成功，降级回 DeepSeek API（已验证的 exp-002/003 方案）。
+             这也反向提供了一个有价值的信号：本地模型全链路方案的环境成本到底有多高。
+      routes:
+        - "D-B0: 原查询 → Dense 检索（exp-007 微调模型）"
+        - "D-P2: Qwen3-4B 改写查询（exp-002 P2 领域 few-shot prompt）→ Dense 检索"
+        - "B-B0: 原查询 → BM25 检索"
+      hyde: "Qwen3-4B HyDE 假答案（E2c-H2 prompt）→ Dense 检索（exp-007 微调模型）"
+      fusion: "4 路 RRF（per-route K=50, RRF k=60，复现 exp-003 S4 最优配置）"
+      reranker: "bge-reranker-v2-m3 精排 → Top-10（复现 exp-004 最优配置）"
+    why_not_reuse_old_retrieval: "训练集 query 从未走过检索管道（之前只在 dev 集上跑过）。且 exp-007 微调后 embedding 空间已变，不可复用旧结果"
+    fallback_plan:
+      condition: "本地 vLLM + Qwen3-4B 环境配置超过半天仍未跑通"
+      action: "降级为 DeepSeek API（prompt 不变，仅切换模型后端）"
+      note: "prompt 是模型无关的（exp-002 时期就在 DeepSeek 上验证过），切换不影响输出语义"
+    cost:
+      primary: "¥0（Qwen3-4B 本地推理）"
+      fallback_api: "5000 × 2（改写 + HyDE）× ¥0.00043 ≈ ¥4（仅当降级时发生）"
+      dense_retrieval: "本地 RTX 4090，~15-20 分钟（FAISS IndexFlatIP）"
+      reranker: "本地 RTX 4090，~30 分钟"
+    output: "每条 query 的 top-10 passages + rrf_score + pid + text"
+
+    orchestration:
+      description: "Shell 脚本串联 6 个独立子步骤，每步读上一步的输出、写下步的输入。支持断点续跑（检测中间文件自动跳过已完成步骤）"
+      windows: "scripts/exp009/run_retrieval_pipeline.ps1"
+      linux: "scripts/exp009/run_retrieval_pipeline.sh"
+    data_flow: |
+      exp009_sampled_queries.jsonl
+        │
+        ├──[Step 1: run_query_augment.py]──→ exp009_rewritten_queries.jsonl
+        │                                    exp009_hyde_answers.jsonl
+        │
+        ├──[Step 2: build_faiss_index.py]──→ {VECTOR_DB}/t2ranking/{model}/  (FAISS 索引)
+        │
+        ├──[Step 3: dense_retrieve.py]─────→ exp009_dense_B0.jsonl  (原查询)
+        │                                    exp009_dense_P2.jsonl  (改写)
+        │                                    exp009_dense_H2.jsonl  (HyDE)
+        │
+        ├──[Step 4: bm25_retrieve.py]──────→ exp009_bm25_B0.jsonl
+        │
+        ├──[Step 5: rrf_fuse.py]───────────→ exp009_rrf_fused.jsonl  (4路→top-50)
+        │
+        └──[Step 6: rerank.py]─────────────→ exp009_reranked_top10.jsonl  (最终输出)
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段三：教师生成
+  # ─────────────────────────────────────────────────────────
+
+  stage3_teacher_generation:
+    objective: "用 qwen3-max 为每条 query 生成高质量参考答案"
+    prompt_template:
+      source: "src/generation/prompts.py（SYSTEM_PROMPT + FEW_SHOT，复用 exp-005 同一套）"
+      key_features:
+        - "明确的忠于资料原则"
+        - "综合多篇资料的融合要求"
+        - "引用来源标注格式（[来源: N]）"
+        - "诚实面对不足的能力（示例如 FEW_SHOT 示例 2）"
+        - "答案结构指导"
+    model_config:
+      model: "qwen3-max"
+      temperature: 0.3
+      thinking: "OFF（关键！exp-005 证实有害）"
+      max_tokens: 1024
+    cost: "5000 × ¥0.003 ≈ ¥15"
+    output: "5000 条原始（query, passages, teacher_answer）三元组"
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段四：质量过滤
+  # ─────────────────────────────────────────────────────────
+
+  stage4_filtering:
+    objective: "筛除教师生成的低质量答案——脏数据进 SFT 比没数据更糟"
+    rule_based:
+      - {rule: "空答案", condition: "生成文本 < 10 字符", action: "丢弃"}
+      - {rule: "超长", condition: "生成文本 > 2048 字符", action: "截断或丢弃"}
+      - {rule: "重复", condition: "同一句子出现 ≥ 3 次", action: "丢弃"}
+      - {rule: "非中文主导", condition: "非中文字符 > 50%", action: "丢弃"}
+      - {rule: "教师意外拒答", condition: "答案中包含'作为 AI'、'无法提供'等，但检索质量良好（非我们设计的拒答场景）", action: "丢弃"}
+      - {rule: "无引用（标准类别）", condition: "标准类别中答案无任何 [来源: 标记]", action: "降级为非标准类别或丢弃"}
+    judge_scoring:
+      description: "用 deepseek-chat 单维度准确性评分（仅准确性，非全 6 维）"
+      threshold: "准确性 < 3 → 丢弃（教师的答案本身不准确，不能用来教学生）"
+      cost: "~4000 条 × ¥0.001 ≈ ¥4"
+    human_spot_check:
+      description: "从通过过滤的数据中随机抽 50 条人工确认教师答案质量"
+      criteria:
+        - "答案是否忠实于给定 passage"
+        - "引用是否基本准确"
+        - "拒答样本的拒答理由是否合理"
+      action: "合格率 > 90% → 信任自动过滤；否则调整过滤阈值重新过"
+    expected_retention: "~60%（3000 条通过过滤）"
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段五：检索质量分桶
+  # ─────────────────────────────────────────────────────────
+
+  stage5_bucketing:
+    objective: "按检索结果的实际质量将数据分配到不同类别"
+    metrics:
+      search_coverage: "|top-10 pids ∩ relevant_pids| / min(10, |relevant_pids|)"
+      best_grade: "max(grade for pid in top-10 if pid in graded_qrels)"
+    buckets:
+      - name: "桶 A（检索好）"
+        condition: "search_coverage ≥ 0.5 且 best_grade ≥ 2"
+        expected_pct: "~56%"
+        target_categories: "标准搜索问答 / 引文强调"
+      - name: "桶 B（检索中）"
+        condition: "0.2 ≤ search_coverage < 0.5 或 best_grade == 1"
+        expected_pct: "~24%"
+        target_categories: "部分标准 / 部分噪声注入"
+      - name: "桶 C（检索差）"
+        condition: "search_coverage < 0.2 或 top-10 全部无 qrels 标注"
+        expected_pct: "~20%"
+        target_categories: "拒答 / 噪声 / 矛盾"
+    note: "桶 C ≠ T3 层。T3 是 query 层面的先验，桶 C 是检索结果的后验。T3 的 query 如果检索意外成功 → 进桶 A"
+
+  # ─────────────────────────────────────────────────────────
+  # 阶段六：类别构造
+  # ─────────────────────────────────────────────────────────
+
+  stage6_category_construction:
+
+    design_rationale: |
+      五类数据的配比来自 exp-005 失败模式的系统反推（详见第一部分 failure_mode_analysis）。
+      核心原则：哪个维度差、哪种失败多，对应的训练数据就多。
+      标准类别被刻意压低（55% 而非 70-80%），因为'正常回答'容易教、
+      '拒答和精确引用'难教——用数量换难度。
+
+    categories:
+
+      # ── 类别 1：标准搜索问答 ──
+      - name: "标准搜索问答"
+        proportion: "55%（~1500 条）"
+        source: "桶 A 中随机采样"
+        construction: "不修改 prompt，不修改答案。直接使用阶段三的生成结果"
+        training_goal: "核心能力：忠实回答 + 综合多文档 + 引用来源 + 结构化呈现"
+        design_why_55pct_not_higher: |
+          在 QLoRA 训练中，如果标准样本占比 ≥ 70%，模型会学到'每道题都有答案'的隐含假设。
+          这和 exp-005 的发现完全一致——7B 的问题不是不会答，而是太想答（D 级 58.6%）。
+          标准题占比 55% 是有意偏低的设计，强制让模型频繁遇到'这道题真的没答案'的情况。
+
+      # ── 类别 2：引文强调 ──
+      - name: "引文强调"
+        proportion: "12%（~320 条）"
+        source: "桶 A 中随机采样（与标准数据不重叠）"
+        construction: |
+          在 prompt 的 system 部分加一句话，然后重新调用 qwen3-max 生成答案：
+          '本次回答中，请特别注重引用精确性——每一条关键事实性陈述后必须紧跟 [来源: N] 标记。不得出现未标注来源的事实性陈述。'
+        training_goal: "最大短板的靶向修复——展示刻意精确的引文范式"
+        design_why_12pct: |
+          这是唯一一个需要刻意构造而非自然产生的类别。在标准数据中，教师已有
+          较好的引文行为（76% 在 3 分区），但学生从中只学到'自然携带的引文'，
+          而非'引文是硬性要求'。12% 的刻意强引文样本提供更强的梯度信号。
+          ——足以让模型学会认真引用，但不至于过度引用影响可读性。
+        cost: "320 × ¥0.003 ≈ ¥1"
+
+      # ── 类别 3：信息不足/拒答 ──
+      - name: "信息不足/拒答"
+        proportion: "17%（~460 条）"
+        source: "桶 C（检索差）"
+        construction: |
+          不做额外 prompt 修改，直接使用教师在桶 C 输入下的原始生成结果。
+          关键筛选：仅保留教师正确拒答的样本（答案中明确表达了'资料不足'或'无法确定'，
+          说明了原因，没有强行编造）。教师强行给了具体答案的 → 丢弃。
+        expected_yield: "桶 C 的 1000 条中约 50-60% 教师自然给出拒答式回答 → 取 460 条"
+        training_goal: "对抗 RLHF 'helpfulness'偏置——教会模型在不该回答时明确说'无法确定'"
+        design_why_17pct: |
+          在 RLHF 对齐的模型中，拒答行为需要大约 1/6 的训练样本来对抗
+          helpfulness 的预训练偏置。模型被数千亿 token 训练成'要帮忙'，
+          用寥寥几个样本告诉它'可以拒绝'是不够的。17%（约 1/6）的占比
+          让拒答行为在训练中被足够多次强化，但不超过 1/3 不至于让模型变得过度保守。
+          AI 搜索最致命的用户体验问题是模型在不该编的时候编造——这一类别是攻击此问题的核心武器。
+
+      # ── 类别 4：噪声干扰 ──
+      - name: "噪声干扰"
+        proportion: "8%（~220 条）"
+        source: "桶 B 的输入 + 人工噪声注入"
+        construction: |
+          在已有的 top-10 passages 中，用 1-3 个完全随机不相关的 passage
+          替换排名靠后的 passage（确保不相关 pid 不在 qrels 中）。
+          用默认 prompt（不告知有噪声）重新调用 qwen3-max 生成答案。
+          质量检查：教师答案是否被噪声带偏？如果教师引用了噪声 passage 的信息 → 丢弃。
+        training_goal: "鲁棒性兜底——在混杂无关文档时仍聚焦相关信息"
+        design_why_8pct: |
+          噪声容忍在标准数据中已经自然覆盖（reranker top-10 总有一定比例的不完全相关文档）。
+          此类别只是额外构造的极端案例（5-10 个 passage 中只有 1-2 个相关），
+          用于训练模型在'检索灾难'场景下的行为。不需要太多——8% 足够让模型见过这种场景。
+        cost: "220 × ¥0.003 ≈ ¥0.7"
+
+      # ── 类别 5：矛盾处理 ──
+      - name: "矛盾处理"
+        proportion: "8%（~220 条）"
+        source: "桶 A+B 中 top-10 passage 内存在事实性矛盾的 case"
+        detection_method: |
+          用 deepseek-chat 快速判断是否存在数值/事实矛盾：
+          Prompt: 以下文档是否存在明显的事实矛盾（矛盾的数字、对立的结论）？
+          对桶 A+B 中的 2000 条抽样 → 矛盾检测
+        construction: |
+          对 has_conflict=true 的 case，在 system prompt 中加：
+          '如果资料之间存在矛盾，请明确指出并呈现各方说法，不要武断选边。'
+          重新调用 qwen3-max 生成答案。
+        expected_yield: "2000 条中约 15-20% 存在可见矛盾 → 取 220 条"
+        training_goal: "能力天花板探索——学会识别和标注文档间分歧"
+        design_why_8pct: |
+          矛盾处理是整合质量的子能力，标准数据中也自然存在。但 T2Ranking 的
+          passage 来自同一语料源，天然矛盾不多。8% 只需让模型'见过这个场景，
+          知道怎么处理'，而非'让模型习惯性怀疑所有文档'（过度警觉反而降低用户体验）。
+          ——且不能人工构造太多矛盾样本，否则模型会过度警觉。
+        cost: "矛盾检测 2000 × ¥0.001 = ¥2，重生成 220 × ¥0.003 ≈ ¥0.7"
+
+    category_summary:
+      total_target: "~2720 条"
+      proportions_check:
+        has_answer: "标准 55% + 引文强调 12% = 67%（大多数在学'怎么答好'）"
+        difficult: "拒答 17% + 噪声 8% + 矛盾 8% = 33%（三分之一在学'什么时候不该答、怎么在困难中答'）"
+        rationale: "33% 的困难场景占比足够高频让模型不敢忽视，但不超过一半不至于让模型变得过度保守"
+
+  # ─────────────────────────────────────────────────────────
+  # 输出：SFT 训练数据格式
+  # ─────────────────────────────────────────────────────────
+
+  output_format:
+    file: "data/processed/exp009_sft_train.jsonl"
+    schema:
+      qid: "T2Ranking query ID（用于溯源，不参与训练）"
+      query: "用户原始查询文本"
+      category: "standard | citation_emphasized | refusal | noisy | conflicting"
+      system_prompt: "完整的 system prompt（含 few-shot 示例）"
+      input_passages: "Top-10 精排 passage 列表 [{rank, pid, text, source}]"
+      output_answer: "qwen3-max 生成的教师答案"
+      teacher_model: "qwen3-max"
+      teacher_temperature: 0.3
+      retrieval_bucket: "A | B | C"
+      search_coverage: "检索覆盖度评分（用于后验分析）"
+    validation_split:
+      description: "从桶 A 标准数据中留出 200 条做训练验证"
+      file: "data/processed/exp009_sft_val.jsonl"
+      note: "仅用于监控训练过程中的 loss/perplexity，不用于模型效果评估（效果评估复用 exp-005 dev 集）"
+
+
+# =============================================================================
+# 第四部分：训练方案
+# =============================================================================
+
+training:
+
+  framework: "unsloth（推荐）或 trl.SFTTrainer"
+  base_model: "Qwen/Qwen3-4B"
+
+  qlora_config:
+    load_in_4bit: true
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_use_double_quant: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  hyperparameters:
+    epochs: 3
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 4
+    effective_batch_size: 16
+    learning_rate: 2e-4
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.05
+    weight_decay: 0.01
+    max_seq_length: 6144
+    packing: false
+    optim: "adamw_8bit"
+    fp16: "not needed（QLoRA 使用 bf16 计算）"
+
+  training_data_format: |
+    使用 Qwen3 的 chat template：
+    <|im_start|>system
+    {system_prompt}<|im_end|>
+    <|im_start|>user
+    参考资料:
+    [1] 来源: {pid}
+    {text}
+    ...（passages）
+    用户问题: {query}
+    请根据以上参考资料回答问题：<|im_end|>
+    <|im_start|>assistant
+    {teacher_answer}<|im_end|>
+
+  expected_resources:
+    vram_usage: "~8-10GB（QLoRA 4B）"
+    training_time: "~2-3 小时（2720 条 × 3 epochs，RTX 4090）"
+
+  monitoring:
+    train_loss: "每个 logging step 记录"
+    eval_loss: "每个 epoch 后在验证集上计算"
+    save_strategy: "每个 epoch 保存 checkpoint"
+
+
+# =============================================================================
+# 第五部分：评估方案
+# =============================================================================
+
+evaluation:
+
+  test_set:
+    description: "复用 exp-005 的 200 条评估集"
+    source: "queries.dev.tsv → exp-004 reranker top-10（与训练数据完全隔离）"
+    note: "T2Ranking 的 dev split 从未被用于训练数据构造，不存在数据泄露"
+
+  judge_system:
+    description: "复用 exp-005 的 Judge 体系，确保 SFT 前后可比"
+    config:
+      judge_model: "deepseek-chat"
+      dimensions: "准确性 + 安全性 + 相关性 + 整合质量 + 引文质量 + 用户体验"
+      batches: "Batch1（门槛组）+ Batch2（质量组），每批 3 维度"
+    baseline_scores:
+      qwen3_4B: 60.2
+      qwen3_max: 72.7
+
+  metrics:
+    primary: "6 维加权总分（0-100）+ Pass%（总分 ≥ 60）"
+    secondary:
+      - "各维度平均分（1-4）"
+      - "等级分布（S/A/B/C/D/F）"
+      - "维度热力图"
+      - "各维度 vs qwen3-max 差距"
+
+  comparison_targets:
+    pretrained: "Qwen3-4B-nonthink 未微调基线（60.2 分）"
+    teacher: "qwen3-max（72.7 分）——理论上界"
+    previous_best: "Qwen2.5-7B（56.0 分）——被 SFT 后 4B 超越的参照"
+
+  ablation:
+    description: "可选：样本量消融——验证 2720 条是否为过饱和"
+    method:
+      - "从 2720 条中随机抽 500 条 → SFT → 评估"
+      - "抽 1000 条 → SFT → 评估"
+      - "全量 2720 条 → SFT → 评估"
+      - "画'训练样本量 vs Judge 评分'曲线"
+    expected_insight: "如果 1000 → 2720 提升 < 1 分，说明 QLoRA 在窄任务上 1000 条就已饱和"
+
+  success_criteria:
+    target: "总分 ≥ 65（+4.8 vs 基线），Pass% ≥ 70%"
+    stretch: "总分 ≥ 68（+7.8），引文质量 ≥ 2.6（+0.15）"
+
+
+# =============================================================================
+# 第六部分：成本估算
+# =============================================================================
+
+cost:
+
+  api_calls:
+    - {step: "查询改写 + HyDE（Qwen3-4B 本地）", amount: "5000 × 2 次", cost: "¥0"}
+    - {step: "[fallback] 查询改写 + HyDE（DeepSeek API）", amount: "仅当本地部署失败时", cost: "+¥4"}
+    - {step: "教师生成（qwen3-max）", amount: "5000 条", cost: "¥15"}
+    - {step: "Judge 评分过滤（DeepSeek-chat）", amount: "~4000 条 × 准确性评分", cost: "¥4"}
+    - {step: "矛盾检测（DeepSeek-chat）", amount: "2000 条", cost: "¥2"}
+    - {step: "引文强调重生成（qwen3-max）", amount: "320 条", cost: "¥1"}
+    - {step: "噪声/矛盾重生成（qwen3-max）", amount: "440 条", cost: "¥1.5"}
+  total_api_primary: "~¥24（本地优先方案）"
+  total_api_fallback: "~¥28（降级为 API 时）"
+
+  compute:
+    - {step: "查询改写 + HyDE（Qwen3-4B vLLM）", resource: "RTX 4090 ~15-20min（5000 × 2）", cost: "¥0（本地）"}
+    - {step: "Dense 检索（5000 queries × 2.3M passages）", resource: "RTX 4090 ~15-20min", cost: "¥0（本地）"}
+    - {step: "Reranker 精排（5000 × top-50）", resource: "RTX 4090 ~30min", cost: "¥0（本地）"}
+    - {step: "QLoRA SFT 训练（2720 条 × 3 epochs）", resource: "RTX 4090 ~2-3h", cost: "¥0（本地）或 AutoDL ¥6-9"}
+    - {step: "SFT 后评估生成（200 条）", resource: "RTX 4090 ~10min", cost: "¥0（本地）"}
+    - {step: "SFT 后 Judge 评分（200 条 × 2 批）", resource: "DeepSeek API", cost: "¥2"}
+
+  total_primary: "~¥35（本地优先方案，含电费 ~¥5-10）"
+  total_fallback: "~¥40（降级为 API 时）"
+
+
+# =============================================================================
+# 第七部分：文件清单
+# =============================================================================
+
+files:
+  plan: "experiments/exp-009-generation-sft.yaml"
+
+  scripts:
+    sample_training_queries_py:
+      path: "scripts/exp009/sample_training_queries.py"
+      description: "阶段一：分层抽样 + 检索难度统计（--mode stats 先统计分布，再抽样）"
+    run_retrieval_pipeline_ps1:
+      path: "scripts/exp009/run_retrieval_pipeline.ps1"
+      description: "阶段二 Shell 编排脚本 (Windows PowerShell) —— 串行执行 Step 1-6，支持断点续跑"
+    run_retrieval_pipeline_sh:
+      path: "scripts/exp009/run_retrieval_pipeline.sh"
+      description: "阶段二 Shell 编排脚本 (Linux bash / AutoDL) —— 串行执行 Step 1-6，支持断点续跑"
+    run_query_augment_py:
+      path: "scripts/exp009/run_query_augment.py"
+      description: "阶段二 Step 1：查询增强（改写 + HyDE），读抽样 JSONL → 调 vLLM → 输出改写/HyDE JSONL"
+    dense_retrieve_py:
+      path: "scripts/exp009/dense_retrieve.py"
+      description: "阶段二 Step 3：Dense 检索（3 路：原查询/改写/HyDE），加载 FAISS 索引 → 编码 → top-50"
+    bm25_retrieve_py:
+      path: "scripts/exp009/bm25_retrieve.py"
+      description: "阶段二 Step 4：BM25 检索（1 路），分词 → 构建 BM25 → top-50"
+    rrf_fuse_py:
+      path: "scripts/exp009/rrf_fuse.py"
+      description: "阶段二 Step 5：RRF 融合（4 路 → top-50），复用 exp003/rrf_fuse()"
+    rerank_py:
+      path: "scripts/exp009/rerank.py"
+      description: "阶段二 Step 6：Reranker 精排（bge-reranker-v2-m3 → top-10），复用 exp004 推理逻辑"
+    generate_teacher_answers_py:
+      path: "scripts/exp009/generate_teacher_answers.py"
+      description: "阶段三：qwen3-max 批量生成教师答案"
+    filter_and_bucket_py:
+      path: "scripts/exp009/filter_and_bucket.py"
+      description: "阶段四+五：规则过滤 + Judge 准确性过滤 + 检索质量分桶"
+    construct_categories_py:
+      path: "scripts/exp009/construct_categories.py"
+      description: "阶段六：五类 SFT 数据构造（引文强调/拒答/噪声/矛盾 + 矛盾检测）"
+    train_sft_py:
+      path: "scripts/exp009/train_sft.py"
+      description: "QLoRA SFT 训练脚本（unsloth 或 trl）"
+    inspect_sft_data_py:
+      path: "scripts/exp009/inspect_sft_data.py"
+      description: "数据质量检查 + 分类统计报告"
+
+  data_outputs:
+    - {file: "data/processed/exp009_sampled_queries.jsonl", description: "分层抽样的 5000 条 query + 元信息"}
+    - {file: "data/processed/exp009_rewritten_queries.jsonl", description: "查询改写结果"}
+    - {file: "data/processed/exp009_hyde_answers.jsonl", description: "HyDE 假答案"}
+    - {file: "data/processed/exp009_dense_B0.jsonl", description: "Dense 检索：原查询 top-50"}
+    - {file: "data/processed/exp009_dense_P2.jsonl", description: "Dense 检索：改写查询 top-50"}
+    - {file: "data/processed/exp009_dense_H2.jsonl", description: "Dense 检索：HyDE 查询 top-50"}
+    - {file: "data/processed/exp009_bm25_B0.jsonl", description: "BM25 检索：原查询 top-50"}
+    - {file: "data/processed/exp009_rrf_fused.jsonl", description: "RRF 融合后 top-50"}
+    - {file: "data/processed/exp009_reranked_top10.jsonl", description: "Reranker 精排后 top-10（检索管道最终输出）"}
+    - {file: "data/processed/exp009_teacher_answers.jsonl", description: "教师生成的原始答案（过滤前）"}
+    - {file: "data/processed/exp009_filtered_answers.jsonl", description: "质量过滤后 + 检索质量分桶"}
+    - {file: "data/processed/exp009_sft_train.jsonl", description: "最终 SFT 训练数据（~2720 条）"}
+    - {file: "data/processed/exp009_sft_val.jsonl", description: "训练验证集（桶 A 标准数据 200 条）"}
+
+  model_outputs:
+    - {file: "models/qwen3-4b-t2ranking-sft/", description: "QLoRA adapter + merged model"}
+
+  results:
+    - {file: "results/exp009/sft_scores.jsonl", description: "SFT 后 Qwen3-4B 在 200 条测试集上的 Judge 评分"}
+    - {file: "results/exp009/sft_vs_baseline.md", description: "SFT 前后对比分析报告"}
+
+
+# =============================================================================
+# 第八部分：风险与应对
+# =============================================================================
+
+risks:
+
+  - risk: "教师答案质量不达标（过滤后样本不足 2000 条）"
+    likelihood: "中（30%）"
+    mitigation: "补抽一批 query 重新走全流程；或放宽 Judge 准确性过滤阈值从 3 降至 2（允许少量 minor error）"
+
+  - risk: "桶 C 的教师拒答率过低（< 30%），导致拒答类别样本不足"
+    likelihood: "中（40%）"
+    mitigation: |
+      人工构造拒答样本：在桶 A 的输入中，故意只保留 1-2 个弱相关 passage，
+      然后用修改后的 prompt 告知教师'资料不足以回答，请诚实说明'，
+      让教师生成拒答式回答。这类构造样本需标注为人工构造以区分。
+
+  - risk: "QLoRA SFT 后模型在通用对话能力上出现灾难性遗忘"
+    likelihood: "低（15%）——QLoRA 仅训练 1.2% 参数，遗忘风险远小于全参微调"
+    mitigation: "SFT 数据中混入 5% 的通用对话保留数据（如 alpaca-gpt4 中文子集）"
+
+  - risk: "SFT 后评估分数未显著提升（< +3 分 vs 基线 60.2）"
+    likelihood: "中（30%）"
+    mitigation: |
+      分析失败原因：
+      - 如果所有维度均无提升 → 数据质量问题（教师答案不够好/数据构造有问题）
+      - 如果引文提升但整合不动 → 整合天花板是 LLM 本体能力限制，需要更大模型或 DPO（exp-010）
+      - 如果拒答有提升但其他维度退步 → 拒答占比过高（17 → 10%）
+      无论如何，失败分析本身就是有价值的发现
+
+  - risk: "用 qwen3-max 做教师训练 Qwen3-4B，产生'教师偏置'——学生学到 max 的风格但'知其然不知其所以然'"
+    likelihood: "高（60%）——蒸馏的本质问题"
+    mitigation: |
+      这不完全是坏事——max 的风格本身在 Judge 眼中就是高分特征。
+      真正的风险是'只模仿风格而没学会内容判断'。
+      对应方案：在 DPO 阶段（exp-010）用偏好对专门训练模型的判断能力。

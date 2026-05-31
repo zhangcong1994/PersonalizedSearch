@@ -1,10 +1,9 @@
 """
 Exp-009 Step 1: Query Augmentation (改写 + HyDE).
 
-读抽样后的 query JSONL → 调用本地 vLLM (Qwen3-4B) → 输出改写/HyDE JSONL。
+读抽样后的 query JSONL → 调用 LLM → 输出改写/HyDE JSONL。
 
 复用 exp-007 中验证过的 P2 改写 prompt + H2 HyDE prompt。
-vLLM 调用逻辑也复用 exp007 的 LangChain ChatOpenAI 模式。
 
 输入格式:
   {"qid": "50000", "query": "如何...", "stratum": "T1", ...}
@@ -16,11 +15,19 @@ vLLM 调用逻辑也复用 exp007 的 LangChain ChatOpenAI 模式。
 缓存: 已生成的 qid 自动跳过（支持断点续跑）。
 
 用法:
+  # 本地 vLLM (Qwen3-4B)
   python scripts/exp009/run_query_augment.py \
+      --backend vllm --llm-url http://localhost:8000/v1 \
       --input data/processed/exp009_sampled_queries.jsonl \
       --output-rw data/processed/exp009_rewritten_queries.jsonl \
-      --output-hy data/processed/exp009_hyde_answers.jsonl \
-      --llm-url http://localhost:8000/v1
+      --output-hy data/processed/exp009_hyde_answers.jsonl
+
+  # DeepSeek API (vLLM 部署失败时的降级方案)
+  python scripts/exp009/run_query_augment.py \
+      --backend deepseek \
+      --input data/processed/exp009_sampled_queries.jsonl \
+      --output-rw data/processed/exp009_rewritten_queries.jsonl \
+      --output-hy data/processed/exp009_hyde_answers.jsonl
 """
 
 import os
@@ -142,24 +149,38 @@ def is_valid_hyde(text: str) -> bool:
     return True
 
 
-# ── vLLM 调用 ────────────────────────────────────────────
+# ── LLM 调用（vLLM / DeepSeek API 双后端）──────────────
 
-def _get_llm(llm_url: str, max_tokens: int):
+def _get_llm(backend: str, max_tokens: int, llm_url: str | None = None):
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(
-        model="default",
-        api_key="EMPTY",
-        base_url=llm_url,
-        temperature=0,
-        max_tokens=max_tokens,
-    )
+
+    if backend == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY not set")
+        return ChatOpenAI(
+            model="deepseek-chat",
+            api_key=api_key,
+            base_url="https://api.deepseek.com/v1",
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+    else:
+        return ChatOpenAI(
+            model="default",
+            api_key="EMPTY",
+            base_url=llm_url or "http://localhost:8000/v1",
+            temperature=0,
+            max_tokens=max_tokens,
+        )
 
 
 # ── 生成函数 ─────────────────────────────────────────────
 
 def generate_rewrites(
     queries: list[tuple[str, str]],
-    llm_url: str,
+    backend: str,
+    llm_url: str | None,
     batch_size: int,
     output_path: Path,
 ):
@@ -175,7 +196,7 @@ def generate_rewrites(
 
     logger.info(f"Rewrite: {len(missing)}/{len(queries)} to generate ({len(cached_qids)} cached)")
 
-    llm = _get_llm(llm_url, max_tokens=128)
+    llm = _get_llm(backend, max_tokens=128, llm_url=llm_url)
     chain = ChatPromptTemplate.from_messages([
         ("system", REWRITE_SYSTEM),
         ("human", REWRITE_HUMAN),
@@ -230,7 +251,8 @@ def generate_rewrites(
 
 def generate_hyde(
     queries: list[tuple[str, str]],
-    llm_url: str,
+    backend: str,
+    llm_url: str | None,
     batch_size: int,
     output_path: Path,
 ):
@@ -246,7 +268,7 @@ def generate_hyde(
 
     logger.info(f"HyDE: {len(missing)}/{len(queries)} to generate ({len(cached_qids)} cached)")
 
-    llm = _get_llm(llm_url, max_tokens=512)
+    llm = _get_llm(backend, max_tokens=512, llm_url=llm_url)
     chain = ChatPromptTemplate.from_messages([("system", HYDE_SYSTEM)]) | llm
 
     ok = filt = fail = 0
@@ -300,27 +322,31 @@ def generate_hyde(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Exp-009 Step 1: Query augmentation (rewrite + HyDE) via vLLM"
+        description="Exp-009 Step 1: Query augmentation (rewrite + HyDE)"
     )
+    parser.add_argument("--backend", choices=["vllm", "deepseek"], default="vllm",
+                        help="LLM backend: vllm (local Qwen3-4B) or deepseek (API)")
     parser.add_argument("--input", required=True,
                         help="Sampled queries JSONL (qid, query, stratum, ...)")
     parser.add_argument("--output-rw", required=True,
                         help="Output path for rewritten queries JSONL")
     parser.add_argument("--output-hy", required=True,
                         help="Output path for HyDE answers JSONL")
-    parser.add_argument("--llm-url", default="http://localhost:8000/v1",
-                        help="vLLM OpenAI-compatible endpoint")
+    parser.add_argument("--llm-url", default=None,
+                        help="vLLM OpenAI-compatible endpoint (required when --backend vllm)")
     parser.add_argument("--batch-size", type=int, default=32,
-                        help="Batch size for vLLM inference (default: 32)")
+                        help="Batch size for inference (default: 32)")
     parser.add_argument("--task", choices=["rewrite", "hyde", "both"], default="both",
                         help="Which task to run (default: both)")
     args = parser.parse_args()
+
+    if args.backend == "vllm" and not args.llm_url:
+        parser.error("--llm-url is required when --backend vllm")
 
     input_path = Path(args.input)
     output_rw = Path(args.output_rw)
     output_hy = Path(args.output_hy)
 
-    # 处理相对路径（相对于 DATA_ROOT）
     from src.utils.config import DATA_ROOT
     if not input_path.is_absolute():
         input_path = DATA_ROOT / input_path
@@ -331,10 +357,12 @@ def main():
 
     logger.info("=" * 60)
     logger.info("  Exp-009 Step 1: Query Augmentation")
+    logger.info(f"  Backend:  {args.backend}")
     logger.info(f"  Input:    {input_path}")
     logger.info(f"  OutputRW: {output_rw}")
     logger.info(f"  OutputHY: {output_hy}")
-    logger.info(f"  LLM URL:  {args.llm_url}")
+    if args.backend == "vllm":
+        logger.info(f"  LLM URL:  {args.llm_url}")
     logger.info(f"  Task:     {args.task}")
     logger.info("=" * 60)
 
@@ -345,13 +373,13 @@ def main():
 
     if args.task in ("rewrite", "both"):
         logger.info("-" * 40)
-        generate_rewrites(queries, args.llm_url, args.batch_size, output_rw)
+        generate_rewrites(queries, args.backend, args.llm_url, args.batch_size, output_rw)
         rw_lines = sum(1 for _ in open(output_rw, "r", encoding="utf-8")) if output_rw.exists() else 0
         logger.info(f"Rewrite cache: {rw_lines} entries → {output_rw}")
 
     if args.task in ("hyde", "both"):
         logger.info("-" * 40)
-        generate_hyde(queries, args.llm_url, args.batch_size, output_hy)
+        generate_hyde(queries, args.backend, args.llm_url, args.batch_size, output_hy)
         hy_lines = sum(1 for _ in open(output_hy, "r", encoding="utf-8")) if output_hy.exists() else 0
         logger.info(f"HyDE cache:    {hy_lines} entries → {output_hy}")
 

@@ -12,6 +12,7 @@ param(
     [switch]$SkipAugment,
     [switch]$SkipIndex,
     [switch]$RebuildIndex,
+    [string]$Backend = "vllm",
     [string]$VllmUrl = "http://localhost:8000/v1",
     [string]$DatasetPrefix = "exp009",
     [int]$PerRouteK = 50,
@@ -40,6 +41,7 @@ Write-Host "=" * 60
 Write-Host "  Exp-009 Retrieval Pipeline (Windows)"
 Write-Host "=" * 60
 Write-Host "  Device:        $Device"
+Write-Host "  Backend:       $Backend"
 Write-Host "  Embedding:     $EmbeddingModel"
 Write-Host "  Reranker:      $RerankerModel"
 Write-Host "  Sampled:       $SampledQueries"
@@ -60,12 +62,19 @@ try {
             $hyCount = (Get-Content $HyFile | Measure-Object -Line).Lines
             Write-Host "[Step 1] SKIP: $rwCount rewritten + $hyCount hyde already cached" -ForegroundColor Yellow
         } else {
-            Write-Host "[Step 1] Query augmentation (rewrite + HyDE) via vLLM..." -ForegroundColor Cyan
-            & $Python scripts/exp009/run_query_augment.py `
-                --input $SampledQueries `
-                --output-rw $RwFile `
-                --output-hy $HyFile `
-                --llm-url $VllmUrl
+            Write-Host "[Step 1] Query augmentation (rewrite + HyDE) backend=$Backend..." -ForegroundColor Cyan
+            $augArgs = @(
+                "scripts/exp009/run_query_augment.py",
+                "--backend", $Backend,
+                "--input", $SampledQueries,
+                "--output-rw", $RwFile,
+                "--output-hy", $HyFile
+            )
+            if ($Backend -eq "vllm") {
+                $augArgs += "--llm-url"
+                $augArgs += $VllmUrl
+            }
+            & $Python $augArgs
             if ($LASTEXITCODE -ne 0) { throw "Step 1 failed" }
             Write-Host "[Step 1] DONE" -ForegroundColor Green
         }

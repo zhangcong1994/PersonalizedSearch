@@ -14,6 +14,7 @@ RERANKER_MODEL="${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}"
 SKIP_AUGMENT=false
 SKIP_INDEX=false
 REBUILD_INDEX=false
+BACKEND="${BACKEND:-vllm}"
 VLLM_URL="${VLLM_URL:-http://localhost:8000/v1}"
 DATASET_PREFIX="exp009"
 PER_ROUTE_K=50
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
         --skip-augment) SKIP_AUGMENT=true; shift ;;
         --skip-index) SKIP_INDEX=true; shift ;;
         --rebuild-index) REBUILD_INDEX=true; shift ;;
+        --backend) BACKEND="$2"; shift 2 ;;
         --vllm-url) VLLM_URL="$2"; shift 2 ;;
         *) echo "Unknown: $1"; exit 1 ;;
     esac
@@ -53,6 +55,7 @@ echo "============================================================"
 echo "  Exp-009 Retrieval Pipeline (Linux)"
 echo "============================================================"
 echo "  Device:        $DEVICE"
+echo "  Backend:       $BACKEND"
 echo "  Embedding:     $EMBEDDING_MODEL"
 echo "  Reranker:      $RERANKER_MODEL"
 echo "  Sampled:       $SAMPLED_QUERIES"
@@ -69,12 +72,16 @@ if [ "$SKIP_AUGMENT" = false ]; then
         HY_COUNT=$(wc -l < "$HY_FILE")
         echo "[Step 1] SKIP: $RW_COUNT rewritten + $HY_COUNT hyde already cached"
     else
-        echo "[Step 1] Query augmentation (rewrite + HyDE) via vLLM..."
-        $PYTHON scripts/exp009/run_query_augment.py \
-            --input "$SAMPLED_QUERIES" \
-            --output-rw "$RW_FILE" \
-            --output-hy "$HY_FILE" \
-            --llm-url "$VLLM_URL"
+        echo "[Step 1] Query augmentation (rewrite + HyDE) backend=$BACKEND..."
+        AUG_ARGS=(scripts/exp009/run_query_augment.py
+            --backend "$BACKEND"
+            --input "$SAMPLED_QUERIES"
+            --output-rw "$RW_FILE"
+            --output-hy "$HY_FILE")
+        if [ "$BACKEND" = "vllm" ]; then
+            AUG_ARGS+=(--llm-url "$VLLM_URL")
+        fi
+        $PYTHON "${AUG_ARGS[@]}"
         echo "[Step 1] DONE"
     fi
 fi

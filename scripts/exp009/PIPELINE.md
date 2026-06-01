@@ -95,7 +95,7 @@ python scripts/exp009/sample_training_queries.py --mode sample --total 5000 --se
 | Windows | `scripts/exp009/run_retrieval_pipeline.ps1` | `.\scripts\exp009\run_retrieval_pipeline.ps1` |
 | Linux | `scripts/exp009/run_retrieval_pipeline.sh` | `bash scripts/exp009/run_retrieval_pipeline.sh` |
 
-公用参数: `-Device cuda` / `-SkipAugment` / `-SkipIndex` / `-RebuildIndex`
+公用参数: `-Device cuda` / `-SkipAugment` / `-SkipIndex` / `-RebuildIndex` / `-Backend {vllm,deepseek}`
 
 ```
 exp009_sampled_queries.jsonl (5000 queries)
@@ -124,9 +124,9 @@ exp009_sampled_queries.jsonl (5000 queries)
 | 输入 | `{DATA_ROOT}/data/processed/exp009_sampled_queries.jsonl` |
 | 输出 | `{DATA_ROOT}/data/processed/exp009_rewritten_queries.jsonl` |
 | | `{DATA_ROOT}/data/processed/exp009_hyde_answers.jsonl` |
-| 模型 | Qwen3-4B (本地 vLLM, OpenAI compatible) |
-| 降级 | DeepSeek API（vLLM 部署失败时） |
-| 费用 | ¥0（本地推理） / ~¥4（降级 API） |
+| 模型 | `--backend vllm`（默认）: Qwen3-4B (本地 vLLM, OpenAI compatible) |
+| | `--backend deepseek`: DeepSeek API（当 vLLM 部署失败时） |
+| 费用 | ¥0（本地推理） / ~¥4（DeepSeek API） |
 
 **输出格式**：
 ```json
@@ -140,11 +140,12 @@ python scripts/exp009/run_query_augment.py \
     --input data/processed/exp009_sampled_queries.jsonl \
     --output-rw data/processed/exp009_rewritten_queries.jsonl \
     --output-hy data/processed/exp009_hyde_answers.jsonl \
+    --backend vllm \
     --llm-url http://localhost:8000/v1 \
     --batch-size 32
 ```
 
-参数: `--input` `--output-rw` `--output-hy` `--llm-url` `--batch-size 32` `--task {rewrite,hyde,both}`
+参数: `--input` `--output-rw` `--output-hy` `--backend {vllm,deepseek}` `--llm-url` `--batch-size 32` `--task {rewrite,hyde,both}`
 
 ### Step 2.2: FAISS 索引构建
 
@@ -267,95 +268,272 @@ python scripts/exp009/rerank.py \
 
 ## 阶段三：教师生成
 
-用 qwen3-max 为每条 query 生成高质量参考答案。
+用 qwen3-max Batch API 为每条 query 生成高质量参考答案。
 
 | 项目 | 内容 |
 |------|------|
-| 脚本 | [ ] `scripts/exp009/generate_teacher_answers.py` |
+| 脚本 | [x] `scripts/exp009/generate_teacher_answers.py` |
 | 输入 | `{DATA_ROOT}/data/processed/exp009_reranked_top10.jsonl` (query + top-10 passages) |
-| 输出 | `{DATA_ROOT}/data/processed/exp009_teacher_answers.jsonl` |
+| 输出 | `{DATA_ROOT}/data/processed/exp009_teacher_answers.jsonl` (4,990 entries) |
+| | `{DATA_ROOT}/data/processed/exp009_batch_state.json` (batch job state for resume) |
 | Prompt | 复用 `src/generation/prompts.py`（SYSTEM_PROMPT + FEW_SHOT，同 exp-005） |
-| 模型 | qwen3-max, temperature=0.3, thinking=OFF, max_tokens=1024 |
-| 费用 | 5000 × ¥0.003 ≈ ¥15 |
+| 模型 | qwen3-max, 阿里云百炼 Batch API（OpenAI 兼容, 费用 50% off） |
+| 参数 | temperature=0.3, enable_thinking=False, max_tokens=1024 |
+| 费用 | 5000 × ~¥0.0015 ≈ ¥7.5（Batch 半价, 实际按输入输出 token 计费） |
+| 结果 | 5000 submitted → 4990 success, 10 条被百炼内容安全审查拦截（data_inspection_failed, 0.2%） |
+
+**三步流程**: `test` → `submit` → `align`
+
+```powershell
+# Step 1: 冒烟测试（免费, 用 batch-test-model 验证 5 条）
+python scripts/exp009/generate_teacher_answers.py test
+
+# Step 2: 提交 batch job（上传 JSONL, 提交任务, 轮询等待完成）
+python scripts/exp009/generate_teacher_answers.py submit
+
+# Step 3: 对齐（下载 batch 结果, 按 custom_id 对齐到原始输入）
+python scripts/exp009/generate_teacher_answers.py align
+```
+
+**关键实现细节**:
+- 使用 `DASHSCOPE_API_KEY`, base_url `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- `test` 子命令先试 `batch-test-model` 全链路免费测试, 失败回退到在线 API 测试（¥0.015）
+- `submit` 子命令在上传 batch 文件之前, 额外调用一次在线 API（纯 smoke test, ¥0.003）确保 API 完全可用后再提交
+- `align` 默认只对齐成功的行，遇到 failed/expired/cancelled 时跳过并打 warning
+- 状态文件 `exp009_batch_state.json` 支持断点续跑
 
 **输出格式**：
 ```json
-{"qid": "50000", "query": "...", "passages": [...], "teacher_answer": "...", "model": "qwen3-max", "temperature": 0.3}
+{"qid": "50000", "query": "...", "passages": [...], "teacher_answer": "...", "model": "qwen3-max", "temperature": 0.3, "batch_job_id": "batch_xxx", "custom_id": "...", "batch_status": "completed"}
 ```
 
 ---
 
-## 阶段四：质量过滤
+## 阶段四+五：规则过滤 + 检索质量分桶 + (可选) 幻觉检测
 
-筛除教师生成的脏数据（空答案、重复、非中文、意外拒答、无引用、准确度不达标）。
+两个阶段合并为一个脚本 `filter_and_bucket.py`，按顺序执行：规则过滤 → 检索质量分桶 → (可选幻觉检测)。
 
 | 项目 | 内容 |
 |------|------|
-| 脚本 | [ ] `scripts/exp009/filter_and_bucket.py` (过滤部分) |
-| 输入 | `{DATA_ROOT}/data/processed/exp009_teacher_answers.jsonl` (~5000 条) |
-| 输出 | `{DATA_ROOT}/data/processed/exp009_filtered_answers.jsonl` (~3000 条, ~60% 留存) |
-| 规则过滤 | 空/超长/重复/非中文/意外拒答/无引用标记 |
-| Judge 过滤 | deepseek-chat 单维度准确性评分，< 3 → 丢弃 |
-| 费用 | ~4000 × ¥0.001 ≈ ¥4 |
+| 脚本 | [x] `scripts/exp009/filter_and_bucket.py` |
+| 输入 | `{DATA_ROOT}/data/processed/exp009_teacher_answers.jsonl` (4,990 entries) |
+| 输出 | `{DATA_ROOT}/data/processed/exp009_filtered_bucketed.jsonl` (过滤后 + bucket + hallu 标注) |
+| | `{DATA_ROOT}/data/processed/exp009_discarded.jsonl` (被丢弃的条目) |
+| 辅助脚本 | [x] `scripts/exp009/test_hallu_detection.py`（幻觉检测试水, 50 条） |
+| | [x] `scripts/exp009/check_synthesis_quality.py`（整合质量抽样, 30 条） |
+
+```powershell
+# 仅规则过滤 + 分桶（免费, 瞬时完成）
+python scripts/exp009/filter_and_bucket.py
+
+# 规则过滤 + 分桶 + 幻觉检测（deepseek-chat, ~¥5, 8并发 ~20分钟）
+python scripts/exp009/filter_and_bucket.py --hallu-check --hallu-workers 8
+```
+
+### 规则过滤（3 条规则）
+
+| 规则 | 逻辑 | 丢弃数 |
+|------|------|:---:|
+| 过短 | `len(answer) < 20` | 0 |
+| 意外拒答 | 含拒答关键词 + `len(answer) <= 400` + top-10 有 relevant passage → 教师该答却没答 | 23 |
+| 无引用 | `"[来源"` 不在 answer 中 | 33 |
+| **合计** | | **56 / 4990 (1.1%)** |
+
+**拒答关键词列表（19 个）**：`"无法确定", "无法回答", "没有提供", "无法提供", "资料中未", "资料中没有", "没有提及", "未提及", "无相关信息", "没有相关信息", "没能找到", "没有找到", "未找到", "参考资料中未", "未涉及", "没有涉及", "无法判断", "无法确认", "没有直接提供"`
+
+**设计要点**:
+- `REFUSAL_MAX_LEN = 400`：拒答关键词 + 长答案（>400 chars）通常是"我找到了这些信息, 但你问的 XXX 资料中没有", 不算拒答
+- 需要 qrels 交叉检验：只有在"检索确实有相关文档但教师却说没有"时才丢弃（意外拒答）
+- 如果检索确实无相关文档, 教师拒答是正确答案 → 保留（用于训练拒答能力）
+
+### 幻觉检测（可选, `--hallu-check`）
+
+当 `--hallu-check` 启用时, 在规则过滤之后对保留的答案做幻觉检测。使用 `ThreadPoolExecutor` 并发调用 API（`--hallu-workers` 控制并发数，默认 8）。
+
+| 项目 | 内容 |
+|------|------|
+| 模型 | deepseek-chat（**不用** deepseek-reasoner：幻觉检测是结构化比对任务，不需要深度推理） |
+| 参数 | temperature=0.0, max_tokens=256 |
+| 方式 | 8 并发 ThreadPoolExecutor, ~3.9 q/s |
+| 输出 | PASS/FAIL + 一句话理由 |
+| 时间 | ~21 分钟 |
+| 费用 | ~¥5 |
+
+**Prompt 8 条规则总结**：逐条检查事实陈述 → 看资料是否支撑 → PASS。合理推断、诚实拒答、表述偏差不扣分。张冠李戴（资料说 A 却安到 B 上）必 FAIL。
+
+**试水结果（50 条, 2 轮 prompt 迭代）**：
+- Round 1（基础 prompt）: PASS 74%
+- Round 2（增加规则 5-8：合理推断/诚实拒答/表述偏差/张冠李戴）: **PASS 82%**
+- 估计真实幻觉率约 10%
+
+**全量结果（4934 条）**：PASS 3589 (72.7%), FAIL 1345 (27.3%)。FAIL 率高于试水的 18%，说明全量数据中幻觉问题比抽样更严重。
+
+### 整合质量抽样（已做, 不上线）
+
+| 项目 | 内容 |
+|------|------|
+| 脚本 | `scripts/exp009/check_synthesis_quality.py` |
+| 样本 | 30 条（分桶等比例: 10A+10B+10C） |
+| 评分 | deepseek-chat, 单维度 1-4 分 |
+
+```powershell
+python scripts/exp009/check_synthesis_quality.py --n 30
+```
+
+**结果**：均分 2.90 / 低分 1-2 占 26.7%。结论：部分 2 分条目是 query 类型导致的假阳性（如"锤头线对上影线有要求吗", 来源高度一致不需要整合）, 整合质量不是致命问题, **不做全量过滤**。
+
+### 检索质量分桶
+
+| 桶 | 条件 | 条数 | 占比 |
+|:--:|------|:---:|:---:|
+| A | coverage ≥ 0.5 且 best_grade ≥ 2 | 1,698 | 47.3% |
+| B | 0.2 ≤ coverage < 0.5 或 best_grade == 1 | 679 | 18.9% |
+| C | coverage < 0.2 或 top-10 全部无 qrels 标注 | 1,212 | 33.8% |
+| 丢弃 | 规则过滤 + 幻觉检测 | 1,401 | 28.1% |
+
+其中丢弃明细：
+- 意外拒答 (accidental_refusal): 23 条
+- 无引用 (no_citation): 33 条
+- 幻觉 (hallu_fail): 1345 条
+
+指标定义：
+- `search_coverage` = \|top-10 pids ∩ retrieval_qrels\| / min(10, \|retrieval_qrels\|)
+- `best_grade` = max(graded_qrels[pid] for pid in top-10 if pid in graded_qrels)
+
+**与计划的偏离**：桶 A（45%）低于预期（56%）, 桶 C（35%）高于预期（20%）, 反映 M3E-base 检索模型 + bge-reranker-v2-m3 精排的整体质量上限。
+
+**注意**：桶 C ≠ T3 层。T3 是 query 层面的先验（num_positive）, 桶 C 是检索结果的后验。T3 的 query 如果检索意外成功 → 进桶 A。
 
 ---
 
-## 阶段五：检索质量分桶
+## 阶段六：类别构造（4 个子阶段）
 
-按 search_coverage 和 best_grade 将过滤后数据归入 A/B/C 三个桶。
+> **目标**：构造 5 种训练场景，教会学生条件化的行为映射——输入什么检索质量，输出什么风格的答案。
 
-| 项目 | 内容 |
-|------|------|
-| 脚本 | [ ] `scripts/exp009/filter_and_bucket.py` (分桶部分) |
-| 输入 | `{DATA_ROOT}/data/processed/exp009_filtered_answers.jsonl` |
-| 输出 | 同文件（新增 `bucket` 字段）, 桶 A(~56%) / B(~24%) / C(~20%) |
+```
+exp009_filtered_bucketed.jsonl (3589条, 已带 bucket + hallu)
+    │
+    ├─[6.1] 筛选分类 ──→  标准搜索问答 (不改动)
+    │                    信息不足/拒答 (不改动)
+    │
+    ├─[6.2] 矛盾检测 ──→  找出"教师答案中处理了矛盾"的样本
+    │
+    ├─[6.3] 改写生成 ──→  引文强调 (重生成)
+    │                    噪声干扰 (重生成)
+    │                    矛盾处理 (重生成)
+    │
+    └─[6.4] 组装切分 ──→  exp009_sft_train.jsonl (~2720条)
+                         exp009_sft_val.jsonl (200条)
+```
 
-| 桶 | 条件 | 目标类别 |
-|:--:|------|------|
-| A | coverage ≥ 0.5 且 best_grade ≥ 2 | 标准 / 引文强调 |
-| B | 0.2 ≤ coverage < 0.5 或 best_grade == 1 | 部分标准 / 噪声注入 |
-| C | coverage < 0.2 或 top-10 全部无标注 | 拒答 / 噪声 / 矛盾 |
-
-**注意**：桶 C ≠ T3 层。T3 是 query 层面的先验（num_positive），桶 C 是检索结果的后验（coverage）。T3 的 query 如果检索意外成功 → 进桶 A。
+| 子阶段 | 操作类型 | API | 费用 | 时间 |
+|:--:|------|------|:---:|:---:|
+| 6.1 | 🗂️ 分类+采样 + ✅ 打分筛选 | 无 | ¥0 | 瞬时 |
+| 6.2 | ✅ 打分筛选 (矛盾检测) | deepseek-chat | ~¥2 | ~5 min (并发) |
+| 6.3 | 改写生成 | deepseek-chat (8 并发) | ~¥0.7 | <10 min |
+| 6.4 | 🔧 组装切分 | 无 | ¥0 | 瞬时 |
 
 ---
 
-## 阶段六：类别构造
+### 6.1 — 筛选分类（无 API 调用）
 
-> **5 类 SFT 数据**：标准搜索问答(55%) + 引文强调(12%) + 信息不足/拒答(17%) + 噪声干扰(8%) + 矛盾处理(8%)
+从已有数据中挑出**不需要改写**的两类：
+
+| 类别 | 来源 | 条数 | 怎么选 |
+|------|------|:---:|------|
+| 标准搜索问答 | 桶 A (hallu=PASS) | ~1200 | 随机采样，不改动 |
+| 信息不足/拒答 | 桶 C | ~230 | 筛出"教师正确拒答"的：含拒答关键词 + 检索确实无相关文档 |
+| 验证集 | 桶 A (hallu=PASS) | 200 | 从标准类中预留，只监控 loss |
+
+核心逻辑：
+- 标准类从桶 A 先拿（检索质量最好），保证训练数据质量底线
+- 桶 A 挑剩的部分留给 6.3 做引文强调改写（不重叠）
+- 拒答类：只保留"该拒答的"——资料确实没有，教师说没有 → 正确行为。教师不该拒答却拒答的已在阶段四被"意外拒答"规则筛掉
+
+---
+
+### 6.2 — 矛盾检测（deepseek-chat）
+
+在桶 A+B 中检测哪些教师答案**包含了对多文档矛盾的识别和处理**。
 
 | 项目 | 内容 |
 |------|------|
-| 脚本 | [ ] `scripts/exp009/construct_categories.py` |
-| 输入 | `{DATA_ROOT}/data/processed/exp009_filtered_answers.jsonl` (含 bucket 字段) |
-| 输出 | `{DATA_ROOT}/data/processed/exp009_sft_train.jsonl` (~2720 条) |
-| | `{DATA_ROOT}/data/processed/exp009_sft_val.jsonl` (桶 A 标准数据 200 条) |
-| 额外 API 调用 | 引文强调重生成 320 条 + 噪声重生成 220 条 + 矛盾检测 2000 条 + 矛盾重生成 220 条 |
-| 额外费用 | ~¥4.4 |
+| 输入 | 桶 A + 桶 B 的教师答案（除去 6.1 已选为标准类的 ~1500 条） |
+| 模型 | deepseek-chat, temperature=0.0 |
+| 输出 | `{"has_contradiction": true/false, "contradiction_type": "数值矛盾/观点对立/信息冲突/无"}` |
+| 目标 | 找到 ~220 条含矛盾的样本 → 作为 6.3 矛盾处理的输入 |
+
+判断依据：回答是否对比了不同来源的差异、指出了信息冲突、或尝试解释了分歧原因。
+
+---
+
+### 6.3 — 改写生成（deepseek-chat 并发，✅ 完成）
+
+三类改写，都是对**同一条 query + passages** 用不同 prompt 调用 deepseek-chat 重新生成。
+
+| 类别 | 来源 | 条数 | 改了什么 | Prompt 差异 |
+|------|------|:---:|------|------|
+| 引文强调 | 桶 A（6.1 挑剩的） | ~300 | **不改 passages**，只改 system prompt | 要求"每个关键陈述必须标注来源编号" |
+| 噪声干扰 | 桶 B | ~220 | **注入 2-3 条无关 passage**，混入 top-10 | 要求"忽略无关信息，只基于相关部分回答" |
+| 矛盾处理 | 桶 A+B（6.2 筛出的） | ~220 | **不改 passages**，只改 system prompt | 要求"对比各方观点，分析差异原因并给出综合判断" |
+
+改用 deepseek-chat + 8 并发（原计划 qwen3-max Batch API，但阿里云 Batch 排队 >40 分钟不可接受），深度改写温度用 0.3，参数：max_tokens=1024。
+
+> **实际耗时**：7.6 min, 738/738 完成（1 条失败），~¥0.7。
+
+---
+
+### 6.4 — 组装切分（无 API 调用）
+
+把 5 类数据拼到一起，输出标准 SFT 训练格式：
+
+```
+标准 ~1200 + 引文 ~300 + 拒答 ~230 + 噪声 ~220 + 矛盾 ~220 = ~2170 条 → train
+从标准类中预留 200 条 → val（只监控 loss，不参与评估）
+```
 
 **输出格式**（训练用）：
 ```json
 {
   "qid": "50000",
   "query": "如何减肥最快",
+  "passages": [{"pid": "...", "text": "...", "rank": 1}],
+  "answer": "根据资料... [来源: 1,2]",
   "category": "standard",
-  "system_prompt": "你是AI搜索助手...",
-  "input_passages": [{"rank": 1, "pid": "...", "text": "...", "source": "dense_B0"}],
-  "output_answer": "根据资料... [来源: 1]",
-  "teacher_model": "qwen3-max",
-  "teacher_temperature": 0.3,
-  "retrieval_bucket": "A",
-  "search_coverage": 0.75
+  "bucket": "A",
+  "teacher_model": "qwen3-max"
 }
 ```
 
-| 类别 | 占比 | 条数 | 数据来源 | 构造方式 |
-|------|:--:|:--:|------|------|
-| 标准搜索问答 | 55% | ~1500 | 桶 A 随机采样 | 不修改，直接使用教师原始生成 |
-| 引文强调 | 12% | ~320 | 桶 A (不重叠) | Prompt 加引文强调指令 → 重生成 |
-| 信息不足/拒答 | 17% | ~460 | 桶 C | 仅保留教师正确拒答的样本 |
-| 噪声干扰 | 8% | ~220 | 桶 B + 人工噪声 | 注入无关 passage → 重生成 |
-| 矛盾处理 | 8% | ~220 | 桶 A+B 含矛盾 | deepseek-chat 检测矛盾 → 重生成 |
+| 字段 | 说明 |
+|------|------|
+| `passages` | top-10 检索结果（噪声类包含注入的无关 passage） |
+| `answer` | 教师原始答案（标准/拒答）或 6.3 重生成的答案（引文/噪声/矛盾） |
+| `category` | 5 种类别之一：standard / citation_emphasis / refusal / noise / contradiction |
+| `bucket` | A/B/C，分桶来源 |
+
+---
+
+### 5 类训练数据的设计意图
+
+| 类别 | 占比(约) | 条数(约) | 教给学生的行为 |
+|------|:---:|:---:|------|
+| 标准搜索问答 | ~55% | ~1200 | 检索结果好 → 正常引用回答 |
+| 引文强调 | ~14% | ~300 | 检索结果好 + 被要求严格引用 → 精细标注来源 |
+| 信息不足/拒答 | ~11% | ~230 | 检索结果差 → 诚实说"没有找到信息" |
+| 噪声干扰 | ~10% | ~220 | 检索混入无关文档 → 学会忽略它们，不编造 |
+| 矛盾处理 | ~10% | ~220 | 检索结果互相矛盾 → 对比分析各方观点 |
+
+> **与计划偏离**：由于幻觉检测筛掉了 1345 条（27.3%），标准类和拒答类的可用数据量低于预期。标准类从 1500 调至 1200，拒答类从 460 调至 234（只剩这么多"正确拒答"的样本）。实际训练数据总量 ~2170 条（vs 计划 2720）。
+
+**操作方式**：
+
+```powershell
+python scripts/exp009/construct_categories.py select                     # 6.1 筛选标准+拒答
+python scripts/exp009/construct_categories.py detect-contradictions      # 6.2 矛盾检测
+python scripts/exp009/construct_categories.py rewrite --workers 8        # 6.3 deepseek-chat 改写
+python scripts/exp009/construct_categories.py assemble                   # 6.4 组装切分
+```
 
 ---
 
@@ -410,9 +588,11 @@ python scripts/exp009/train_sft.py \
 | 2.4 | `bm25_retrieve.py` | x | Python |
 | 2.5 | `rrf_fuse.py` | x | Python |
 | 2.6 | `rerank.py` | x | Python |
-| 三 | `generate_teacher_answers.py` | | Python |
-| 四+五 | `filter_and_bucket.py` | | Python |
-| 六 | `construct_categories.py` | | Python |
+| 三 | `generate_teacher_answers.py` | x | Python |
+| 四+五 | `filter_and_bucket.py` | x | Python |
+| 四+五 | `test_hallu_detection.py` | x | Python (pilot) |
+| 四+五 | `check_synthesis_quality.py` | x | Python (analysis) |
+| 六 | `construct_categories.py` | x | Python |
 | 七 | `train_sft.py` | | Python |
 | 八 | 复用 exp005 evaluate | | Python |
 
@@ -429,8 +609,11 @@ python scripts/exp009/train_sft.py \
 | `exp009_bm25_B0.jsonl` | 2.4 | 5000 | qid/query/results[50] |
 | `exp009_rrf_fused.jsonl` | 2.5 | 5000 | qid/query/results[50] |
 | `exp009_reranked_top10.jsonl` | 2.6 | 5000 | qid/query/results[10] |
-| `exp009_teacher_answers.jsonl` | 阶段三 | ~5000 | qid/query/passages/teacher_answer |
-| `exp009_filtered_answers.jsonl` | 阶段四+五 | ~3000 | 同上 + bucket + coverage |
+| `exp009_batch_state.json` | 阶段三 | - | batch job state (resume) |
+| `exp009_teacher_answers.jsonl` | 阶段三 | 4990 | qid/query/passages/teacher_answer |
+| `exp009_hallu_test_results.jsonl` | 阶段四 pilot | 50 | qid/verdict/reason |
+| `exp009_filtered_bucketed.jsonl` | 阶段四+五 | 3589 | 同上 + bucket + coverage + hallu |
+| `exp009_discarded.jsonl` | 阶段四+五 | 1401 | qid/query/discard_reason |
 | `exp009_sft_train.jsonl` | 阶段六 | ~2720 | SFT 训练格式 |
 | `exp009_sft_val.jsonl` | 阶段六 | 200 | SFT 训练格式 |
 

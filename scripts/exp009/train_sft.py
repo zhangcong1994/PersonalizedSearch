@@ -46,7 +46,7 @@ def build_user_message(query: str, passages: list[dict]) -> str:
     return ctx + "\n\n" + q
 
 
-def load_and_format_data(path: Path, tokenizer) -> Dataset:
+def load_and_format_data(path: Path, tokenizer, max_seq_length: int = 2048) -> Dataset:
     conversations = []
     stats = {cat: 0 for cat in MONITOR_CATEGORIES}
     skipped = 0
@@ -80,6 +80,11 @@ def load_and_format_data(path: Path, tokenizer) -> Dataset:
                 tokenize=False,
                 add_generation_prompt=False,
             )
+
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(token_ids) > max_seq_length:
+                token_ids = token_ids[:max_seq_length]
+                text = tokenizer.decode(token_ids, skip_special_tokens=True)
 
             conversations.append({"text": text, "category": category, "answer_len": len(answer)})
 
@@ -212,8 +217,8 @@ def main():
     model.print_trainable_parameters()
 
     logger.info("Loading and formatting data...")
-    train_dataset = load_and_format_data(Path(args.train), tokenizer)
-    val_dataset = load_and_format_data(Path(args.val), tokenizer)
+    train_dataset = load_and_format_data(Path(args.train), tokenizer, args.max_seq_length)
+    val_dataset = load_and_format_data(Path(args.val), tokenizer, args.max_seq_length)
 
     import math
     steps_per_epoch = math.ceil(len(train_dataset) / (args.batch_size * args.grad_accum))
@@ -245,9 +250,6 @@ def main():
         seed=42,
         dataloader_num_workers=2,
         remove_unused_columns=True,
-        max_seq_length=args.max_seq_length,
-        dataset_text_field="text",
-        packing=False,
     )
 
     trainer = SFTTrainer(
@@ -256,6 +258,8 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
+        dataset_text_field="text",
+        packing=False,
     )
 
     logger.info("Starting training...")

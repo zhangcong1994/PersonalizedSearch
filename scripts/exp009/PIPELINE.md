@@ -541,20 +541,42 @@ python scripts/exp009/construct_categories.py assemble                   # 6.4 �
 
 | 项目 | 内容 |
 |------|------|
-| 脚本 | [ ] `scripts/exp009/train_sft.py` |
-| 输入 | `{DATA_ROOT}/data/processed/exp009_sft_train.jsonl` (~2720 条) |
+| 脚本 | [x] `scripts/exp009/train_sft.py` |
+| 输入 | `{DATA_ROOT}/data/processed/exp009_sft_train.jsonl` (2172 条) |
 | | `{DATA_ROOT}/data/processed/exp009_sft_val.jsonl` (200 条, 仅监控 loss) |
 | 输出 | `{DATA_ROOT}/models/qwen3-4b-t2ranking-sft/` (QLoRA adapter + merged) |
 | 基座模型 | Qwen/Qwen3-4B |
 | 方法 | QLoRA (4-bit NF4, r=16, alpha=32, dropout=0.05) |
 | 超参 | epochs=3, lr=2e-4 cosine, batch=16, max_seq=6144 |
-| 显存 | ~8-10GB (RTX 4090) |
+| 显存 | ~8-10GB (RTX 4090 24GB) |
 | 时间 | ~2-3 小时 |
 
-```powershell
+### 推荐云 GPU 配置
+
+| 平台 | GPU | 显存 | 单价 | 预计费用 |
+|------|------|:---:|------|:---:|
+| AutoDL | RTX 4090 | 24GB | ~¥1.8/h | ¥4-6 (2-3h) |
+| AutoDL | RTX 3090 | 24GB | ~¥1.2/h | ¥4-5 (3-4h) |
+| AutoDL | RTX 4070 Ti Super | 16GB | ~¥0.9/h | ¥3-4 (3-4h) |
+
+> 推荐 **RTX 4090**：fp16 推理 + QLoRA 训练完全够用，单价比 3090 贵 50% 但速度快 ~30%，总费用差不多。4070 Ti Super 16GB 够用但显存紧凑。
+
+### 服务器部署流程
+
+```bash
+# 1. AutoDL 选配：PyTorch 2.5+ / Python 3.11 / CUDA 12.4+ / 系统盘 50GB
+
+# 2. 上传训练数据（从本机）
+scp data/processed/exp009_sft_train.jsonl your_server:/root/autodl-tmp/data/processed/
+scp data/processed/exp009_sft_val.jsonl   your_server:/root/autodl-tmp/data/processed/
+
+# 3. 服务器上一键安装 + 下载模型
+bash scripts/exp009/server_setup.sh
+
+# 4. 开始训练（模型自动从 HF 下载，或指定本地路径提速）
 python scripts/exp009/train_sft.py \
-    --train-data data/processed/exp009_sft_train.jsonl \
-    --val-data data/processed/exp009_sft_val.jsonl \
+    --train data/processed/exp009_sft_train.jsonl \
+    --val data/processed/exp009_sft_val.jsonl \
     --base-model Qwen/Qwen3-4B \
     --output-dir models/qwen3-4b-t2ranking-sft \
     --epochs 3 \

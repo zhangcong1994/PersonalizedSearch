@@ -258,8 +258,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
-        dataset_text_field="text",
-        packing=False,
     )
 
     logger.info("Starting training...")

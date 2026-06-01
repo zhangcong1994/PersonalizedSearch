@@ -162,7 +162,7 @@ def main():
         TrainingArguments,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from trl import SFTTrainer
+    from trl import SFTConfig, SFTTrainer
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -220,7 +220,7 @@ def main():
     total_steps = steps_per_epoch * args.epochs
     logger.info(f"  Steps per epoch: ~{steps_per_epoch}, total: ~{total_steps}")
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -245,6 +245,9 @@ def main():
         seed=42,
         dataloader_num_workers=2,
         remove_unused_columns=True,
+        max_seq_length=args.max_seq_length,
+        dataset_text_field="text",
+        packing=False,
     )
 
     trainer = SFTTrainer(
@@ -253,9 +256,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
-        max_seq_length=args.max_seq_length,
-        dataset_text_field="text",
-        packing=False,
     )
 
     logger.info("Starting training...")

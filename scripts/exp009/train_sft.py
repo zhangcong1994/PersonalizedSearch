@@ -176,6 +176,14 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+        logger.info("flash-attn detected, using FlashAttention2")
+    except ImportError:
+        attn_impl = "sdpa"
+        logger.info("flash-attn not found, falling back to PyTorch SDPA")
+
     logger.info("Loading base model (4-bit)...")
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -183,7 +191,7 @@ def main():
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
 
     model = prepare_model_for_kbit_training(model)

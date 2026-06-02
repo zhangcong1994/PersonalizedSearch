@@ -28,7 +28,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.config import DATA_ROOT, PROJECT_ROOT
 from src.generation.prompts import PromptManager, get_default_prompts

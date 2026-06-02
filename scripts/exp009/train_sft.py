@@ -69,17 +69,7 @@ def load_and_format_data(path: Path, tokenizer, max_seq_length: int = 2048) -> D
 
             user_msg = build_user_message(query, passages)
 
-            messages = [
-                {"role": "system", "content": SYSTEM_TEXT},
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": answer},
-            ]
-
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
+            text = f"{SYSTEM_TEXT}\n\n{user_msg}\n\n{answer}"
 
             token_ids = tokenizer.encode(text, add_special_tokens=False)
             if len(token_ids) > max_seq_length:
@@ -109,13 +99,13 @@ def main():
                         help="Base model HF ID")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT),
                         help="Output directory for adapter + merged model")
-    parser.add_argument("--epochs", type=int, default=3,
+    parser.add_argument("--epochs", type=int, default=1,
                         help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Per-device batch size")
     parser.add_argument("--grad-accum", type=int, default=4,
                         help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=2e-4,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument("--max-seq-length", type=int, default=6144,
                         help="Max sequence length")

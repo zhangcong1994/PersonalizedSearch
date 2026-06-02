@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 RESULTS_DIR = DATA_ROOT / "results" / "exp005"
 INPUT_QUERIES = RESULTS_DIR / "input_queries.jsonl"
-GENERATIONS_DIR = RESULTS_DIR / "generations"
+GENERATIONS_DIR = RESULTS_DIR / "generation"
 
 MODEL_ID = "qwen3-4b-sft"
 MODEL_PATH = str(DATA_ROOT / "models" / "qwen3-4b-t2ranking-sft" / "merged")

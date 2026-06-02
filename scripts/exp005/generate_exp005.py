@@ -72,6 +72,21 @@ MODEL_CONFIGS = {
         "temperature": 0.3,
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     },
+    "qwen3-8b-nothink": {
+        "hf_id": "Qwen/Qwen3-8B",
+        "backend": "local",
+        "params": "8B",
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
+    "qwen3-8b": {
+        "hf_id": "Qwen/Qwen3-8B",
+        "backend": "local",
+        "params": "8B",
+        "max_tokens": 1024,
+        "temperature": 0.3,
+    },
     "qwen2.5-7b": {
         "hf_id": "Qwen/Qwen2.5-7B-Instruct",
         "backend": "local",

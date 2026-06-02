@@ -1,0 +1,499 @@
+# 实验计划：V1 Cross-Encoder 精排模型微调
+# exp-008: gte-mul Reranker 领域自适应微调
+# 创建日期: 2026-06-02
+# 状态: planning
+
+meta:
+  experiment_id: exp-008
+  phase: "V1"
+  objective: "在 T2Ranking 训练集上 BCE 微调 gte-mul Reranker，验证领域自适应对中文 passage 精排的提升。配合 exp-007 微调后的 Embedding + S4 粗排候选池，形成全链路微调闭环"
+  status: planned
+  target_platform: "AutoDL (RTX 4090 24GB)"
+  prerequisite:
+    - "exp-007 Phase 3.2 完成（有微调后的 m3e-base 模型）"
+    - "exp-004 完成（有精排评估脚本和零样本基线）"
+    - "T2Ranking 训练集已下载（queries.train.tsv + qrels.train.tsv）"
+  design_principle: "数据驱动·干净基座·简单优先——单阶段 BCE 微调，不引入未经验证的迭代式 hard negative mining。延续 exp-007 '无污染基座'策略选择 gte-mul"
+  key_difference_from_previous: |
+    exp-004 是零样本模型选型（5 个开源 Reranker 纯推理对比）。
+    exp-008 是对最优干净模型做领域微调——训练数据、候选池、模型权重三个
+    维度全面适配 T2Ranking 分布。配合 exp-007 微调后的 Embedding + S4
+    粗排候选池，实现「粗排召回提升 + 精排排序提升」的双重增益。
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么需要微调 Reranker
+# =============================================================================
+
+motivation:
+
+  where_we_are:
+    exp004_best:
+      clean_model: "gte-mul (Alibaba-NLP/gte-multilingual-reranker-base, 306M)"
+      ndcg_at_10_test: 0.4442
+      mrr_test: 0.5579
+      candidate_pool: "S4 (D-B0 + D-P2 + D-HyDE + B-B0), pretrained m3e-base"
+    embedding_improvement:
+      exp007_best: "m3e-base Phase 3.2 ep1, Recall@10=0.5064 (+30%), Recall@50=0.7452 (+18.7%)"
+      implication: "粗排召回上限从 0.6912 提升到预计 0.74+，更多相关文档将进入 top-50 候选池"
+    gap:
+      ndcg_ceiling: "零样本 gte-mul NDCG@10=0.4442，距离实用水平（0.50+）还有显著差距"
+      domain_mismatch: "gte-mul 在通用多语言语料上训练，未见过 T2Ranking 的 query-passage 匹配模式"
+      new_pool_opportunity: "exp-007 微调后的 Embedding 粗排候选池质量更高，精排有更大发挥空间"
+
+  why_gte_mul:
+    clean_model:
+      reason: "延续 exp-007 的'无污染基座'策略。BGE 系列（base/v2-m3）虽然零样本更强，但 C-MTP 训练集包含 T2Ranking 数据——微调后的提升无法区分是'领域泛化'还是'见过答案'。gte-mul 是干净模型中零样本最优（CMTEB-R 74.08），微调后的结论在学术上无争议"
+    compared_alternatives:
+      - model: "bge-reranker-base (278M)"
+        issue: "C-MTP 数据泄露，与 exp-002/004 的数据污染风险一致"
+      - model: "bge-reranker-v2-m3 (568M)"
+        issue: "同上 + 参数量更大（4090 训练 batch 受限）"
+    architecture:
+      model: "gte-mul, 306M, Cross-Encoder (XLM-RoBERTa-like)"
+      max_length: 8192
+      library: "transformers (AutoModelForSequenceClassification)"
+
+  why_not_keep_zero_shot:
+    reason: "零样本 gte-mul 在 T2Ranking 上与 bge-v2-m3 差距 7.9%（NDCG@10: 0.4442 vs 0.4791）。虽然部分差距来自数据泄露，但即使不考虑泄露，0.4442 的 NDCG@10 意味着 top-10 中约一半的文档排序错误。微调有望把干净模型的 NDCG@10 推到 0.50+，追上甚至超过零样本 bge-v2-m3"
+
+  core_hypothesis:
+    main: "在 T2Ranking 训练集上 BCE 微调 gte-mul，NDCG@10 能从 0.4442 提升到 0.50~0.55（+13%~24%），使干净模型追上零样本 bge-v2-m3（0.4717）"
+
+
+# =============================================================================
+# 第二部分：为什么不引入迭代式 Hard Negative Mining
+# =============================================================================
+
+why_no_iterative_hard_negative_mining:
+
+  context: |
+    在 exp-007（Embedding 微调）中，Phase 3.2 的 Dynamic Hard Negative Mining
+    贡献了 +11.6% Recall@10，是该实验最大的单一增益来源。自然会考虑在
+    Reranker 微调中引入类似策略。但经过文献调研，结论是：
+    不引入迭代式 hard negative mining。
+
+  three_key_findings:
+
+    - finding: "gte-mul 官方训练未使用 hard negative mining"
+      source: "mGTE 论文 (Alibaba, EMNLP 2024 Industry Track)"
+      quote: "弱监督训练阶段对排序模型效果的提升非常有限。因此，在最终的排序模型训练过程中，mGTE-rerank 仅使用监督数据进行微调。"
+      implication: "我们用的就是 gte-mul——它的创造者试过并放弃了，直接用 BCE + 监督数据就发布了"
+
+    - finding: "BGE Reranker 的负样本是训练前一次性构造的，不是迭代式挖掘"
+      source: "C-Pack 论文 (BAAI, SIGIR 2024) + FlagEmbedding GitHub"
+      detail: "BGE 使用了三种负样本：随机负例、BM25 检索负例、Embedding 检索负例。但这是在训练数据构造阶段一次性完成的，用的是一个独立的 Bi-Encoder（不是 Cross-Encoder 自己），不存在「训模型 → 挖负样本 → 再训」的迭代过程"
+
+    - finding: "Sentence Transformers 官方推荐的 hard negative 工具是 Embedding 驱动的"
+      source: "Sentence Transformers v4 文档 + mine_hard_negatives 工具"
+      detail: "推荐的 hard negative 挖掘方式：用一个快速的 Bi-Encoder 编码全量语料，通过 FAISS 近似搜索找出高分非正样本。这和 exp-007 Phase 3.2 的方法完全一致——但只能用于 Bi-Encoder 场景（因为可以对全库做高效向量检索）。Cross-Encoder 推理太慢，无法对 2.3M 全量 passages 做挖掘"
+
+    - finding: "有专门做 Reranker hard negative mining 的论文，但方法不是 Cross-Encoder 自我迭代"
+      source: "ACL 2025: Hard Negative Mining for Domain-Specific Retrieval (Oracle)"
+      detail: "MRR@10 +19%。但方法是用多个异构 Embedding 模型 + PCA 降维 + 语义过滤来选 hard negatives——仍然是 Embedding 驱动的离线构造，不是 Cross-Encoder 自我挖掘"
+
+  cross_encoder_fundamental_limitation: |
+    本质原因：Bi-Encoder 可以一次编码全库建立 FAISS 索引，然后对每条
+    query 做 O(log N) 的近似搜索。Cross-Encoder 必须逐对计算——
+    258K query × 2.3M passage = 5.9×10¹¹ 次推理，完全不可行。
+
+  what_we_could_do_but_wont: |
+    缩小范围到候选池 top-100 做 Cross-Encoder 自我挖掘（Phase 1 训完 →
+    对 position 51-100 打分 → 取高分负样本 → Phase 2 再训）。这在工程上
+    可行，但没有论文或官方指南支持这种做法，收益完全未知。根据 exp-007
+    的教训（Phase 3.1 CachedMNRL 自行设计 → 过拟合退化），舍去。
+
+  conclusion: "不引入迭代式 hard negative mining。采用单阶段 BCE 微调，与 gte-mul 官方方法一致。候选池中的 label=0 自然负样本已经提供了足够多样的训练信号"
+
+
+# =============================================================================
+# 第三部分：候选池重建（exp-007 联动）
+# =============================================================================
+
+candidate_pool_rebuild:
+
+  motivation: |
+    exp-004 的 S4 候选池基于 pretrained m3e-base（R@50=0.628）。
+    exp-007 Phase 3.2 将 R@50 提升到 0.745。用新 Embedding 重建
+    S4 RRF 候选池，粗排召回上限提升约 12%，精排有更高质量的输入。
+
+  rebuild_steps:
+    - step: 1
+      name: "构建微调后 Embedding 的向量索引"
+      description: "用 exp-007 Phase 3.2 ep1 模型编码全量 2.3M passages → FAISS/ChromaDB 索引"
+    - step: 2
+      name: "生成三路 Dense 检索结果"
+      description: |
+        对 train 集和 dev 集 query 分别跑三路 Dense 检索（每路 top-50）：
+        - D-B0: 原始 query 检索
+        - D-P2: 领域 few-shot 改写 query 检索
+        - D-HyDE: HyDE 假答案检索
+        复用 exp-002 的改写/HyDE 生成结果（不改 prompt），仅替换检索后端
+    - step: 3
+      name: "BM25 检索"
+      description: "对 train 集和 dev 集 query 跑 BM25 检索（top-50），复用 exp-002 逻辑"
+    - step: 4
+      name: "S4 RRF 融合"
+      description: "D-B0 + D-P2 + D-HyDE + B-B0 四路 RRF 融合（k=60, per-route K=50），产出 top-50 候选池"
+
+  outputs:
+    train:
+      file: "results/exp008/train_s4_pool.jsonl"
+      description: "258K train query × top-50 candidates"
+      format: '{"qid": str, "query": str, "candidates": [{"pid": str, "score": float, "rank": int}, ...]}'
+    dev:
+      file: "results/exp008/dev_s4_pool.jsonl"
+      description: "~24K dev query × top-50 candidates"
+      format: 同上
+
+  llm_generation:
+    train_set:
+      queries: "~258K train queries"
+      rewrite: "DeepSeek API, P2 prompt（领域 few-shot, temperature=0）"
+      hyde: "DeepSeek API, HyDE prompt（100-150 字假答案, temperature=0）"
+      estimated_cost: "~258K × 2 次 × ¥0.0005/次 ≈ ¥258"
+    dev_set:
+      note: "复用 exp-002 已生成的改写/HyDE 结果"
+
+
+# =============================================================================
+# 第四部分：训练数据构建
+# =============================================================================
+
+training_data:
+
+  source:
+    raw:
+      queries: "data/raw/t2ranking/queries.train.tsv"
+      qrels: "data/raw/t2ranking/qrels.retrieval.train.tsv"
+      collection: "data/raw/t2ranking/collection.tsv"
+    processed:
+      candidate_pool: "results/exp008/train_s4_pool.jsonl"
+
+  construction:
+    description: |
+      对每条 train query，从 S4 top-50 候选池中取所有候选 passage，
+      查 qrels 获取 label（0/1），形成 (query, passage, label) 三元组。
+      这是 BCE 训练的标准格式——每条样本独立计算 loss。
+
+    per_query:
+      candidates: "top-50（实际可能不足 50 条，RRF 融合会缓解稀疏性）"
+      positives: "candidates 中 label > 0 的 passage，label=1（平均约 2.9 个/query）"
+      negatives: "candidates 中 label = 0 的 passage，label=0"
+      total_samples: "~258K × 50 ≈ 12.9M (query, passage) 对（80/20 split 后 ~10.3M 用于训练）"
+      note: "正负比约 1:16，BCE 训练时可能需 pos_weight 缓解。这些负样本来自粗排 top-50——与 query 有一定语义相似性但不相关，是高质量的自然负样本"
+
+  label_treatment:
+    binary:
+      rule: "label > 0 → 1 (正样本), label = 0 → 0 (负样本)"
+      rationale: "exp-004 已验证二元 NDCG 和 graded NDCG 提升幅度一致，二元信号足够驱动排序提升"
+    optional_denoising:
+      description: "只取 label=3（高度相关）和 label=0（不相关），丢弃 label=1,2 的模糊样本"
+      status: "可选消融实验——主实验完成后决定是否执行"
+      rationale: "如果 label=1,2 的 passage 质量参差不齐，带噪声标注训练可能损害排序质量"
+
+  split:
+    method: "从 train 集中按 qid 做 80/20 分割"
+    train_split: "约 206K 条 query → ~10.3M (q, p, label) 对"
+    eval_split: "约 52K 条 query → ~2.6M (q, p, label) 对（用于训练过程中的 dev loss 监控）"
+    note: "不涉及 T2Ranking dev 集，避免训练/最终评估泄漏"
+
+
+# =============================================================================
+# 第五部分：训练方案
+# =============================================================================
+
+training:
+
+  name: "BCE 单阶段微调"
+  objective: "用最标准的 pointwise loss 跑通训练全链路，验证 gte-mul 在 T2Ranking 上的微调增益"
+
+  training_data:
+    source: "train split（~10.3M 对）"
+    positives: "候选池中 label > 0 的 passage"
+    negatives: "候选池中 label = 0 的 passage（自然负样本）"
+
+  model_config:
+    base_model: "Alibaba-NLP/gte-multilingual-reranker-base"
+    architecture: "AutoModelForSequenceClassification, num_labels=1"
+    max_length: 512
+    note: "T2Ranking passage 中位数 368 字符，512 token 覆盖绝大多数样本；gte-mul 原生支持 8192，但短文本训练更快且显存更省"
+
+  loss:
+    name: "BCEWithLogitsLoss"
+    formula: "L = -[y·log(σ(s)) + (1-y)·log(1-σ(s))]"
+    rationale: |
+      Cross-Encoder 输出一个 logit s，通过 sigmoid 映射为相关性概率。
+      BCE 直接优化每个 (query, passage) 对的相关性判断——
+      训练和推理格式完全一致，无 train-inference gap。
+    advantage_over_alternatives: |
+      相比 pairwise（MarginRankingLoss）和 listwise（LambdaRank）：
+      - 直接利用原始标注（label 0/1），无需构造偏好对或列表
+      - exp-007 经验：越简单的 Loss 越不容易过拟合
+      - 业界事实标准：BGE/C-MTP、gte-mul 官方、Cohere Rerank 均用 BCE
+      - mGTE 论文明确使用了监督数据 + BCE（见第二部分文献引用）
+
+  hyperparameters:
+    epochs: 1
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    optimizer: "AdamW"
+    scheduler: "cosine"
+    weight_decay: 0.01
+    batch_size: 32
+    gradient_accumulation_steps: 2
+    effective_batch_size: 64
+    fp16: true
+    max_grad_norm: 1.0
+    pos_weight: "可选——如正负比失衡严重（<1:10），在 BCEWithLogitsLoss 中设置 pos_weight 平衡正样本梯度的贡献"
+    rationale: |
+      epochs=1: exp-007 经验——ep1 即最优，多训容易过拟合
+      lr=2e-5: Cross-Encoder 标准微调 lr（HuggingFace 默认）
+      batch=32, accumulation=2: gte-mul 306M 在 4090 24GB 约需 8-12GB，等效 batch=64 增加负样本多样性
+
+  evaluation:
+    frequency: "每 500 steps"
+    metric: "validation BCE loss（train split 的 eval 部分）"
+    early_stopping: "patience=3, 基于 val_loss"
+
+  expected_outcome:
+    ndcg_at_10: "0.50 ~ 0.55（vs 零样本 0.4442）"
+    risk: "如果增益 < 0.03（NDCG@10），可能原因：(1) 候选池中的负样本与 query 的区分度太高，模型在零样本下已经能区分，BCE 学不到新信号；(2) 标注噪声（label=1,2 模糊样本）干扰训练"
+
+  deliverable:
+    - "训练脚本 scripts/exp008/train_reranker.py"
+    - "微调后模型 models/gte-mul-t2ranking/"
+
+
+# =============================================================================
+# 第五点五：可选消融实验
+# =============================================================================
+
+optional_ablation:
+
+  - name: "label=3 vs label=0 去噪训练"
+    status: "可选——主实验完成后决定"
+    description: "只用最干净的强信号对训练：label=3（高度相关）vs label=0（不相关），丢弃 label=1,2"
+    rationale: "T2Ranking label 定义——3=Perfect, 2=Good, 1=Fair, 0=Irrelevant。label=1 可能是弱相关或歧义标注，引入这些模糊信号可能干扰排序学习"
+    experiment:
+      data: "从训练集中只保留 label=3 的正样本 + label=0 的负样本"
+      training: "1 epoch, 同主实验超参"
+      comparison: "全 label>0 vs 去噪训练，判断 label=1,2 是信号还是噪声"
+
+  - name: "候选池大小消融: top-50 vs top-100"
+    status: "可选——主实验完成后决定"
+    description: "将四路检索各扩大到 top-100，RRF 融合取 top-100。全部 100 条候选中的 label=0 都作为自然负样本参与 BCE 训练。测试不同候选池大小下的精排效果"
+    rationale: |
+      更大的候选池带来两个效应：
+      - 正面：更多负样本 → 更丰富的负样本分布（position 51-100 的 passage
+        与 query 的语义关联更弱，多样性更高）
+      - 负面：训练数据量加倍（~25M 对），训练时间加倍
+      这个消融的目的是验证「数据量/多样性」和「训练成本」之间的 tradeoff。
+      注意：这仍然是自然负样本（不做 hard negative 筛选），不是迭代式 mining
+    experiment:
+      data: "top-100 候选池中全部 label=0 + label>0，~25M 对"
+      training: "1 epoch, 同主实验超参"
+      comparison: "top-50 vs top-100，看新增的 position 51-100 负样本是否提供增量信号"
+
+
+# =============================================================================
+# 第六部分：评估方案
+# =============================================================================
+
+evaluation:
+
+  source:
+    queries: "data/raw/t2ranking/queries.dev.tsv"
+    qrels: "data/raw/t2ranking/qrels.retrieval.dev.tsv"
+    collection: "data/raw/t2ranking/collection.tsv"
+    qrels_graded: "data/raw/t2ranking/qrels.dev.tsv"
+
+  data_split:
+    method: "复用 exp-004 的 50/50 分割（seed=42）"
+    test: "~912 queries —— 最终评估"
+
+  # ───────────────────────────────────────────────────
+  # 三组对照评估
+  # ───────────────────────────────────────────────────
+
+  evaluation_groups:
+
+    group_a:
+      name: "Baseline: 老池子 + 零样本"
+      candidate_pool: "exp-004 S4（pretrained m3e）"
+      reranker: "gte-mul 零样本"
+      purpose: "复现 exp-004 基线，作为下界对比"
+
+    group_b:
+      name: "池子增益: 新池子 + 零样本"
+      candidate_pool: "exp-008 新 S4（finetuned m3e Phase 3.2）"
+      reranker: "gte-mul 零样本"
+      purpose: "隔离 Embedding 微调对精排的间接收益——粗排候选池质量提升 → 精排输入质量提升"
+      hypothesis: "NDCG@10 比 Group A 高 2~5pp，因为更多相关文档进入 top-50"
+
+    group_c:
+      name: "精排增益: 新池子 + 微调"
+      candidate_pool: "exp-008 新 S4（finetuned m3e Phase 3.2）"
+      reranker: "gte-mul 微调后"
+      purpose: "测量精排微调的直接收益——在最优粗排候选池上，精排模型自身的提升"
+      hypothesis: "NDCG@10 比 Group B 高 5~10pp"
+
+  # ───────────────────────────────────────────────────
+  # 指标
+  # ───────────────────────────────────────────────────
+
+  metrics:
+    primary:
+      - "NDCG@10"
+      note: "精排核心指标——衡量 top-10 排序质量。二元 NDCG（label > 0 → relevant）"
+    secondary:
+      - "NDCG@10_graded"
+      - "MRR"
+      - "NDCG@5"
+      - "NDCG@20"
+    supplementary:
+      - "Recall@5 / @10 / @20"
+      - "Precision@5 / @10"
+      - "Hit@5 / @10"
+
+  external_baseline:
+    model: "bge-reranker-v2-m3 (零样本, K=50)"
+    ndcg_at_10_test: 0.4717
+    mrr_test: 0.5857
+    note: "⚠️ 数据泄露风险——不参与正式排名，仅作参考上界。如果微调 gte-mul 超过此分数，说明领域微调胜过了有泄露的通用模型"
+    candidate_pool_note: "exp-004 的 bge-v2-m3 在老池子上评估，与 Group B/C 的池子不同。如需要同池对比，需额外跑 bge-v2-m3 在新池子上的推理"
+
+
+# =============================================================================
+# 第七部分：风险与缓解
+# =============================================================================
+
+risks:
+
+  - risk: "过拟合"
+    severity: "high"
+    description: "exp-007 Phase 1 (3 epoch) 和 Phase 3.1 (2 epoch 继续训练) 均出现过拟合退化。Reranker 参数量更大（306M vs 110M），但训练数据量也更大（10M vs 0.7M 对）"
+    mitigation:
+      - "epochs=1（exp-007 教训：少即是多）"
+      - "eval loss 监控 + early stopping (patience=3)"
+
+  - risk: "正负样本比例失衡"
+    severity: "medium"
+    description: "平均每 query 约 2.9 个正样本 vs 47 个负样本（约 1:16），BCE 的梯度可能被负样本主导"
+    mitigation:
+      - "BCEWithLogitsLoss 的 pos_weight 参数：设为负/正比例（约 16），平衡正负样本的梯度贡献"
+      - "可选消融：pos_weight=None vs pos_weight=16"
+
+  - risk: "候选池重建工程量大"
+    severity: "medium"
+    description: "需要对 258K train query 重新生成改写和 HyDE（DeepSeek API 调用约 516K 次），成本 ¥258，耗时约数小时"
+    mitigation:
+      - "改写和 HyDE 生成可并行（async API 调用）"
+      - "先跑通小规模验证（1K query），确认管道正确后再全量生成"
+
+  - risk: "LLM API 稳定性"
+    severity: "low"
+    description: "258K 条改写 + 258K 条 HyDE 生成，依赖 DeepSeek API 稳定性"
+    mitigation:
+      - "断点续传 + 重试机制（参考 exp-002/003 的 generate_with_retry）"
+      - "先跑 1K 验证 → 跑全量"
+
+
+# =============================================================================
+# 第八部分：预期时间与成本
+# =============================================================================
+
+time_and_cost:
+
+  candidate_pool_rebuild:
+    embedding_index: "~2 小时（FAISS 索引 2.3M × 768d，RTX 4090）"
+    retrieval: "~6 小时（三路 Dense top-50 检索 258K + 24K queries）"
+    rewrite_hyde_generation: "~4 小时（516K API 调用，并行 async）"
+    bm25: "~1 小时"
+    rrf_fusion: "~30 分钟"
+    total: "~14 小时"
+
+  training_data_construction:
+    build_triplets: "~1 小时（查 qrels + 拼接 text）"
+
+  training:
+    duration: "~4 小时（10.3M 对, bs=32×2, fp16, RTX 4090）"
+
+  evaluation:
+    inference: "~30 分钟（912 test query × 50 candidates × 3 组）"
+
+  llm_api_cost:
+    rewrite: "258K × ¥0.0005 ≈ ¥129"
+    hyde: "258K × ¥0.0005 ≈ ¥129"
+    total: "~¥258"
+
+  gpu_cost:
+    total_hours: "~20 小时"
+    rate: "RTX 4090, ¥2-3/小时"
+    total: "~¥40-60"
+
+
+# =============================================================================
+# 第九部分：分析问题
+# =============================================================================
+
+analysis_questions:
+
+  primary:
+    - "Q1: gte-mul 在 T2Ranking 上微调后，NDCG@10 能从 0.4442 提升到多少？是否能追上零样本 bge-v2-m3（0.4717）？"
+    - "Q2: 新候选池（finetuned m3e）对精排指标的间接提升有多大（Group B vs Group A）？Embedding 微调对精排的贡献占总提升的比例？"
+    - "Q3: 精排微调后（Group C），NDCG@10 绝对值和相对提升幅度是多少？领域微调是否能让干净模型超越有泄露的通用模型？"
+
+  secondary:
+    - "Q4: pos_weight 是否影响训练质量？正负比 1:16 的 BCE 训练是否稳定？"
+    - "Q5: Embedding 微调（粗排召回提升）和 Reranker 微调（精排排序提升）各自对端到端 NDCG@10 的贡献比例？"
+
+  optional_ablation_questions:
+    - "Q6: label=3 vs label=0 去噪训练是否优于全 label>0 训练？label=1,2 是信号还是噪声？"
+    - "Q7: 候选池从 top-50 扩大到 top-100 是否带来 NDCG 增益？新增负样本的边际价值 vs 额外训练成本？"
+
+
+# =============================================================================
+# 第十部分：后续方向
+# =============================================================================
+
+future_directions:
+
+  immediate:
+    - "exp-008 最优精排模型接入 RAG 生成管道，评估端到端答案质量（exp-005 框架）"
+    - "与 exp-004 零样本最优（bge-v2-m3）做同池对比，消除候选池差异"
+
+  short_term:
+    - "如果 label denoising 有效，探索 label 加权方案（label=3 weight=3, label=2 weight=2, label=1 weight=1）"
+    - "如果 1 epoch 未过拟合且 eval loss 仍在下降，谨慎尝试 2 epoch"
+
+  medium_term:
+    - "粗排 + 精排 + LLM 生成三阶段全链路评估：exp-007 (embedding) + exp-008 (reranker) + exp-005 (generation) 联调"
+    - "蒸馏方向：用微调后 gte-mul 的分数蒸馏更小的 Cross-Encoder（如 MiniLM），降低线上推理延迟"
+
+
+# =============================================================================
+# 参考资料
+# =============================================================================
+
+references:
+  gte_mul:
+    paper: "mGTE: Generalized Long-Context Text Representation and Reranking Models for Multilingual Text Retrieval"
+    venue: "EMNLP 2024 Industry Track"
+    hf: "https://huggingface.co/Alibaba-NLP/gte-multilingual-reranker-base"
+    cmteb_r: 74.08
+    key_finding: "弱监督训练对排序模型提升有限，最终仅用监督数据微调。排序模型超参与文本表示模型保持一致"
+  bge_reranker:
+    paper: "C-Pack: Packaged Resources For General Chinese Embeddings (SIGIR 2024)"
+    arxiv: "2309.07597"
+    key_finding: "Reranker 使用 BCE 微调，pairwise/listwise 仅带来 <1% NDCG 边际提升。负样本在训练前一次性构造（随机+BM25+Embedding 检索），非迭代式 mining"
+  t2ranking:
+    paper: "T2Ranking: A large-scale Chinese Benchmark for Passage Ranking (SIGIR 2023)"
+    arxiv: "2304.03679"
+    note: "训练集 258K query，qrels 含 4 级标注"
+  exp007_experience:
+    key_lessons:
+      - "epochs=1 在大多数场景下已收敛，多训容易过拟合（Phase 1 3-epoch 达到平台，Phase 3.1 2-epoch 退化）"
+      - "Hard negative mining 对 bi-encoder 是最大单一增益来源（+11.6% Recall@10），但其方法（FAISS 全库检索）无法直接移植到 Cross-Encoder"
+      - "越简单的 Loss 越稳定（MNRL > CachedMNRL）"
+      - "未经文献验证的自创训练策略风险高（Phase 3.1 自行设计 CachedMNRL → 退化）"

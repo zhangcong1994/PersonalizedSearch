@@ -303,3 +303,22 @@ experiment_summary:
     files:
       plan: experiments/exp-007-embedding-finetune.yaml
       analysis: experiments/exp-007-results-analysis.md
+
+  - id: exp-009
+    name: 生成模型 QLoRA SFT（教师蒸馏）
+    status: done
+    date_range: 2026-05-31 ~ 2026-06-02
+    summary: "以 qwen3-max 为教师，2172 条 5 类 AI 搜索 SFT 数据 QLoRA 微调 Qwen3-4B。V1（chat_template 格式, epochs=3, lr=2e-4）严重过拟合，均分 50.1（基线 60.2, -10.1）。V2（plain text 格式修复 + epochs=1 + lr=1e-4）回升至 51.2（-9.0）。结论：SFT 不适合该场景——4B 模型通过 SFT 无法习得跨文档整合能力，建议转向 Prompt 工程或更大模型。"
+    best_result: "V2: 51.2 分（基线 60.2, -9.0），整合质量 1.94（-0.37）、引文质量 2.09（-0.36）"
+    key_findings:
+      - "训练数据质量高：29 条抽样 Judge 均分 82.3，Pass 93.1%，问题不在数据"
+      - "epoch 0.22 时 loss 已降至 0.2-0.27，token acc 94-96%，两条训练线均严重过拟合"
+      - "chat_template vs plain text 格式不匹配是 V1 主要错误，修复后仅回升 1.1 分"
+      - "SFT 损坏的维度与基线完全一致：整合/引文/体验，准确性/安全性/相关性基本持平"
+      - "失败模式：模型退化为逐篇罗列原文，丧失了基线具备的跨文档整合能力"
+      - "SFT 无法突破 4B 模型在信息综合上的能力天花板"
+    files:
+      plan: experiments/exp-009-generation-sft.yaml
+      analysis: experiments/exp-009-results-analysis.md
+      pipeline: scripts/exp009/PIPELINE.md
+      suggestions: experiments/exp-009-improvement-suggestions.md

@@ -103,6 +103,20 @@ candidate_models:
 
   # ========== Group B：本地中等模型 ==========
 
+  - id: "qwen3-8b"
+    name: "Qwen3-8B"
+    hf_id: "Qwen/Qwen3-8B"
+    series: "Qwen3"
+    params: "8B"
+    vram_fp16: "~16GB"
+    vram_int4: "~5GB"
+    context_len: 131072
+    license: "Apache 2.0"
+    chat_template: "qwen3"
+    notes: "Qwen3 系列中等模型，支持 thinking / non-thinking 模式切换。实验五前期将其排除（VRAM 余量紧张），后续 V1 阶段纳入以量化参数量翻倍（4B→8B）的收益。同时对比 thinking ON vs OFF 在 8B 规模上的效果差异"
+    selection_rationale: "参数量翻倍测试——量化从 4B 到 8B 的自然增益，验证「换大模型」策略是否比 SFT 更有效"
+    expected_role: "本地新一代 8B 参照"
+
   - id: "qwen2.5-7b"
     name: "Qwen2.5-7B-Instruct"
     hf_id: "Qwen/Qwen2.5-7B-Instruct"
@@ -118,6 +132,18 @@ candidate_models:
     expected_role: "本地部署质量基准"
 
   # ========== Group C：API 强模型（生成质量上界）==========
+
+  - id: "qwen3-max"
+    name: "qwen3-max"
+    provider: "阿里云百炼 API (DashScope)"
+    backend: "api"
+    params: "未公开 (MoE)"
+    context_len: 131072
+    cost_1k_input: "¥0.004"
+    cost_1k_output: "¥0.012"
+    notes: "2025 年 7 月新增。阿里云 Qwen3 旗舰 API 模型，think=OFF。在 exp-005 首批对比中以 72.7 分确立「本地 4B 与 API 之间 +12.5 分」的基准差距线"
+    selection_rationale: "阿里系 API 最强——与开源 Qwen3 系列同一家族，排除跨模型家族的风格偏差，纯粹对比规模/训练差异"
+    expected_role: "同一家族 API 上界参照"
 
   - id: "deepseek-chat"
     name: "DeepSeek-V3 (deepseek-chat)"
@@ -151,13 +177,15 @@ candidate_models:
       - ["qwen2.5-1.5b", "1.5B", "~3GB", "32K", "本地", "质量下界"]
       - ["qwen2.5-3b", "3B", "~6GB", "32K", "本地", "性价比参照"]
       - ["qwen3-4b", "4B", "~8GB", "32K", "本地", "小模型上限"]
+      - ["qwen3-8b", "8B", "~16GB", "128K", "本地", "新一代 8B 参照"]
       - ["qwen2.5-7b", "7B", "~14GB", "128K", "本地(INT4备选)", "本地质量基准"]
       - ["deepseek-chat", "671B MoE", "API", "128K", "API", "质量上界"]
+      - ["qwen3-max", "未公开 MoE", "API", "128K", "API", "同家族 API 上界"]
       - ["gpt-4o-mini", "未公开", "API", "128K", "API (可选)", "跨家族参照"]
 
   exclusions:
-    - model: "Qwen3-8B / Qwen3-14B / Qwen3-32B"
-      reason: "8B FP16 约 16GB VRAM，RTX 4090 勉强可跑但余量紧张；14B+ 超出单卡能力。V1 阶段如需更高精度可引入 INT4 版本"
+    - model: "Qwen3-14B / Qwen3-32B"
+      reason: "14B+ 超出单卡 RTX 4090 能力。V1 阶段如需更高精度可引入 INT4 版本"
     - model: "MiniCPM3-4B"
       reason: "Qwen3-4B 发布后，MiniCPM3-4B 在大部分 benchmark 上被超越。保留 Qwen3-4B 作为小模型代表即可。如果想增加模型多样性可在后续补充"
     - model: "GLM-4-9B-Chat"

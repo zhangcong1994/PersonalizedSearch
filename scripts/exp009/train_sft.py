@@ -8,6 +8,7 @@ Exp-009 阶段七：QLoRA SFT 微调 Qwen3-4B。
 import os
 import sys
 import json
+import shutil
 import argparse
 import logging
 from pathlib import Path
@@ -126,6 +127,10 @@ def main():
     parser.add_argument("--no-merge", action="store_true",
                         help="Skip merging adapter into base model")
     args = parser.parse_args()
+
+    if os.path.exists(args.output_dir):
+        logger.info(f"Removing previous output: {args.output_dir}")
+        shutil.rmtree(args.output_dir)
 
     logger.info("=" * 60)
     logger.info("  Exp-009 QLoRA SFT Training")

@@ -93,6 +93,7 @@ def generate_vllm(
         base_url=vllm_url,
         max_tokens=1024,
         temperature=0.3,
+        model_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
     )
     client = LangChainLLMClient(llm)
 

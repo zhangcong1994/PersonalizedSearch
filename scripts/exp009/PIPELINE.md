@@ -589,10 +589,39 @@ python scripts/exp009/train_sft.py \
 
 | 项目 | 内容 |
 |------|------|
-| 脚本 | [ ] 复用 `scripts/exp005/evaluate_exp005.py`（或新建 eval wrapper） |
-| 测试集 | exp-005 200 条 dev 集（queries.dev.tsv → exp-004 reranker top-10） |
+| 脚本 | [x] `scripts/exp009/eval_sft_model.py` |
+| 测试集 | exp-005 198 条 dev 集（`results/exp005/input_queries.jsonl`） |
 | Judge | deepseek-chat, 6 维评分（准确性+安全性+相关性+整合质量+引文质量+用户体验） |
-| 基线 | Qwen3-4B-nonthink 60.2 分 → qwen3-max 72.7 分（差距 12.5 分） |
+
+### 基线（exp-005）
+
+| 模型 | 均分 | Pass% | 备注 |
+|------|:---:|:---:|------|
+| qwen3-max | 72.7 | 81.2% | 教师模型上限 |
+| qwen3-4b-nonthink | 60.2 | 58.6% | 微调前基线 |
+| qwen2.5-7b | 56.0 | 39.4% | 更大但更差 |
+| qwen3-4b (think) | 57.4 | 52.0% | thinking 有害 |
+
+### 操作流程
+
+```bash
+# 1. 在服务器上启动 vLLM
+vllm serve models/qwen3-4b-t2ranking-sft/merged \
+    --host 0.0.0.0 --port 8000 \
+    --max-model-len 8192
+
+# 2. 在服务器上生成答案（198 条，~2 分钟）
+python scripts/exp009/eval_sft_model.py --generate-only
+
+# 3. 把生成结果下载到本机
+scp server:~/PersonalizedSearch/results/exp005/generations/qwen3-4b-sft.jsonl \
+    results/exp005/generations/
+
+# 4. 在本机跑 Judge
+python scripts/exp009/eval_sft_model.py --judge-only
+```
+
+> **提示词来源**：与 exp-005 完全一致，都在 [`src/generation/prompts.py`](src/generation/prompts.py)，通过 `PromptManager.get_system_prompt()` + `build_user_prompt()` 构建。基线模型评分已存在（qwen3-4b-nonthink 60.2），无需重新生成。
 
 ---
 
@@ -615,8 +644,8 @@ python scripts/exp009/train_sft.py \
 | 四+五 | `test_hallu_detection.py` | x | Python (pilot) |
 | 四+五 | `check_synthesis_quality.py` | x | Python (analysis) |
 | 六 | `construct_categories.py` | x | Python |
-| 七 | `train_sft.py` | | Python |
-| 八 | 复用 exp005 evaluate | | Python |
+| 七 | `train_sft.py` | x | Python |
+| 八 | `eval_sft_model.py` | x | Python |
 
 ### 中间数据文件（全部在 `{DATA_ROOT}/data/processed/`）
 

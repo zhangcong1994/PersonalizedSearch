@@ -150,6 +150,8 @@ def generate_multi_vllm(
         base_url=vllm_url,
         max_tokens=model_config.get("max_tokens", 1024),
         temperature=temperature,
+        max_retries=6,
+        timeout=180.0,
     )
     extra_body = model_config.get("extra_body")
     if extra_body:
@@ -189,7 +191,12 @@ def generate_multi_vllm(
                 except Exception as e:
                     logger.warning(f"  Error on qid={qid} sample={sample_idx}: {e}")
                     total_err += 1
+                    time.sleep(1.0)  # 出错后稍等再发下一个请求
                     continue
+
+                # 请求间短暂间隔，避免 vLLM 请求堆积
+                if sample_idx < num_samples - 1:
+                    time.sleep(0.5)
 
                 # 使用复合 ID 避免 Judge 缓存去重（同一条 query 的多个 sample 需要独立评分）
                 composite_qid = f"{qid}_s{sample_idx}"

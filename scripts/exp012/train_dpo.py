@@ -289,26 +289,8 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # ── 参考模型（冻结，用于 KL 散度计算）──
-    # DPO 需要 ref model 提供基线概率分布。用相同的 4-bit base model，
-    # 不加 LoRA，冻结，以节省显存。
-    # DPOTrainer 内部会自动把 ref model 设为 eval mode。
-    logger.info("Loading reference model (4-bit, frozen)...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        cache_dir=str(MODEL_CACHE_DIR),
-    )
-    # ref model 不加 LoRA，直接冻结
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
-
-    # ── DPO Config ──
+    # ── DPO Config（含 precompute_ref_log_probs）──
+    # ref model 的 log prob 预计算后释放，训练时只保留 policy model，节省显存
     dpo_config = DPOConfig(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
@@ -332,13 +314,13 @@ def main():
         beta=args.beta,
         max_length=args.max_length,
         loss_type="sigmoid",
+        precompute_ref_log_probs=True,
     )
 
     # ── DPO Trainer ──
     logger.info("Initializing DPOTrainer...")
     dpo_trainer = DPOTrainer(
         model=model,
-        ref_model=ref_model,
         args=dpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,

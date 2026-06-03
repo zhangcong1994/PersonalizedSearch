@@ -73,12 +73,25 @@ MODEL_CONFIGS = {
         "max_tokens": 1024,
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     },
+    "qwen3-4b-thinking": {
+        "hf_id": "Qwen/Qwen3-4B",
+        "backend": "vllm",
+        "params": "4B",
+        "max_tokens": 1024,
+    },
     "qwen3-8b-nothink": {
         "hf_id": "Qwen/Qwen3-8B",
         "backend": "vllm",
         "params": "8B",
         "max_tokens": 1024,
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
+    "qwen3-8b-thinking": {
+        "hf_id": "Qwen/Qwen3-8B",
+        "backend": "vllm",
+        "params": "8B",
+        "max_tokens": 1024,
+        # thinking 模式不需要 extra_body（默认开启 thinking）
     },
 }
 

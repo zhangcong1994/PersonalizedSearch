@@ -1,22 +1,23 @@
 """
-Exp-005 多模型批量生成脚本。
+Exp-010 生成脚本 —— 支持多 Prompt 版本的批量生成。
 
-支持两类模型：
-  - 本地模型（vLLM OpenAI-compatible server 或 HuggingFace Transformers）
-  - API 模型（DeepSeek / OpenAI，复用 src/intent/api_client.py）
-
-输入：查询 + 精排后的 top-K passages（exp-004 输出或理想排序）
-输出：results/exp005/generations/{model_id}.jsonl
+与 exp-005 的 generate_exp005.py 功能对应，但：
+  - 使用 src/generation/prompts_v2.py（PromptV2Manager）管理 prompt 版本
+  - 输入侧统一用 [文档 N] 格式（而非旧版 [N] 来源: pid）
+  - 输出默认写到 results/exp010/generations/
 
 用法：
-  # API 模型
-  python scripts/generate_exp005.py --model deepseek-chat --input data/exp005_queries.jsonl
+  # 基线（v0 prompt）
+  python scripts/exp010/generate_exp010.py --model qwen3-4b-nothink \\
+      --input data/exp005_queries.jsonl --prompt-version v0
 
-  # 本地 vLLM 模型
-  python scripts/generate_exp005.py --model qwen3-4b --local --vllm-url http://localhost:8000/v1
+  # Phase 1（v1-full prompt）
+  python scripts/exp010/generate_exp010.py --model qwen3-4b-nothink \\
+      --input data/exp005_queries.jsonl --prompt-version v1-full
 
-  # 批量全部模型
-  python scripts/generate_exp005.py --all --input data/exp005_queries.jsonl
+  # 消融变体
+  python scripts/exp010/generate_exp010.py --model qwen3-4b-nothink \\
+      --input results/exp010/queries_50.jsonl --prompt-version abl-no-cot
 """
 
 import os
@@ -30,8 +31,8 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.utils.config import DATA_ROOT, PROJECT_ROOT
-from src.generation.prompts import PromptManager, get_default_prompts
+from src.utils.config import DATA_ROOT
+from src.generation.prompts_v2 import PromptV2Manager, list_versions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,34 +40,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-RESULTS_DIR = DATA_ROOT / "results" / "exp005"
+RESULTS_DIR = DATA_ROOT / "results" / "exp010"
 GENERATIONS_DIR = RESULTS_DIR / "generations"
 
 MODEL_CONFIGS = {
-    "qwen2.5-1.5b": {
-        "hf_id": "Qwen/Qwen2.5-1.5B-Instruct",
-        "backend": "vllm",
-        "params": "1.5B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
-    "qwen2.5-3b": {
-        "hf_id": "Qwen/Qwen2.5-3B-Instruct",
-        "backend": "vllm",
-        "params": "3B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
-    "qwen3-4b": {
-        "hf_id": "Qwen/Qwen3-4B",
-        "backend": "vllm",
-        "params": "4B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
     "qwen3-4b-nothink": {
         "hf_id": "Qwen/Qwen3-4B",
-        "backend": "vllm",
+        "backend": "local",
         "params": "4B",
         "max_tokens": 1024,
         "temperature": 0.3,
@@ -74,55 +54,25 @@ MODEL_CONFIGS = {
     },
     "qwen3-8b-nothink": {
         "hf_id": "Qwen/Qwen3-8B",
-        "backend": "vllm",
+        "backend": "local",
         "params": "8B",
         "max_tokens": 1024,
         "temperature": 0.3,
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     },
-    "qwen3-8b": {
+    "qwen3-8b-thinking": {
         "hf_id": "Qwen/Qwen3-8B",
-        "backend": "vllm",
+        "backend": "local",
         "params": "8B",
         "max_tokens": 1024,
         "temperature": 0.3,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
     },
-    "qwen2.5-7b": {
-        "hf_id": "Qwen/Qwen2.5-7B-Instruct",
-        "backend": "vllm",
-        "params": "7B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-        "quantization": "int4",
-        "alt_hf_id": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
-    },
-    "glm4-9b": {
-        "hf_id": "THUDM/glm-4-9b-chat",
-        "backend": "vllm",
-        "params": "9B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
-    "llama3.1-8b": {
-        "hf_id": "meta-llama/Llama-3.1-8B-Instruct",
-        "backend": "vllm",
-        "params": "8B",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
-    "deepseek-chat": {
+    "qwen3-max": {
         "hf_id": None,
         "backend": "api",
-        "provider": "deepseek",
-        "model": "deepseek-chat",
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    },
-    "gpt-4o-mini": {
-        "hf_id": None,
-        "backend": "api",
-        "provider": "openai",
-        "model": "gpt-4o-mini",
+        "provider": "dashscope",
+        "model": "qwen3-max",
         "max_tokens": 1024,
         "temperature": 0.3,
     },
@@ -130,7 +80,6 @@ MODEL_CONFIGS = {
 
 
 def load_input_queries(filepath: Path) -> list[dict]:
-    """加载输入查询 + passages 的 JSONL 文件。"""
     queries = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -145,8 +94,9 @@ def load_input_queries(filepath: Path) -> list[dict]:
 def build_prompt(
     query_text: str,
     passages: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
 ) -> tuple[str, str]:
+    """构造 system prompt 和 user prompt。输入侧统一用 [文档 N] 格式。"""
     system_prompt = prompt_manager.get_system_prompt()
 
     context_parts = []
@@ -155,7 +105,8 @@ def build_prompt(
         rank = p.get("rank", i + 1)
         text = p.get("text", "")
         text_truncated = text[:800]
-        context_parts.append(f"[{rank}] 来源: {pid}\n{text_truncated}")
+        # 与旧版关键差异：用 [文档 N] 而非 [N] 来源: pid
+        context_parts.append(f"[文档 {rank}]\n{text_truncated}")
 
     context = "\n\n".join(context_parts)
     user_prompt = prompt_manager.build_user_prompt(query_text, context)
@@ -163,54 +114,16 @@ def build_prompt(
     return system_prompt, user_prompt
 
 
-def generate_api(
-    model_config: dict,
-    query_data: list[dict],
-    prompt_manager: PromptManager,
-    output_file: Path,
-    api_key: Optional[str] = None,
-):
-    """使用 API 模型生成答案。"""
-    from src.intent.api_client import APIClientFactory, LangChainLLMClient
-    from langchain_openai import ChatOpenAI
-
-    provider = model_config["provider"]
-    model_name = model_config["model"]
-
-    if provider == "deepseek":
-        deepseek_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-        llm = ChatOpenAI(
-            model=model_name,
-            api_key=deepseek_key,
-            base_url="https://api.deepseek.com/v1",
-            max_tokens=model_config.get("max_tokens", 1024),
-            temperature=model_config.get("temperature", 0.3),
-        )
-    elif provider == "openai":
-        openai_key = api_key or os.getenv("OPENAI_API_KEY")
-        llm = ChatOpenAI(
-            model=model_name,
-            api_key=openai_key,
-            max_tokens=model_config.get("max_tokens", 1024),
-            temperature=model_config.get("temperature", 0.3),
-        )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    client = LangChainLLMClient(llm)
-    _run_generation(client, model_config, query_data, prompt_manager, output_file, "api")
-
-
 def generate_local_vllm(
     model_config: dict,
     query_data: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
     output_file: Path,
     vllm_url: str,
 ):
     """使用 vLLM OpenAI-compatible API 生成答案。"""
-    from src.intent.api_client import LangChainLLMClient
     from langchain_openai import ChatOpenAI
+    from src.intent.api_client import LangChainLLMClient
 
     llm_kwargs = dict(
         model=model_config["hf_id"],
@@ -228,13 +141,43 @@ def generate_local_vllm(
     _run_generation(client, model_config, query_data, prompt_manager, output_file, "vllm")
 
 
+def generate_api(
+    model_config: dict,
+    query_data: list[dict],
+    prompt_manager: PromptV2Manager,
+    output_file: Path,
+    api_key: Optional[str] = None,
+):
+    """使用 API 模型生成答案。"""
+    from langchain_openai import ChatOpenAI
+    from src.intent.api_client import LangChainLLMClient
+
+    provider = model_config["provider"]
+    model_name = model_config["model"]
+
+    if provider == "dashscope":
+        key = api_key or os.getenv("DASHSCOPE_API_KEY")
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            max_tokens=model_config.get("max_tokens", 1024),
+            temperature=model_config.get("temperature", 0.3),
+        )
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    client = LangChainLLMClient(llm)
+    _run_generation(client, model_config, query_data, prompt_manager, output_file, "api")
+
+
 def generate_local_hf(
     model_config: dict,
     query_data: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
     output_file: Path,
 ):
-    """使用 HuggingFace Transformers 直接生成答案（备选方案）。"""
+    """使用 HuggingFace Transformers 直接生成（备选方案）。"""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -311,7 +254,7 @@ def _run_generation(
     client,
     model_config: dict,
     query_data: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
     output_file: Path,
     backend: str,
 ):
@@ -328,6 +271,7 @@ def _run_generation(
 
             system_prompt, user_prompt = build_prompt(query_text, passages, prompt_manager)
 
+            # 纯文本拼接（与评估格式一致，不使用 chat_template）
             full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
             start_time = time.time()
@@ -351,16 +295,21 @@ def _run_generation(
             out_f.flush()
 
             if (i + 1) % 10 == 0:
-                logger.info(f"  Generated {i + 1}/{len(query_data)} "
-                            f"({elapsed_ms}ms avg on last query)")
+                logger.info(
+                    f"  Generated {i + 1}/{len(query_data)} "
+                    f"({elapsed_ms}ms avg on last query)"
+                )
 
     logger.info(f"Saved {len(query_data)} generations to {output_file}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Exp-005 Multi-Model Generation Runner")
-    parser.add_argument("--model", type=str, help="Model ID (e.g., deepseek-chat, qwen3-4b)")
-    parser.add_argument("--all", action="store_true", help="Run all models")
+    parser = argparse.ArgumentParser(description="Exp-010 Multi-Version Generation Runner")
+    parser.add_argument("--model", type=str, required=True,
+                        help="Model ID (e.g., qwen3-4b-nothink)")
+    parser.add_argument("--prompt-version", type=str, default="v0",
+                        choices=list_versions(),
+                        help="Prompt 版本 (v0=基线, v1-full=Phase1, v2=Phase2, v3=Phase3, abl-*=消融)")
     parser.add_argument("--input", "-i", type=str, required=True,
                         help="Input JSONL file with queries and passages")
     parser.add_argument("--output-dir", type=str, default=str(GENERATIONS_DIR),
@@ -384,51 +333,45 @@ if __name__ == "__main__":
         logger.error(f"Input file not found: {input_path}")
         sys.exit(1)
 
+    if args.model not in MODEL_CONFIGS:
+        logger.error(f"Unknown model: {args.model}. Available: {list(MODEL_CONFIGS.keys())}")
+        sys.exit(1)
+
     query_data = load_input_queries(input_path)
     if args.max > 0:
         query_data = query_data[:args.max]
 
-    prompt_manager = get_default_prompts()
-
-    models_to_run = []
-    if args.all:
-        models_to_run = list(MODEL_CONFIGS.keys())
-    elif args.model:
-        if args.model not in MODEL_CONFIGS:
-            logger.error(f"Unknown model: {args.model}. Available: {list(MODEL_CONFIGS.keys())}")
-            sys.exit(1)
-        models_to_run = [args.model]
-    else:
-        logger.error("Specify --model or --all")
-        sys.exit(1)
+    prompt_manager = PromptV2Manager(version=args.prompt_version)
+    model_config = MODEL_CONFIGS[args.model]
+    model_config["id"] = args.model
 
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    for model_id in models_to_run:
-        config = MODEL_CONFIGS[model_id]
-        config["id"] = model_id
+    # 文件名含 prompt 版本
+    output_file = output_dir / f"{args.model}-{args.prompt_version}.jsonl"
 
-        output_file = output_dir / f"{model_id}.jsonl"
+    if output_file.exists() and not args.force:
+        logger.info(f"Skipping {args.model}-{args.prompt_version} (cached at {output_file})")
+        sys.exit(0)
 
-        if output_file.exists() and not args.force:
-            logger.info(f"Skipping {model_id} (cached at {output_file})")
-            continue
+    backend = args.backend
+    if backend == "auto":
+        backend = model_config.get("backend", "api")
 
-        backend = args.backend
-        if backend == "auto":
-            backend = config.get("backend", "api")
+    logger.info(
+        f"Generating: model={args.model} prompt={args.prompt_version} "
+        f"backend={backend} queries={len(query_data)}"
+    )
 
-        logger.info(f"Generating with {model_id} ({backend})...")
+    if backend == "api":
+        generate_api(model_config, query_data, prompt_manager, output_file, args.api_key)
+    elif backend == "vllm":
+        generate_local_vllm(model_config, query_data, prompt_manager, output_file, args.vllm_url)
+    elif backend == "hf":
+        generate_local_hf(model_config, query_data, prompt_manager, output_file)
+    else:
+        logger.error(f"Unknown backend: {backend}")
+        sys.exit(1)
 
-        if backend == "api":
-            generate_api(config, query_data, prompt_manager, output_file, args.api_key)
-        elif backend == "vllm":
-            generate_local_vllm(config, query_data, prompt_manager, output_file, args.vllm_url)
-        elif backend == "hf":
-            generate_local_hf(config, query_data, prompt_manager, output_file)
-        else:
-            logger.error(f"Unknown backend: {backend}")
-            sys.exit(1)
-
-    logger.info("All generations complete")
+    logger.info(f"Done: {output_file}")

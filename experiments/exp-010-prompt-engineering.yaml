@@ -1,26 +1,27 @@
 # 实验计划：V1 生成模型 Prompt 工程优化
-# exp-010: Qwen3-4B 在 AI 搜索场景下的 Prompt 迭代优化
+# exp-010: Qwen3-8B 在 AI 搜索场景下的 Prompt 迭代优化
 # 创建日期：2026-06-02
-# 最后更新：2026-06-02
+# 最后更新：2026-06-03
 #
 # 注：
 #   - exp-009 原计划 DPO 偏好对齐，现留空（exp-010 被 Prompt 工程占用）
 #   - 本实验不涉及模型训练，纯 prompt 迭代 + 评估
 #   - 检索输入固定（exp-004 精排 top-10），仅更换 prompt
 #   - 评估沿用 exp-005 Judge 体系（deepseek-chat, 6 维两批）
+#   - exp-005 已跑完 8B non-thinking (60.9) 和 thinking (60.5)，8B 比 4B 有更大的潜力窗口
 
 meta:
   experiment_id: exp-010
   phase: "V1"
-  objective: "通过系统化的 Prompt 工程迭代，在不训练模型的前提下，将 Qwen3-4B-nonthink 的生成质量从 60.2 分提升至显著高于基线的水平"
+  objective: "通过系统化的 Prompt 工程迭代，在不训练模型的前提下，将 Qwen3-8B 的生成质量从 60.9 分提升至显著高于基线的水平。同时测试 thinking 模式与新 prompt 的交互效应（基线 thinking 在整合/引文上微超 non-thinking，新 prompt 可能放大这一优势或抵消)"
   status: planned
   target_platform: "本地 RTX 4090 (vLLM) 或 AutoDL"
-  prerequisite: "exp-005 评估体系已验证 + exp-009 SFT 结果已出（确认 SFT 不适合，Prompt 是下一优先方向）"
-  design_principle: "单变量消融 —— 每个 Phase 只改一个 prompt 变量，用同一批 198 条评估数据测量效果，拒绝同时改多个变量的'散弹枪'做法"
+  prerequisite: "exp-005 8B 双模式基线已出（nt 60.9 / t 60.5）+ exp-009 SFT 结果已出（确认 SFT 不适合）"
+  design_principle: "单变量消融 —— 每个 Phase 只改一个 prompt 变量，用同一批 198 条评估数据测量效果，拒绝同时改多个变量的'散弹枪'做法。主力在 non-thinking 上迭代，thinking 做关键节点对照"
   key_references:
-    - "exp-005: Qwen3-4B-nonthink 基线 60.2 分，6 维分项已知"
+    - "exp-005: Qwen3-8B-nonthink 基线 60.9 分, thinking 基线 60.5 分, 6 维分项已知"
+    - "exp-005 发现 7: 8B vs 4B 参数量翻倍几乎零增益（+0.7），但 8B-thinking 在整合(2.35)和引文(2.53)上微超 non-thinking，存在潜力窗口"
     - "exp-009: SFT 两次训练均退化（-9~-10 分），根因模型学会格式而非整合"
-    - "exp-009 定性分析：SFT 后模型退化为逐篇罗列，Judge 评语明确指向整合失败"
     - "prompt 端痛点分析：6 个痛点 × 对应提示词招式（详见 exp-010 设计文档）"
 
 
@@ -32,19 +33,21 @@ motivation:
 
   why_prompt_after_sft_failure:
     core_reason: |
-      exp-009 证明 SFT 不适合该场景：2172 条高质量训练数据（教师均分 82.3）+ 两次不同参数训练，
-      结果稳定比基线（60.2）差 9-10 分。根因：4B 模型通过 SFT 无法习得跨文档整合能力，
-      且训练格式问题导致模型学会了表面的"格式模仿"而非真正的"信息综合"。
+      exp-009 证明 SFT 不适合该场景（4B 上）：2172 条高质量训练数据（教师均分 82.3）+ 两次不同参数训练，
+      结果稳定比基线差 9-10 分。根因：小模型通过 SFT 无法习得跨文档整合能力。
+      exp-005 发现 7 进一步确认：4B→8B 参数量翻倍几乎零增益（+0.7 分），
+      说明单纯增加参数无法突破整合瓶颈——但 8B-thinking 在整合(2.35)和引文(2.53)上
+      微超 non-thinking，暗示 8B 有 4B 不具备的"结构化思考潜力窗口"。
       
-      这直接指向一个假设：4B 模型本身具有整合能力（基线 2.31 分），但 prompt 没有引导它用出来。
-      SFT 用更多的数据反而覆盖了它原有的整合行为。如果这个假设成立，优化 prompt 可以
-      释放基线已有的能力，而无需改变模型参数。
+      假设：如果给 8B 一个明确的思考框架（我们的分步指令 prompt），它可以利用
+      更大的参数空间把这种结构化思考能力释放出来——效果可能远超 4B 上的微幅波动。
 
     sft_negative_evidence:
-      - "整合质量：2.31 (基线) → 1.94 (SFT V2)，−0.37"
-      - "引文质量：2.45 (基线) → 2.09 (SFT V2)，−0.36"
-      - "用户体验：3.11 (基线) → 2.66 (SFT V2)，−0.45"
+      - "整合质量：2.31 (4B基线) → 1.94 (4B SFT V2)，−0.37"
+      - "引文质量：2.45 (4B基线) → 2.09 (4B SFT V2)，−0.36"
+      - "用户体验：3.11 (4B基线) → 2.66 (4B SFT V2)，−0.45"
       - "准确性/安全性/相关性：SFT 前后基本无变化（这三维不敏感于训练）"
+      - "8B non-thinking 基线 60.9：参数量翻倍但总分仅 +0.7，整合 2.27 甚至低于 4B 的 2.31"
 
     prompt_sensitivity_hypothesis: |
       在评估标准 11 维 × 提示词敏感性分析中，有 5 个维度对 prompt 高度敏感：
@@ -77,26 +80,31 @@ experiment_setup:
 
   models_under_test:
     primary:
-      id: "qwen3-4b-nonthink"
-      hf_id: "Qwen/Qwen3-4B"
+      id: "qwen3-8b-nonthink"
+      hf_id: "Qwen/Qwen3-8B"
       backend: "vLLM"
       temperature: 0.3
       max_tokens: 1024
       thinking: "OFF"
-      role: "主力实验对象 —— exp-005 基线 60.2，所有 Phase 都在此模型上评估"
+      role: "主力实验对象 —— exp-005 基线 60.9，所有 Phase 都在此模型上评估"
     secondary:
-      - id: "qwen3-8b-nonthink"
+      - id: "qwen3-8b-thinking"
         hf_id: "Qwen/Qwen3-8B"
         backend: "vLLM"
         temperature: 0.3
         max_tokens: 1024
-        thinking: "OFF"
-        role: "Phase 4 验证 Prompt 改进是否跨模型泛化（参数翻倍后 prompt 收益是放大还是缩小？）"
+        thinking: "ON"
+        role: "Phase 3 完成后跑最优 prompt，测试新 prompt 与 thinking 模式的交互效应（基线 thinking 在整合/引文微超 non-thinking，新 prompt 可能放大此优势）"
+    reference:
+      id: "qwen3-4b-nonthink"
+      hf_id: "Qwen/Qwen3-4B"
+      score: 60.2
+      role: "4B 参照 —— 如果 8B prompt 收益远超 4B，说明大参数 + 好 prompt 有乘数效应"
     upper_bound:
       id: "qwen3-max"
       backend: "阿里云 API"
       score: 72.7
-      role: "质量上界参照，不参与 prompt 迭代（API 模型 prompt 收益通常远小于本地模型）"
+      role: "质量上界参照，不参与 prompt 迭代"
 
   evaluation:
     dataset: "exp-005 198 条 dev 集（T2Ranking, exp-004 bge-reranker-v2-m3 精排 top-10）"
@@ -110,17 +118,19 @@ experiment_setup:
     cost_per_eval: "198 条 × 2 批 Judge 调用 ≈ ¥2-3"
 
   baseline:
-    model: "qwen3-4b-nonthink"
+    model: "qwen3-8b-nonthink"
     prompt: "exp-005 原版（src/generation/prompts.py）"
-    score: 60.2
-    pass_pct: "58.6%"
+    score: 60.9
+    pass_pct: "60.4%"
     dim_scores:
-      veracity: 3.10
-      safety: 3.61
-      relevance: 3.68
-      synthesis_quality: 2.31
-      citation_quality: 2.45
+      veracity: 3.18
+      safety: 3.63
+      relevance: 3.64
+      synthesis_quality: 2.27
+      citation_quality: 2.47
       user_experience: 3.11
+    d_grade_pct: "36.4%（72/198）"
+    note: "8B thinking 基线: 60.5 分, 整合 2.35, 引文 2.53, 准确性 2.95（thinking 在信息综合维度上有微幅优势，但准确性大跌）"
 
 
 # =============================================================================
@@ -165,18 +175,16 @@ phases:
 
     prompt_changes:
       code_changes:
-        - file: "scripts/exp005/generate_exp005.py"
-          line_range: "L151-L158 (build_prompt 函数)"
-          change: |
-            将 `f"[{rank}] 来源: {pid}\n{text_truncated}"` 
-            改为 `f"[文档 {rank}]\n{text_truncated}"`
+        - file: "scripts/exp010/generate_exp010.py"
+          line_range: "L82-L84 (build_prompt 函数)"
+          note: "已内置 [文档 N] 格式（与旧版 generate_exp005.py 不同的关键差异）"
       prompt_changes:
-        - file: "src/generation/prompts.py"
-          section: "SYSTEM_PROMPT + FEW_SHOT"
+        - file: "src/generation/prompts_v2.py"
+          version: "v1-full"
           changes:
-            - "few-shot 示例中的输入格式从 [N] 来源: doc-xxx 改为 [文档 N]"
-            - "核心原则第 2 条（综合多篇）替换为分步推理指令"
-            - "回答结构部分补充：'重要——不要以「文档A说…文档B说…文档C说…」的形式组织答案'"
+            - "few-shot 示例中的输入格式已使用 [文档 N]"
+            - "核心原则第 2 条替换为「整合步骤」分步推理指令（步骤1-4）"
+            - "新增「避免以下行为」区块（较低强度负面约束，为 Phase 2 硬规则区留出递进空间）"
 
     evaluation:
       model: "qwen3-4b-nonthink"
@@ -184,8 +192,8 @@ phases:
       comparison: "Phase 1 prompt vs 基线 prompt（exp-005 原版）"
 
     success_criteria:
-      primary: "整合质量从 2.31 提升至 ≥ 2.45（+0.14，约半个档位），或 D 级占比从 38.4% 降至 ≤ 33%"
-      secondary: "总分不低于基线 60.2（不允许其他维度显著退化）"
+      primary: "整合质量从 2.27 提升至 ≥ 2.40（+0.13），或 D 级占比从 36.4% 降至 ≤ 31%"
+      secondary: "总分不低于基线 60.9（不允许其他维度显著退化）"
       failure: "整合质量无变化或下降，且失败模式仍以「逐篇罗列」为主"
       significance_note: |
         198 条样本下 +0.14 的维度级变化需要结合分布检验判断显著性。
@@ -225,12 +233,12 @@ phases:
         industry_ref: "Instruction Hierarchy + Microsoft Prompt Bench (2024)"
 
     prompt_changes:
-      - file: "src/generation/prompts.py"
-        section: "SYSTEM_PROMPT"
+      - file: "src/generation/prompts_v2.py"
+        version: "v2"
         changes:
           - "新增「=== 硬性规则 ===」区块（禁止逐篇罗列、禁止编造、禁止元描述）"
-          - "保留原 4 条核心原则的正面指引，但负面约束提到硬规则区集中强调"
-          - "新增 1 个对比示例（同一 query 下的 ❌ 罗列 vs ✅ 整合）"
+          - "新增 1 个对比示例（示例 2: ❌ 逐篇罗列 vs ✅ 整合后输出）"
+          - "原核心原则简化为 4 条要点（硬规则已提前到区块中声明）"
 
     evaluation:
       model: "qwen3-4b-nonthink"
@@ -282,12 +290,12 @@ phases:
         industry_ref: "Task Decomposition + Meta-Prompting (Google Search Generative Experience)"
 
     prompt_changes:
-      - file: "src/generation/prompts.py"
-        section: "SYSTEM_PROMPT"
+      - file: "src/generation/prompts_v2.py"
+        version: "v3"
         changes:
-          - "在回答结构部分前加入查询类型判断规则（5 类 × 对应结构）"
-          - "核心原则第 4 条（诚实面对不足）替换为 3 级拒答/回答指引"
-          - "第二个 few-shot 示例（灭菌锅拒答）更新为对应格式"
+          - "新增「=== 查询类型判断 ===」区块（5 类 × 对应结构）"
+          - "新增「=== 面对不同资料情况的回答策略 ===」区块（ABCD 四场景）"
+          - "原核心原则第 4 条更新为引用 ABCD 场景"
 
     evaluation:
       model: "qwen3-4b-nonthink"
@@ -295,52 +303,55 @@ phases:
       comparison: "Phase 3 prompt vs Phase 2 prompt（测量叠加收益）"
 
     success_criteria:
-      primary: "总 Pass% 从 58.6% 提升至 ≥ 62%（D 级中误拒答/强行回答的 case 被修复）"
+      primary: "总 Pass% 从 60.4% 提升至 ≥ 64%（D 级中误拒答/强行回答的 case 被修复）"
       secondary: "用户体验从 3.11 提升至 ≥ 3.20（结构适配提升自然反映在此维度）"
       failure: "Pass% 无变化，或过度拒答导致相关性维度下降"
 
 
   # ========================================================================
-  # Phase 4: 跨模型泛化验证 + 消融分析
+  # Phase 4: thinking 模式对照 + 消融分析
   # ========================================================================
   - id: phase-4
-    name: "跨模型验证 + 消融分析"
+    name: "thinking 对照 + 消融分析"
     priority: P2
     depends_on: "phase-3（需要在最优 prompt 确定后进行）"
     target_dimensions:
-      primary: "全维度 —— 验证 prompt 改进是否跨模型泛化"
+      primary: "全维度 —— 新 prompt 与 thinking 模式的交互效应"
       secondary: "各 Phase 贡献的消融归因"
 
     objectives:
-      - objective: "跨模型泛化测试"
+      - objective: "thinking vs non-thinking 在新 prompt 下的对照"
         description: |
-          用 Phase 3 最优 prompt 在 Qwen3-8B-nonthink 上跑 198 条。
-          验证：prompt 收益是 4B 特供还是模型无关的通用改进？
-          预期 8B 的 prompt 收益可能小于 4B（大模型本身指令遵循更好，prompt 影响递减）。
-        evaluation: "Phase 3 prompt vs 基线 prompt 在 8B 上的对比"
+          用 Phase 3 最优 prompt 在 Qwen3-8B-thinking 上跑 198 条。
+          基线状态下：thinking 总分 60.5（nt 60.9），整合 2.35（nt 2.27），引文 2.53（nt 2.47），
+          但准确性大跌 2.95（nt 3.18）。
+          
+          核心问题：新 prompt 的外部化分步指令 + thinking 的内部推理链，
+          是互相抵消（总计 < 60.9），互相促进（总计 > 61.5），还是选择性提升
+          （整合/引文大幅上涨但准确性仍低）？
+        evaluation: "Phase 3 prompt (v3) on 8B-thinking vs Phase 3 prompt (v3) on 8B-nonthink"
 
-      - objective: "单变量消融"
+      - objective: "单变量消融（8B-nonthink 上）"
         description: |
           对 Phase 1-3 的每个改动做消融：从最优 prompt 中逐个移除改动，测量边际贡献。
-          验证哪些改动是真正有功的、哪些是搭车的。
           
-          消融矩阵：
-          Prompt A = 最优 (Phase 1+2+3 全部)
-          Prompt B = 最优 − 对比示例（保留其他）
-          Prompt C = 最优 − 硬规则区（保留其他）
-          Prompt D = 最优 − 分步指令（保留其他）
-          Prompt E = 最优 − 分级拒答（保留其他）
-          Prompt F = 基线（原版，作为参照）
+          消融矩阵（均在 8B-nonthink 上，每个变体 50 条）：
+          Prompt v3 = 最优 (Phase 1+2+3 全部)
+          Prompt abl-no-cot = v3 − 分步指令
+          Prompt abl-no-contrast = v3 − 对比示例
+          Prompt abl-no-rules = v3 − 硬规则区
+          Prompt abl-no-refusal = v3 − 分级拒答
+          Prompt v0 = 基线（原版，作为参照）
           
-          每个变体跑 50 条（198 条的子集，控制成本），比较各维度差异。
+          比较各维度差异，计算每个改动的边际贡献。
 
     evaluation:
-      model: "qwen3-4b-nonthink（消融） + qwen3-8b-nonthink（泛化）"
-      dataset: "198 条（泛化） + 50 条（消融）"
+      model: "qwen3-8b-nonthink（消融，50 条） + qwen3-8b-thinking（对照，198 条）"
+      dataset: "198 条（thinking 对照） + 50 条（消融）"
 
     success_criteria:
-      primary: "8B 上最优 prompt ≥ 8B 基线（不允许退化）"
-      secondary: "消融分析明确每个改动的边际贡献"
+      primary: "thinking 模式下最优 prompt 的总分与 non-thinking 最优版的分差 ≤ 2 分（允许权衡取舍），且整合质量至少一个模式 ≥ 2.45"
+      secondary: "消融分析明确每个改动的边际贡献，若某改动移除后分数下降 > 1 分则该改动为关键贡献"
 
 
 # =============================================================================
@@ -350,20 +361,20 @@ phases:
 overall_success_criteria:
 
   level_excellent:
-    condition: "总分从 60.2 提升至 ≥ 65.0（+4.8），且整合质量 ≥ 2.55（+0.24）"
-    decision: "Prompt 工程路线验证成功，进入 V2 阶段。考虑将最优 prompt 固化为系统默认，并在更大型号上验证"
+    condition: "总分从 60.9 提升至 ≥ 65.5（+4.6），且整合质量 ≥ 2.50（+0.23）"
+    decision: "Prompt 工程路线验证成功，进入 V2 阶段。将最优 prompt 固化为系统默认"
 
   level_good:
-    condition: "总分从 60.2 提升至 ≥ 63.0（+2.8），且整合质量 ≥ 2.45（+0.14）"
-    decision: "Prompt 工程有实质收益，但与 API 差距（12.5）仍大。结合 8B 模型或 Prompt+DPO 组合路线继续推进"
+    condition: "总分从 60.9 提升至 ≥ 63.5（+2.6），且整合质量 ≥ 2.40（+0.13）"
+    decision: "Prompt 工程有实质收益。如果 thinking 模式在整合维度有额外增益，考虑 thinking + 定制 prompt 的混合方案"
 
   level_marginal:
-    condition: "总分在 60.2 ± 1.5 范围内波动，整合质量无显著变化"
-    decision: "Prompt 工程对此场景的增益存在天花板。4B 模型的整合行为可能已被基线 prompt 充分释放。转向换大模型（8B）或 DPO/GRPO 路线"
+    condition: "总分在 60.9 ± 1.0 范围内波动，整合质量无显著变化"
+    decision: "Prompt 工程对此场景的增益存在天花板。转向 DPO/GRPO 路线或接受本地模型 61 分的现实，生产上走 API 兜底策略"
 
   level_failure:
     condition: "任一 Phase 总分下降超过 2 分，或整合质量显著退化"
-    decision: "Prompt 工程不适合此场景。回归 exp-009 结论：4B 模型的整合能力天花板过低，需要换模型规模或训练范式"
+    decision: "Prompt 工程不适合此场景。回归 exp-009 结论：中小模型在 AI 搜索的多文档整合任务上存在根本性能力壁垒"
 
 
 # =============================================================================
@@ -378,11 +389,18 @@ data:
   naming_convention: "{model_id}-{phase_id}-{variant}.jsonl"
 
 files:
-  create:
-    - "src/generation/prompts_v2.py"  # Phase 1 开始的新 prompt 文件（不改动原 prompts.py）
-  scripts:
-    - "复用 scripts/exp005/generate_exp005.py（新增 --prompt-version 参数）"
-    - "复用 scripts/exp005/run_judge_exp005.py（Judge 不变）"
+  new:
+    - "src/generation/prompts_v2.py"       # 所有 Phase 的 prompt 变体 + PromptV2Manager
+    - "scripts/exp010/__init__.py"         # 包标记
+    - "scripts/exp010/generate_exp010.py"  # 自包含生成脚本（支持 --prompt-version）
+    - "scripts/exp010/run_phase.py"        # Phase 全流程 orchestrator（生成 → Judge → 对比）
+    - "scripts/exp010/prepare_exp010_data.py"    # 消融用 50 条分层抽样
+    - "scripts/exp010/summarize_ablation.py"     # 消融结果汇总分析
+  reused:
+    - "scripts/exp005/run_judge_exp005.py"       # Judge 脚本完全复用（不改动）
+    - "src/evaluation/judge_prompts.py"          # Judge Prompt 不变
+    - "src/evaluation/aggregation.py"            # 聚合逻辑不变
+    - "data/exp005_queries.jsonl"                # 同一批 198 条输入数据不变
 
 iteration_cost:
   per_phase:
@@ -402,25 +420,28 @@ risks:
   - risk: "Phase 1 整合质量无变化"
     likelihood: "中等"
     mitigation: |
-      如果分步指令无效，说明 4B 模型的整合能力已到上限 —— 它不是"不知道怎么整合"，
-      而是"做不到整合"。此时直接跳到 Phase 4 跨模型验证，看 8B 是否也如此。
-      如果 8B 也无变化，说明整个 prompt 路线方向错误，提前终止实验。
+      如果分步指令在 8B 上也无反应，说明整合行为可能不是"指令问题"而是
+      "能力问题"——模型即使被告知了步骤，也无法执行。此时直接跳到 Phase 4
+      thinking 对照，看内置推理链是否比外部指令更有效。如果 thinking 也无变化，
+      提前终止实验。
 
-  - risk: "Prompt 改进在 4B 上有效但在 8B 上退化"
-    likelihood: "低"
+  - risk: "新 prompt 让 thinking 模式准确性进一步大跌"
+    likelihood: "低中"
     mitigation: |
-      通常 prompt 改进对大模型更有效，但某些改进（如硬规则区）可能对 8B 是冗余的。
-      如果 8B 退化，保留 4B 专用版和 8B 专用版两份 prompt。
+      外部指令 + 内部推理 = 认知过载，可能让 thinking 模式过度分析而偏离事实。
+      如果 thinking 准确性比基线 2.95 还低 > 0.2，则确认 thinking 不兼容此 prompt 范式。
+      保留 non-thinking 版作为最终方案。
 
-  - risk: "消融分析发现核心收益来自某个非预期改动"
+  - risk: "消融分析发现核心收益来自文档格式修复，其他改动均无效"
     likelihood: "中"
     mitigation: |
-      这反而是好事 —— 知道哪个改动真正有效，后续可以重点深化。
-      如果只有文档格式修复有效、其他改动均无效，说明 prompt 内容优化已穷尽。
+      如果只有 [文档 N] 格式修复有效、分步指令/对比示例/硬规则均无额外增益，
+      说明 prompt 内容优化已穷尽——剩下的问题是模型能力而非指令质量。
+      接受结果，结论为"Prompt 工程的核心价值在格式消歧"，后续转 DPO/GRPO。
 
   - risk: "Judge 对 prompt 变更后的输出产生系统性偏差"
     likelihood: "中低"
     mitigation: |
       Judge 是同一套标准（deepseek-chat + 固定 Judge Prompt），应该免疫生成端 prompt 变更。
-      但如果在极端 case（如 prompt 让模型输出格式完全不同）下 Judge 行为异常，
-      需要抽样人工检查 10-20 条确认。
+      但如果在极端 case（如新 prompt 让模型输出格式完全不同）下 Judge 行为异常，
+      抽样人工检查 10-20 条确认。

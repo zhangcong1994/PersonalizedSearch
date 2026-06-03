@@ -251,10 +251,9 @@ def main():
     from transformers import (
         AutoModelForCausalLM,
         BitsAndBytesConfig,
-        TrainingArguments,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from trl import DPOTrainer
+    from trl import DPOTrainer, DPOConfig
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -310,8 +309,8 @@ def main():
     for param in ref_model.parameters():
         param.requires_grad = False
 
-    # ── Training Arguments ──
-    training_args = TrainingArguments(
+    # ── DPO Config ──
+    dpo_config = DPOConfig(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -330,6 +329,11 @@ def main():
         seed=args.seed,
         dataloader_num_workers=0,
         remove_unused_columns=True,
+        # DPO 专属参数
+        beta=args.beta,
+        max_length=args.max_length,
+        max_prompt_length=args.max_prompt_length,
+        loss_type="sigmoid",
     )
 
     # ── DPO Trainer ──
@@ -337,13 +341,9 @@ def main():
     dpo_trainer = DPOTrainer(
         model=model,
         ref_model=ref_model,
-        args=training_args,
+        args=dpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        beta=args.beta,
-        max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
-        loss_type="sigmoid",
     )
 
     # ── 训练 ──

@@ -100,6 +100,42 @@ def load_dpo_dataset(filepath: Path) -> Dataset:
     return ds
 
 
+def resolve_model_path(model_id: str, cache_dir: Path) -> str:
+    """解析模型路径：优先找本地已下载的，否则走 HF 下载。
+
+    HuggingFace 缓存结构：
+      - `snapshots` 模式: cache_dir/models--Qwen--Qwen3-8B/snapshots/<hash>/
+      - 手动 save_pretrained: cache_dir/Qwen3-8B/  （含 config.json）
+
+    检测顺序：
+      1. model_id 本身就是本地路径且存在 → 直接用
+      2. cache_dir/models--<org>--<model>/  HF 缓存 → 直接用
+      3. cache_dir/<model_name>/  手动保存的 → 直接用
+      4. 都不存在 → 返回原始 HF ID，让 transformers 去下载
+    """
+    model_path = Path(model_id)
+    if model_path.exists():
+        logger.info(f"直接使用本地模型路径: {model_path}")
+        return str(model_path)
+
+    # HuggingFace 缓存目录名
+    hf_cache_name = f"models--{model_id.replace('/', '--')}"
+    hf_cache_path = cache_dir / hf_cache_name
+    if hf_cache_path.exists():
+        logger.info(f"找到 HF 缓存: {hf_cache_path}")
+        return model_id  # 返回 HF ID，配合 cache_dir 参数自动命中
+
+    # 手动 save_pretrained 的可能路径
+    local_name = model_id.split("/")[-1]
+    local_path = cache_dir / local_name
+    if local_path.exists() and (local_path / "config.json").exists():
+        logger.info(f"找到本地模型目录: {local_path}")
+        return str(local_path)
+
+    logger.info(f"本地未找到 {model_id}，将从 HuggingFace 下载到 {cache_dir}")
+    return model_id
+
+
 # ── 主逻辑 ──────────────────────────────────────────────────
 
 def main():
@@ -176,6 +212,11 @@ def main():
     logger.info(f"  GPU: {gpu_name} ({gpu_mem:.0f} GB)")
     logger.info("=" * 60)
 
+    # ── 解析模型路径 ──
+    base_model_path = resolve_model_path(args.base_model, MODEL_CACHE_DIR)
+    logger.info(f"  Resolved model path: {base_model_path}")
+    logger.info("=" * 60)
+
     # ── 加载数据 ──
     logger.info("Loading DPO dataset...")
     train_dataset = load_dpo_dataset(Path(args.data))
@@ -191,7 +232,7 @@ def main():
     logger.info("Loading tokenizer...")
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, cache_dir=str(MODEL_CACHE_DIR))
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True, cache_dir=str(MODEL_CACHE_DIR))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     # Qwen3 的 tokenizer 默认 left-padding 可能导致 DPO trainer 问题，用 right
@@ -224,7 +265,7 @@ def main():
 
     logger.info("Loading base model (4-bit) for training...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        base_model_path,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
@@ -256,7 +297,7 @@ def main():
     # DPOTrainer 内部会自动把 ref model 设为 eval mode。
     logger.info("Loading reference model (4-bit, frozen)...")
     ref_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        base_model_path,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,

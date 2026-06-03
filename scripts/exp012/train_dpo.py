@@ -197,7 +197,6 @@ def main():
     logger.info(f"  LR:            {args.lr}")
     logger.info(f"  DPO beta:      {args.beta}")
     logger.info(f"  Max length:    {args.max_length}")
-    logger.info(f"  Max prompt:    {args.max_prompt_length}")
     logger.info(f"  LoRA:          r={args.lora_r} alpha={args.lora_alpha} dropout={args.lora_dropout}")
     logger.info(f"  Seed:          {args.seed}")
     logger.info("=" * 60)
@@ -332,7 +331,6 @@ def main():
         # DPO 专属参数
         beta=args.beta,
         max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
         loss_type="sigmoid",
     )
 

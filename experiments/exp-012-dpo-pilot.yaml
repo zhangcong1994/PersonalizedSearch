@@ -1,0 +1,407 @@
+# 实验计划：自对比式 DPO 小规模可行性验证
+# exp-012: 用 exp-011 已有 50 条多样本数据，快速验证自对比式 DPO 在 AI 搜索生成场景是否有效
+# 创建日期：2026-06-03
+# 最后更新：2026-06-03
+#
+# 背景：
+#   - exp-009 SFT 两次训练均退化（-9~-10 分 vs 基线 60.2）。根因：SFT 教会模型"模仿格式"而非"跨文档整合"
+#   - exp-010 Phase 1: v1-full prompt 让 8B 整合质量 +0.26（2.47→2.73），总分 61→64（重新评后的基线也涨了）
+#   - exp-011 可行性验证：8B-nonthink Best-of-5 = 76.54（比基线 +16.1），76% query 显著改善。per-query std 12.5 分
+#     结论 LIKELY_FEASIBLE：分布中确实存在更好的答案，RL/DPO 有望将分布推向高分区
+#   - exp-011 thinking: Best-of-5 = 82.61（比基线 +18.4），per-query std 15.39 分。但 thinking 训练复杂、推理成本高
+#     且可能泄露内部思考痕迹到输出中
+#
+# 核心假设：
+#   DPO 通过"好答案 vs 坏答案"的对比学习，能让模型学会"好答案长什么样、坏答案长什么样"，
+#   而不像 SFT 那样机械背诵格式。自对比式（同模型 best vs worst）让模型调整自己的行为分布，
+#   而非模仿另一个模型（教师）的风格。50 条数据足以验证这个假设是否成立。
+#
+# 与已有实验的关系：
+#   - exp-011 证明"更好答案在分布中" → exp-012 验证"DPO 能否把它们概率抬高"
+#   - exp-009 教师数据（2172 条，旧版 prompt）作为可选辅助数据源，不作为主力
+#   - exp-010 已提供 v1-full prompt 版本（本实验的评估 prompt）
+
+meta:
+  experiment_id: exp-012
+  phase: "V1"
+  objective: "复用 exp-011 已有的 50 条 query × 5 samples 数据，构造自对比式 DPO 对，在 Qwen3-8B-nonthink 上做 QLoRA DPO 微调，评估 DPO 在本场景是否有效"
+  status: planned
+  target_platform: "AutoDL RTX 4090 24GB（或更高 VRAM 服务器）"
+  prerequisite:
+    - "exp-011 多样本生成已完成：8B-nonthink v1-full T=0.8 n=5, 50 query"
+    - "exp-011 Judge 评分已完成：deepseek-chat, 6 维两批, 250 条全部已评分"
+    - "exp-005 评估体系已验证（deepseek-chat Judge, 6 维两批, 198 条 dev 集）"
+    - "Qwen3-8B 可通过 vLLM 服务访问用于评估推理"
+  design_principle: "最小可行验证 —— 用已有数据、最小代码改动、最快迭代速度，只回答一个问题：DPO 能不能让 8B 分数涨？涨不到 3 分以上就放弃 DPO 路线"
+  key_references:
+    - "exp-011: 8B-nonthink Best-of-5=76.54, mean-of-5=63.19, baseline(T=0.3)=60.48"
+    - "exp-011: 8B-thinking Best-of-5=82.61, mean-of-5=63.93, baseline(T=0.3)=64.23"
+    - "exp-011 维度级 delta: 准确性 +0.80(最大), 引文 +0.48, UX +0.46, 整合 +0.36"
+    - "exp-010 Phase 1: v1-full 8B-nonthink 整合 2.73, 总分 64.2（重新评后）"
+    - "exp-009: SFT 退化根因 —— 整合 −0.37, 引文 −0.36, 用户体验 −0.45"
+    - "DPO (Rafailov et al., 2023): 偏好对直接优化策略模型，无需 reward model"
+    - "Zephyr (Tunstall et al., 2023): 7B + GPT-4 chosen + 自模型 rejected → AlpacaEval 超 70B"
+    - "UltraFeedback (Cui et al., 2023): LLM-as-Judge 评分 → best/worst 构造偏好对"
+
+
+# =============================================================================
+# 第一部分：动机 —— 为什么现在是做 DPO 的最佳时机
+# =============================================================================
+
+motivation:
+
+  why_dpo_now:
+    sft_failed_but_dpo_is_different: |
+      exp-009 SFT 失败的核心原因：SFT 教"答案长什么样"，模型学会的是格式模仿而非能力习得。
+      
+      DPO 与 SFT 的本质区别：
+      - SFT: 最大化 P(answer|prompt) —— "用最大似然背下答案"
+      - DPO: 最大化 P(chosen|prompt) / P(rejected|prompt) —— "理解好答案和坏答案的边界"
+      
+      在 AI 搜索场景中，"好答案"不是一种固定的格式（有时整合、有时列表、有时拒答），
+      SFT 的固定 target 模式天然不适合。DPO 的 contrastive 范式天然适合这种多样化任务。
+
+    data_already_ready: |
+      exp-011 已经生成了 50 query × 5 samples = 250 条 + Judge 评分全部完成。
+      不需要任何新数据生成。直接把已有评分拿过来做 best/worst 配对即可。
+      从数据到训练，整个链路可以在半天内跑通（含评估）。
+
+    theory_confirmed_by_exp011: |
+      exp-011 证明：分布中确实存在比 T=0.3 基线好得多的答案（Best-of-5 +16 分）。
+      问题不是"模型有没有能力"，而是"模型能不能在需要时自动选到好答案"。
+      DPO 的训练目标正好是改变输出的概率分布——把 bad 往下压、把 good 往上拉。
+
+    what_if_dpo_also_fails: |
+      如果 50 条 DPO 下来分数不涨反跌，快速失败、成本可控（GPU < 1 小时，API < ¥2）。
+      如果涨了但不够多（< +3 分），说明方法对但数据量不够，后续扩展数据规模。
+      如果涨了 ≥ +3 分，证明 DPO 路线成立，立即规划 exp-013 大规模 DPO 训练。
+
+  why_self_contrastive_not_teacher:
+    teacher_prompt_is_old: |
+      exp-009 的 2172 条教师数据用的是 v0 prompt（exp-005 原始 prompt）。
+      exp-010 已证明 v1-full 在 8B 上让整合 +0.26、总分 +3.3。
+      如果 DPO 的 chosen 来自旧 prompt 下的教师、模型推理用新 prompt v1-full，
+      相当于存在 prompt distribution shift —— 训练和推理的 prompt 不一致。
+
+    model_can_beat_teacher: |
+      exp-011 发现 8B-nonthink Best-of-5 = 76.54，已经超过教师 qwen3-max 全量得分 72.7。
+      8B-thinking Best-of-5 = 82.61 更是大幅超越。这说明在 v1-full prompt 下，
+      8B 模型的"能力上界"已经不低于教师。没必要再追随旧 prompt 下的教师输出。
+
+    self_contrast_is_pure: |
+      自对比式 DPO 的 chosen 和 rejected 都来自同一模型、同一 prompt、同一 query：
+      - 没有跨模型分布偏移
+      - 没有 prompt 版本不一致的问题
+      - 模型优化的是"自己的行为分布"，而非"模仿别人的风格"
+      这是 Zephyr、UltraFeedback、SPIN 等工作的共识：self-contrast 比 teacher-student 更干净。
+
+  what_this_experiment_does_not_do:
+    - "不使用 exp-009 教师数据（旧 prompt，除非后续补充实验证明有价值）"
+    - "不做 thinking 模式 DPO（thinking 训练复杂、推理成本高，先验证 nonthinking）"
+    - "不新生成更多多样本（50 条足够小规模验证，通过后再大规模生成）"
+    - "不修改 prompt（固定 v1-full，与 exp-010 Phase 1 保持一致）"
+    - "不修改评估体系（固定 exp-005 Judge, 6 维两批, 198 条 dev 集）"
+
+
+# =============================================================================
+# 第二部分：模型与基底选择
+# =============================================================================
+
+model_selection:
+
+  base_model:
+    id: "Qwen3-8B"
+    hf_id: "Qwen/Qwen3-8B"
+    backend: "transformers + bitsandbytes (QLoRA)"
+    thinking: "OFF"
+    rationale: |
+      选 8B 而非 4B 的理由：
+      1. exp-011 的多样本实验在 8B 上跑的，4B 未做多样本实验，没有 paired chosen/rejected 数据
+      2. exp-009 SFT 在 4B 上失败，4B 的能力上限可能本身就低
+      3. exp-010 和 exp-011 的结果主线都在 8B 上，叙事一致
+      4. 如果 DPO 在 8B 上有效，后续可补跑 4B 多样本实验验证规模效应
+
+    starting_checkpoint: "Qwen/Qwen3-8B 原始权重（不做 SFT 初始化）"
+    why_no_sft_init: |
+      exp-009 证明 SFT 初始化会让模型退化（整合 −0.37、引文 −0.36）。
+      DPO 应从干净的基座模型开始，让 preference signal 直接塑造行为，
+      避免 SFT 的"格式背诵"偏置污染。
+
+  prompt_version: "v1-full（exp-010 Phase 1 版本）"
+  prompt_consistency: |
+    训练时和评估时使用相同的 prompt 格式（v1-full）。
+    这与 exp-009 SFT 的教训一致：训练-推理的 prompt 不一致会导致严重退化。
+
+  training_method:
+    method: "QLoRA + DPO"
+    rationale: |
+      - 8B 全参数 DPO 需要 ~32GB+ VRAM（forward × 2 for ref model），RTX 4090 24GB 不够
+      - QLoRA 仅训练 ~1.2% 参数，参考模型（冻结）和策略模型共享 base weights，VRAM ~12-16GB
+    quantization: "4-bit NF4（bitsandbytes）"
+    lora_config:
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    dpo_config:
+      beta: 0.1
+      loss_type: "sigmoid"
+      max_length: 4096
+      max_prompt_length: 3072
+    epochs: 1
+    learning_rate: 5e-5
+    optimizer: "adamw_8bit"
+    batch_size: 2
+    gradient_accumulation_steps: 4
+
+  framework: "trl.DPOTrainer（与 HuggingFace 生态无缝集成，坑最少）"
+
+
+# =============================================================================
+# 第三部分：DPO 数据构造
+# =============================================================================
+
+data:
+
+  source:
+    description: "完全复用 exp-011 已有数据，零新增生成"
+    generation_file: "results/exp011/generation/qwen3-8b-nothink_v1-full_t0.8_n5_s42.jsonl"
+    judge_file: "results/exp011/judge_scores/qwen3-8b-nothink_v1-full_t0.8_n5_s42_judged.jsonl"
+    baseline_file: "results/exp010/judge_scores/qwen3-8b-nothink-v1-full_judged.jsonl（用于参考对比）"
+
+  data_format:
+    description: "exp-011 数据格式 —— 每条 record 包含 query_id, prompt_text, 5 个 samples, 5 个 Judge 总分"
+    record_fields:
+      - "query_id: 原始 query ID"
+      - "prompt: 完整的 prompt 文本（system + user + documents，v1-full 格式）"
+      - "sample_0 ~ sample_4: 模型在 T=0.8 下的 5 个独立生成文本"
+      - "judge_score_0 ~ judge_score_4: 每个 sample 的 Judge 总分 (0-100)"
+      - "dimension_scores_0 ~ dimension_scores_4: 6 维分项评分"
+
+  dpo_pair_construction:
+    method: "per-query best-vs-worst（自对比式 DPO）"
+
+    step_by_step:
+      - step: "1. 加载 Judge 评分文件，获取 per-query 的 5 个总分"
+      - step: "2. 对每个 query，找到 Judge 总分最高的 sample → chosen"
+      - step: "3. 对每个 query，找到 Judge 总分最低的 sample → rejected"
+      - step: "4. 计算 chosen_score - rejected_score（对比度）"
+      - step: "5. 过滤对比度不足的 query（gap < 阈值，详见下方过滤策略）"
+      - step: "6. 构造 DPO 训练格式：prompt + chosen + rejected"
+
+    pairing_variants:
+      description: "同时构造多个配对策略，后续可做消融实验"
+      variants:
+        - id: "best_vs_worst"
+          description: "每个 query 取最高分 sample 做 chosen，最低分做 rejected"
+          rationale: "最大化对比度，信号最强。主策略"
+        - id: "best_vs_median"
+          description: "每个 query 取最高分做 chosen，中位数分做 rejected"
+          rationale: "适度对比度，避免 rejected 质量太低导致 DPO 过度压低弱输出的概率。备选策略"
+        - id: "above_teacher_vs_below_baseline"
+          description: "chosen = 总分 > 73（超过教师），rejected = 总分 < 65（低于当前均值）"
+          rationale: "只在质量差距显著的 case 上训练，过滤掉模糊的中间态。与 best_vs_worst 高度重叠"
+
+    filtering:
+      description: "不是所有 50 条都适合做 DPO —— 需要确保 chosen/rejected 之间有足够的质量差距"
+      gap_threshold_variants:
+        - id: "gap_geq_10"
+          cutoff: "chosen_score - rejected_score >= 10 分"
+          rationale: "严格过滤，确保对比度足够。来自 exp-011 per-query std = 12.5 的参考"
+        - id: "gap_geq_5"
+          cutoff: "chosen_score - rejected_score >= 5 分"
+          rationale: "宽松过滤，保留更多训练数据"
+
+    expected_yield:
+      gap_geq_10: "预期保留 20-30 条（exp-011 mean std = 12.5，约一半 query 的 max-min >= 10）"
+      gap_geq_5: "预期保留 35-45 条"
+
+    quality_validation:
+      description: "DPO 对构造完成后，对 chosen 和 rejected 做快速人工抽查"
+      checks:
+        - "chosen 是否明显优于 rejected（定性判断）"
+        - "chosen/rejected 是否存在完全相同的情况（Judge 不同分但文本相同 → 丢弃）"
+        - "chosen 是否真的'好'（抽查 top-5 和 bottom-5 对比度最大的 pair）"
+
+  train_test_split:
+    description: "50 条全部用于训练（不做 train/val split），评估用 198 条 dev 集"
+    rationale: |
+      50 条已经很少了，再切分会导致训练数据更少。DPO 的训练信号来自 chosen/rejected
+      的对比而非 teacher forcing，不需要 val set 监控过拟合。
+
+
+# =============================================================================
+# 第四部分：训练与评估
+# =============================================================================
+
+training:
+
+  script: "scripts/exp012/train_dpo.py"
+  outputs:
+    adapter: "{DATA_ROOT}/models/exp012-dpo-pilot/adapter/"
+    logs: "{DATA_ROOT}/models/exp012-dpo-pilot/logs/"
+
+  monitoring:
+    metrics:
+      - "DPO loss（rewards/chosen, rewards/rejected, rewards/margins）"
+      - "rewards/accuracies（chosen > rejected 的比例）"
+    tracking: "tensorboard 或 wandb（可选）"
+    early_stopping: 无（50 条数据 + QLoRA，epoch=1 不会过拟合）
+
+  sanity_check:
+    description: "训练完成后，在训练 set 的 50 条 query 上推理，确认 chosen-like 的输出被优先采样"
+    checks:
+      - "训练 loss 是否正常下降"
+      - "rewards/margins 是否从 ~0 增长到正值"
+      - "训练后模型对 50 条训练 query 的 T=0.3 输出，Judge 评分是否提升"
+
+
+evaluation:
+
+  dataset: "exp-005 198 条 dev 集（T2Ranking, exp-004 bge-reranker-v2-m3 精排 top-10）"
+  prompt: "v1-full（与训练时一致）"
+  judge_model: "deepseek-chat"
+  judge_protocol: "6 维两批（exp-005 标准 Judge Prompt），Batch1: 准确性+安全性+相关性, Batch2: 整合+引文+体验"
+  primary_metric: "Avg 总分 (0-100)"
+  secondary_metrics:
+    - "Pass%（总分 ≥ 60）"
+    - "各维度分项（特别是整合质量、引文质量、用户体验——SFT 退化最严重的三个维度）"
+    - "S/A/B/C/D/F 等级分布"
+    - "D 级占比（不可用率）"
+
+  comparison_baselines:
+    - model: "Qwen3-8B-nonthink + v1-full（DPO 训练前）"
+      score: 64.2
+      source: "exp-010 Phase 1 结果"
+    - model: "Qwen3-8B-nonthink + v1-full, T=0.8, mean-of-5"
+      score: 63.19
+      source: "exp-011 结果"
+    - model: "Qwen3-8B-nonthink + v1-full, T=0.8, best-of-5"
+      score: 76.54
+      source: "exp-011 结果（理论上界）"
+    - model: "qwen3-max（API 上界）"
+      score: 72.7
+      source: "exp-005"
+
+  ablation:
+    description: "如果 DPO 有效，跑消融实验确认收益来源"
+    ablations:
+      - "gap=5 vs gap=10 过滤阈值：对比度阈值对效果的影响"
+      - "best_vs_worst vs best_vs_median：配对策略对比"
+      - "beta=0.1 vs beta=0.5 vs beta=1.0：KL 约束强度消融"
+
+
+# =============================================================================
+# 第五部分：成功判定与决策树
+# =============================================================================
+
+success_criteria:
+
+  level_strong:
+    condition: "DPO 后总分 ≥ 68（比基线 +3.8 以上），且整合质量 ≥ 2.80"
+    decision: "DPO 路线强验证。立即规划 exp-013：扩展至 500-1000 条 query 大规模 DPO。考虑加入 thinking 模式 DPO。"
+    note: "+3.8 分相当于从 60.9→64.7（exp-010 Phase 1 全流程 prompt 优化的累计收益），DPO 单轮超过整个 prompt 工程收益 = 方法极强"
+
+  level_good:
+    condition: "DPO 后总分 ≥ 66（比基线 +1.8 以上），且整合质量 ≥ 2.75"
+    decision: "DPO 路线证实有效。规划 exp-013 大规模 DPO。重点扩展数据量（500+ query）以进一步拉升分数。"
+    note: "单轮 50 条 DPO 拿 1.8 分，说明边际收益高。扩展数据量到 10 倍预计还能再涨"
+
+  level_marginal:
+    condition: "DPO 后总分在 64.2 ± 1.5 范围内波动"
+    decision: "DPO 有信号但 50 条数据不够。不急于放弃：尝试增加训练数据（补 50 条 → 100 条）、调整 beta、尝试 best_vs_median。如果仍无改善，则 DPO 对该场景增益有限。"
+    note: "可能是数据量限制或超参不对。先调参，调参无效再放弃"
+
+  level_failure:
+    condition: "DPO 后总分下降超过 2 分，或整合质量显著退化"
+    decision: "DPO 不适合该场景（与 SFT 一样的退化模式）。停止 DPO 探索，全力以赴 exp-010 prompt 工程（Phase 2-4）。或考虑换更大模型（14B/32B）直接提升基线。"
+    note: "快速失败也是成功 —— 避免在错误路线上投入更多时间"
+
+  caveat:
+    description: "50 条 DPO 数据量小，不能以此定论 DPO 的最终上限，但足以判断方法在方向上是否正确"
+    analogy: "类似'用 10 个 sample 验证分类器是否在学'——不能得出最终准确率，但能判断 loss 在不在降"
+
+
+# =============================================================================
+# 第六部分：执行计划
+# =============================================================================
+
+execution_plan:
+
+  prerequisites:
+    - "exp-011 数据文件确认存在且可读"
+    - "GPU 环境可用（AutoDL RTX 4090 或本地）"
+    - "trl ≥ 0.9.0 已安装"
+    - ".env 中 DEEPSEEK_API_KEY 已配置（评估用）"
+
+  step_1_construct_dpo_pairs:
+    script: "scripts/exp012/construct_dpo_pairs.py"
+    input:
+      - "results/exp011/judge_scores/qwen3-8b-nothink_v1-full_t0.8_n5_s42_judged.jsonl"
+      - "results/exp011/generation/qwen3-8b-nothink_v1-full_t0.8_n5_s42.jsonl"
+    output: "data/processed/exp012_dpo_train.jsonl"
+    key_params:
+      pairing_strategies: ["best_vs_worst", "best_vs_median"]
+      gap_thresholds: [5, 10]
+    quality_check: "自动检查 + 人工抽查 top/bottom 5 对"
+
+  step_2_train_dpo:
+    script: "scripts/exp012/train_dpo.py"
+    input: "data/processed/exp012_dpo_train.jsonl"
+    output:
+      adapter: "{DATA_ROOT}/models/exp012-dpo-pilot/adapter/"
+    key_params:
+      model: "Qwen/Qwen3-8B"
+      beta: 0.1
+      epochs: 1
+      lr: 5e-5
+      lora_r: 16
+      max_seq_length: 4096
+      per_device_batch_size: 2
+      grad_accum: 4
+    estimated_time: "30-60 分钟（RTX 4090，50 条数据）"
+
+  step_3_evaluate:
+    script: "复用 exp-005/exp-010 的生成脚本（vLLM 推理） + Judge 评分"
+    model: "Qwen3-8B + exp012 LoRA adapter"
+    prompt: "v1-full"
+    dataset: "198 条 dev 集"
+    temperature: 0.3
+    estimated_time: "vLLM 推理 ~10 分钟 + Judge 评分 ~30 分钟"
+    estimated_cost: "~¥2-3（Judge API 198 条 × 2 批）"
+
+  step_4_analyze:
+    script: "scripts/exp012/analyze_results.py"
+    output: "experiments/exp-012-results-analysis.md"
+    comparison: "DPO 后 vs DPO 前（exp-010 v1-full 基线）"
+
+
+# =============================================================================
+# 第七部分：风险与局限
+# =============================================================================
+
+risks_and_limitations:
+
+  risks:
+    - risk: "50 条数据太少，DPO 信号不足以影响模型行为分布"
+      likelihood: 中等
+      mitigation: "如果 marginal 但方向正确（loss 在降、某些维度有改善），立即扩展数据"
+
+    - risk: "DPO 与 SFT 一样导致'退化到简单行为'（如学会只说简单拒答来拿高分）"
+      likelihood: 低
+      mitigation: "6 维分项评估能捕获这种作弊——如果总分涨了但整合跌了，就是 reward hacking"
+      reference: "exp-009 SFT 的整合 -0.37 就是这种退化，从分项评分可立即识别"
+
+    - risk: "Judge 评分本身存在噪声（±1 分），best/worst 的排序可能不稳定"
+      likelihood: 中等
+      mitigation: "exp-005 已验证 Judge 可靠性（双 Judge ±1 一致率 0.92-1.00）。配合 gap >= 5 过滤，足够排除噪声波动"
+
+    - risk: "训练 DPO 后，在 50 条训练 query 上过拟合（chosen 被背诵而非行为改变）"
+      likelihood: 低
+      mitigation: "评估在完全不重叠的 198 条 dev 集上进行。50 条 QLoRA DPO 不可能在 198 条上'背答案'"
+
+  limitations:
+    - "50 条 DPO 只能验证方法是否有效，不能给出最终效果的上限估计"
+    - "仅在 nonthinking 模式上验证，thinking 模式的 DPO 效果未知"
+    - "仅在 v1-full prompt 上验证，prompt 和 DPO 的交互效应未知"
+    - "未做超参搜索（beta、lr、epochs），当前配置是经验值，不一定最优"

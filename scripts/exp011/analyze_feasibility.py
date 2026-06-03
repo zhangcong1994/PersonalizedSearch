@@ -332,13 +332,31 @@ def print_report(result: dict):
     print()
 
 
-def load_baseline_scores(model_id: str) -> Optional[Path]:
-    """查找基线评分文件（来自 exp-005 T=0.3 单样本生成）。"""
+def load_baseline_scores(model_id: str, prompt_version: str = "v0") -> Optional[Path]:
+    """查找基线评分文件。
+
+    查找逻辑：
+    1. 先查 exp-011/judge_scores/（如果有同 prompt 的基线）
+    2. 再查 exp-010/judge_scores/（prompt 工程实验的基线）
+    3. 最后查 exp-005/judge_scores/（原始基线，仅 v0 prompt）
+    """
     candidates = [
+        # exp-011 自己的目录（用户可以通过 --baseline 直接指定）
+        # exp-010 的 prompt 工程结果
+        DATA_ROOT / "results" / "exp010" / "judge_scores" /
+        f"{model_id}-{prompt_version}_judged.jsonl",
+        DATA_ROOT / "results" / "exp005" / "judge_scores" /
+        f"{model_id}-{prompt_version}_judged.jsonl",
+        # exp-005 原始基线（v0 prompt）
         BASELINE_SCORES_DIR / f"{model_id}_judged.jsonl",
     ]
     if "-nothink" in model_id:
         base = model_id.replace("-nothink", "")
+        # exp-010 无 -nothink 后缀的变体
+        candidates.insert(1, DATA_ROOT / "results" / "exp010" / "judge_scores" /
+                          f"{base}-{prompt_version}_judged.jsonl")
+        candidates.insert(2, DATA_ROOT / "results" / "exp005" / "judge_scores" /
+                          f"{base}-{prompt_version}_judged.jsonl")
         candidates.append(BASELINE_SCORES_DIR / f"{base}_judged.jsonl")
 
     for path in candidates:
@@ -347,14 +365,23 @@ def load_baseline_scores(model_id: str) -> Optional[Path]:
     return None
 
 
-def find_multi_scores(model_id: str) -> Optional[Path]:
-    """查找多样本 Judge 评分文件（来自 exp-011）。"""
+def find_multi_scores(model_id: str, prompt_version: str = "v0") -> Optional[Path]:
+    """查找多样本 Judge 评分文件（来自 exp-011）。
+
+    命名约定：{model}_{prompt}_t0.8_n5_s42_judged.jsonl
+    """
     if not MULTI_SCORES_DIR.exists():
         return None
-    # 按命名约定查找：{model_id}_t0.8_*_judged.jsonl
-    pattern = f"{model_id}_t0.8"
+    # 按命名约定查找
+    prefix_old = f"{model_id}_t0.8"          # 旧格式：无 prompt version
+    prefix_new = f"{model_id}_{prompt_version}_t0.8"  # 新格式
+
     for f in sorted(MULTI_SCORES_DIR.iterdir()):
-        if f.name.startswith(pattern) and f.name.endswith("_judged.jsonl"):
+        if not f.name.endswith("_judged.jsonl"):
+            continue
+        if f.name.startswith(prefix_new):
+            return f
+        if f.name.startswith(prefix_old) and prompt_version == "v0":
             return f
     return None
 
@@ -374,6 +401,10 @@ def main():
     parser.add_argument(
         "--model-id", type=str, default=None,
         help="Model ID to auto-find files (e.g., qwen3-4b-nothink)",
+    )
+    parser.add_argument(
+        "--prompt-version", type=str, default="v0",
+        help="Prompt version used (e.g., v0, v1-full, v2, v3). Used for auto-finding files. Default: v0",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -402,17 +433,21 @@ def main():
 
     if args.model_id:
         # 自动查找对应文件
-        found_multi = find_multi_scores(args.model_id)
+        found_multi = find_multi_scores(args.model_id, args.prompt_version)
         if not found_multi:
             logger.error(
-                f"No multi-sample judge file found for {args.model_id}. "
-                f"Looking for: {args.model_id}_t0.8_*_judged.jsonl in {MULTI_SCORES_DIR}"
+                f"No multi-sample judge file found for {args.model_id} "
+                f"(prompt={args.prompt_version}). "
+                f"Looking for: {args.model_id}_{args.prompt_version}_t0.8_*_judged.jsonl "
+                f"in {MULTI_SCORES_DIR}"
             )
             return 1
 
-        baseline_path = load_baseline_scores(args.model_id)
+        baseline_path = args.baseline if args.baseline else load_baseline_scores(args.model_id, args.prompt_version)
+        if baseline_path and isinstance(baseline_path, str):
+            baseline_path = Path(baseline_path)
         if not baseline_path:
-            logger.error(f"No baseline judge file found for {args.model_id}")
+            logger.error(f"No baseline judge file found for {args.model_id} (prompt={args.prompt_version})")
             return 1
 
         to_analyze.append((args.model_id, found_multi, baseline_path))
@@ -421,7 +456,7 @@ def main():
     else:
         logger.error(
             "Specify either:\n"
-            "  --model-id qwen3-4b-nothink  (auto-find)\n"
+            "  --model-id qwen3-4b-nothink --prompt-version v1-full  (auto-find)\n"
             "  --multi <file> --baseline <file>  (manual)"
         )
         return 1

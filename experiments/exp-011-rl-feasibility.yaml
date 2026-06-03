@@ -5,12 +5,17 @@
 #
 # 背景：
 #   - exp-009 SFT 两次训练均退化（-9~-10 分 vs 基线 60.2）
-#   - exp-010 Prompt 工程已在进行（V0-V3 + 消融变体）
-#   - SFT/DPO 对"优化行为而非模仿格式"有天然优势，但需要验证前提
+#   - exp-010 Phase 1: prompt v1-full 让 8B 整合质量 +0.26（2.47→2.73），总分 64.2
+#   - 更好的 prompt 可能释放更多模型能力，为 RL 创造更大的收益空间
 #
 # 核心假设：
 #   如果模型多次采样（高温度）能找到比单次生成（低温度）显著更好的答案，
 #   则 RL/DPO 有望将这些优质输出概率提高；否则瓶颈在模型能力上限而非训练方法。
+#
+# 与 exp-009/exp-010 的关系：
+#   - exp-009 SFT 失败 → SFT 不适合该场景，需要探索 RL
+#   - exp-010 Prompt 工程成功 → v1-full prompt 显著优于 v0 baseline
+#   - exp-011 用 v1-full（或更好版本）做基底，验证 RL 在已有 prompt 优化基础上是否还有增量空间
 
 meta:
   experiment_id: exp-011
@@ -24,9 +29,10 @@ meta:
     - "Qwen3-4B 和 Qwen3-8B 可通过 vLLM 服务访问"
   design_principle: "最简可行实验 —— 只回答一个核心问题（更好答案在分布中吗？），不搞 RL 训练本身"
   key_references:
-    - "exp-005: Qwen3-4B-nothink 基线 60.2 分, Qwen3-8B-nothink 待评估"
+    - "exp-005: Qwen3-4B-nothink 基线 60.2 分, Qwen3-8B-nothink 基线 60.9 分"
     - "exp-009: SFT 失败根因 —— 模型学会格式而非整合，2160 条数据无法突破 4B 能力上限"
-    - "RL 理论框架: 有可量化评判标准（Judge 6 维）；优化路径模糊（整合/引文/用户体验 → SFT 学不会）；存在自动 verifier（source documents）"
+    - "exp-010 Phase 1: v1-full prompt → 8B 总分 64.2 (+3.3), 整合 2.73 (+0.26), 整合 4 分首次突破 (11 条)"
+    - "RL 理论框架: 有可量化评判标准（Judge 6 维）；优化路径模糊（整合/引文/用户体验 ← SFT 学不会）；存在自动 verifier（source documents）"
 
 
 # =============================================================================
@@ -107,22 +113,27 @@ experiment_design:
 
   models_under_test:
     - id: "qwen3-4b-nothink"
-      baseline_score: 60.2
+      baseline_score_v0: 60.2
+      baseline_score_v1_full: "待评估（exp-010 未跑 4B）"
       reason: "已验证的最佳性价比本地模型，SFT 在此模型上失败，是 RL 首选的验证对象"
       vllm_port: 8000
+      prompt_versions: ["v0", "v1-full"]  # 至少两个版本对比
     - id: "qwen3-8b-nothink"
-      baseline_score: "待评估（预期 65-70）"
-      reason: "参数翻倍，预期整合能力自然更强。与 4B 的 best-of-N 对比可验证'能力上限决定 RL 收益'的假设"
+      baseline_score_v0: 60.9
+      baseline_score_v1_full: 64.2  # exp-010 Phase 1 已出
+      reason: "参数翻倍，v1-full 下整合质量 2.73。4B vs 8B 对比可验证'能力上限决定 RL 收益'的假设"
       vllm_port: 8001
+      prompt_versions: ["v1-full"]  # 用表现最好的 prompt 做基底
 
   sampling_config:
     num_queries: 50  # 从 dev 集 198 条中随机采样，seed=42
     num_samples_per_query: 5
     temperature: 0.8
     original_temperature: 0.3  # 基线生成温度
-    total_generations: "50 × 5 × 2 模型 = 500"
-    total_judge_calls: "500 × 2 批 = 1000 次 Judge API 调用"
-    estimated_cost: "约 $2-4（deepseek-chat 计费）"
+    prompt_version_default: "v1-full"  # 推荐使用 exp-010 验证过的最佳 prompt
+    total_generations: "50 × 5 × 2 模型 = 500（每 prompt 版本）"
+    total_judge_calls: "~1000 次 Judge API 调用 / prompt 版本"
+    estimated_cost: "约 $2-4 / prompt 版本（deepseek-chat 计费）"
 
   pipeline:
     phase_1:
@@ -195,6 +206,14 @@ analysis_dimensions:
         std_2_to_5: "有一定多样性，RL 可以调整分布偏好"
         std_gt_5: "输出差异大，RL 空间充足但训练可能不稳定"
 
+    prompt_version_comparison:
+      question: "v0 vs v1-full prompt 下，RL 收益空间是否有差异？"
+      hypothesis: |
+        exp-010 证明 v1-full 让 8B 整合质量 +0.26，说明更好的 prompt 能释放更多模型能力。
+        如果 v1-full 下的 best-of-N delta > v0 下的 delta，说明 prompt 优化和 RL 有协同效应
+        —— prompt 扩大输出质量的上界，RL 把分布推向上界。
+        如果两者 delta 相似，说明 prompt 改善的是"单次输出质量"而非"分布上界"。
+
     query_level_distribution:
       question: "多少比例的 query 从 best-of-5 中受益？"
       interpretation:
@@ -236,10 +255,11 @@ execution_plan:
     - ".env 中 DEEPSEEK_API_KEY 已配置（Judge 评分）"
 
   step_1_generate:
-    description: "对 4B 和 8B 分别执行多样本生成"
+    description: "对 4B 和 8B 分别执行多样本生成（使用 v1-full prompt）"
     commands:
-      4b: "python scripts/exp011/generate_multi_sample.py --model qwen3-4b-nothink --vllm-url http://localhost:8000/v1 --num-samples 5 --temperature 0.8 --sample-size 50 --seed 42"
-      8b: "python scripts/exp011/generate_multi_sample.py --model qwen3-8b-nothink --vllm-url http://localhost:8001/v1 --num-samples 5 --temperature 0.8 --sample-size 50 --seed 42"
+      4b_v1full: "python scripts/exp011/generate_multi_sample.py --model qwen3-4b-nothink --vllm-url http://localhost:8000/v1 --num-samples 5 --temperature 0.8 --sample-size 50 --seed 42 --prompt-version v1-full"
+      8b_v1full: "python scripts/exp011/generate_multi_sample.py --model qwen3-8b-nothink --vllm-url http://localhost:8001/v1 --num-samples 5 --temperature 0.8 --sample-size 50 --seed 42 --prompt-version v1-full"
+      optional_4b_v0: "python scripts/exp011/generate_multi_sample.py --model qwen3-4b-nothink --vllm-url http://localhost:8000/v1 --num-samples 5 --temperature 0.8 --sample-size 50 --seed 42 --prompt-version v0"
     estimated_time: "约 10-15 分钟/模型（vLLM 推理，取决于 GPU）"
 
   step_2_judge:
@@ -251,22 +271,27 @@ execution_plan:
   step_3_analyze:
     description: "生成可行性报告"
     commands:
-      4b: "python scripts/exp011/analyze_feasibility.py --model-id qwen3-4b-nothink"
-      8b: "python scripts/exp011/analyze_feasibility.py --model-id qwen3-8b-nothink"
+      4b_v0: "python scripts/exp011/analyze_feasibility.py --model-id qwen3-4b-nothink --prompt-version v0"
+      8b_v1full: "python scripts/exp011/analyze_feasibility.py --model-id qwen3-8b-nothink --prompt-version v1-full"
+      4b_v1full: "python scripts/exp011/analyze_feasibility.py --model-id qwen3-4b-nothink --prompt-version v1-full"
     estimated_time: "< 1 分钟"
+    note: |
+      基线文件自动查找逻辑：
+      - v0 prompt → 从 exp-005 原始基线读取
+      - v1-full prompt → 从 exp-010 Phase 1 结果读取（exp-010/judge_scores/）
+      也可以用 --baseline 直接指定基线文件路径
 
   step_4_interpret:
     description: "根据报告判定下一步方向"
     decision_tree:
-      both_feasible: |
-        两个模型都显示 RL 可行 → 优先对 8B 做 DPO（利用 exp-009 教师数据作为 winner），
-        后续考虑 4B GRPO（成本更低但需要更多 reward 优化）
-      4b_infeasible_8b_feasible: |
-        印证"能力上限决定 RL 收益"的假设 → 4B 的天花板确实是 60 分附近，
-        应放弃 4B 训练路线，改用 8B 或 prompt 工程提升 4B
+      both_feasible_v1full: |
+        8B + v1-full 显示 RL 可行 → 最优路径：8B + v1-full prompt + DPO（利用 exp-009 教师数据）。4B 也可以尝试但优先级低。
+      prompt_amplifies_rl: |
+        v1-full 的 best-of-N delta > v0 的 best-of-N delta → prompt 和 RL 有协同效应。之后做 RL 训练时应该用最佳 prompt 版本做基底。
+      only_8b_feasible: |
+        8B 可行但 4B 不可行 → 印证"能力上限决定 RL 收益"。4B 天花板约 60 分，放弃 RL 路线。8B 的 RL 有前景。
       both_infeasible: |
-        RL/DPO 不适用于本场景 → 聚焦 exp-010 prompt 工程，
-        或考虑换更大模型（Qwen3-14B / Qwen3-32B）直接提升基线
+        RL/DPO 不适用于本场景 → 停止 RL 探索，聚焦 exp-010 prompt 工程（v2/v3 迭代）。或考虑换更大模型直接提升基线。
 
 
 # =============================================================================

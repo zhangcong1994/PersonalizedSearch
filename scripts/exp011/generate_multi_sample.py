@@ -48,7 +48,7 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.config import DATA_ROOT
-from src.generation.prompts import PromptManager, get_default_prompts
+from src.generation.prompts_v2 import PromptV2Manager, get_prompt_manager, list_versions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,7 +110,7 @@ def load_input_queries(filepath: Path, sample_size: Optional[int] = None, seed: 
 def build_prompt(
     query_text: str,
     passages: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
 ) -> tuple[str, str]:
     system_prompt = prompt_manager.get_system_prompt()
 
@@ -135,7 +135,7 @@ def generate_multi_vllm(
     model_config: dict,
     model_id: str,
     query_data: list[dict],
-    prompt_manager: PromptManager,
+    prompt_manager: PromptV2Manager,
     output_file: Path,
     vllm_url: str,
     temperature: float,
@@ -254,6 +254,11 @@ def main():
         "--force", action="store_true",
         help="Force re-generation even if output exists",
     )
+    parser.add_argument(
+        "--prompt-version", type=str, default="v0",
+        choices=list_versions(),
+        help="Prompt version to use (from prompts_v2.py). Default: v0 (exp-005 baseline)",
+    )
     args = parser.parse_args()
 
     # -- 路径与采样 --
@@ -266,24 +271,32 @@ def main():
     query_data = load_input_queries(INPUT_QUERIES, sample_size, args.seed)
     model_config = MODEL_CONFIGS[args.model]
 
-    output_file = GENERATIONS_DIR / f"{args.model}_t{args.temperature}_n{args.num_samples}_s{args.seed}.jsonl"
+    output_file = (
+        GENERATIONS_DIR /
+        f"{args.model}_{args.prompt_version}_t{args.temperature}_n{args.num_samples}_s{args.seed}.jsonl"
+    )
 
     if output_file.exists() and not args.force:
         logger.info(f"Skipping generation (cached at {output_file}). Use --force to regenerate.")
         return 0
 
+    # -- Prompt --
+    prompt_mgr = get_prompt_manager(args.prompt_version)
+    logger.info(f"Using prompt version: {args.prompt_version}")
+
     # -- 生成 --
     logger.info(
         f"Multi-sample generation: model={args.model}, "
         f"t={args.temperature}, n={args.num_samples}, "
-        f"queries={len(query_data)}, seed={args.seed}"
+        f"queries={len(query_data)}, seed={args.seed}, "
+        f"prompt={args.prompt_version}"
     )
 
     generate_multi_vllm(
         model_config=model_config,
         model_id=args.model,
         query_data=query_data,
-        prompt_manager=get_default_prompts(),
+        prompt_manager=prompt_mgr,
         output_file=output_file,
         vllm_url=args.vllm_url,
         temperature=args.temperature,

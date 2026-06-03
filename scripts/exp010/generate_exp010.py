@@ -44,9 +44,9 @@ RESULTS_DIR = DATA_ROOT / "results" / "exp010"
 GENERATIONS_DIR = RESULTS_DIR / "generations"
 
 MODEL_CONFIGS = {
-    "qwen3-4b-nothink": {
+    "qwen3-4b-nonthink": {
         "hf_id": "Qwen/Qwen3-4B",
-        "backend": "local",
+        "backend": "vllm",
         "params": "4B",
         "max_tokens": 1024,
         "temperature": 0.3,
@@ -54,7 +54,7 @@ MODEL_CONFIGS = {
     },
     "qwen3-8b-nothink": {
         "hf_id": "Qwen/Qwen3-8B",
-        "backend": "local",
+        "backend": "vllm",
         "params": "8B",
         "max_tokens": 1024,
         "temperature": 0.3,
@@ -62,7 +62,7 @@ MODEL_CONFIGS = {
     },
     "qwen3-8b-thinking": {
         "hf_id": "Qwen/Qwen3-8B",
-        "backend": "local",
+        "backend": "vllm",
         "params": "8B",
         "max_tokens": 1024,
         "temperature": 0.3,

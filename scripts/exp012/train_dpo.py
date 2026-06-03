@@ -30,7 +30,7 @@ import torch
 from datasets import Dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from src.utils.config import DATA_ROOT
+from src.utils.config import DATA_ROOT, MODEL_CACHE_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,15 +114,15 @@ def main():
                         help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=2,
                         help="每 GPU 的 batch size")
-    parser.add_argument("--grad-accum", type=int, default=4,
+    parser.add_argument("--grad-accum", type=int, default=2,
                         help="梯度累积步数")
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="学习率")
     parser.add_argument("--beta", type=float, default=0.1,
                         help="DPO beta（KL 散度约束系数，越大越远离 ref model）")
-    parser.add_argument("--max-length", type=int, default=4096,
+    parser.add_argument("--max-length", type=int, default=7168,
                         help="最大序列长度（chosen/rejected 总 token 数）")
-    parser.add_argument("--max-prompt-length", type=int, default=3072,
+    parser.add_argument("--max-prompt-length", type=int, default=6144,
                         help="prompt 最大 token 数")
     parser.add_argument("--lora-r", type=int, default=16,
                         help="LoRA rank")
@@ -191,7 +191,7 @@ def main():
     logger.info("Loading tokenizer...")
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, cache_dir=str(MODEL_CACHE_DIR))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     # Qwen3 的 tokenizer 默认 left-padding 可能导致 DPO trainer 问题，用 right
@@ -230,6 +230,7 @@ def main():
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
+        cache_dir=str(MODEL_CACHE_DIR),
     )
 
     model = prepare_model_for_kbit_training(model)
@@ -261,6 +262,7 @@ def main():
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
+        cache_dir=str(MODEL_CACHE_DIR),
     )
     # ref model 不加 LoRA，直接冻结
     ref_model.eval()

@@ -146,13 +146,13 @@ model_selection:
     dpo_config:
       beta: 0.1
       loss_type: "sigmoid"
-      max_length: 4096
-      max_prompt_length: 3072
+      max_length: 7168
+      max_prompt_length: 6144
     epochs: 1
     learning_rate: 5e-5
     optimizer: "adamw_8bit"
     batch_size: 2
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 2
 
   framework: "trl.DPOTrainer（与 HuggingFace 生态无缝集成，坑最少）"
 

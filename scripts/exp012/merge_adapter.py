@@ -67,7 +67,7 @@ def main():
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
     logger.info(f"  GPU: {gpu_name} ({gpu_mem:.0f} GB)")
 
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import PeftModel
 
     # Step 1: 找本地已下载的模型
@@ -109,25 +109,16 @@ def main():
     logger.info(f"Saving merged model to {output_path}...")
     merged.save_pretrained(str(output_path), safe_serialization=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_path, trust_remote_code=True, cache_dir=str(MODEL_CACHE_DIR),
-    )
-    tokenizer.save_pretrained(str(output_path))
-
-    # Qwen3 tokenizer 在 save_pretrained 后会产生重复 chat_template 条目，
-    # 导致 vLLM 启动时 Pydantic 校验失败。删除 tokenizer_config.json，让 vLLM
-    # 从 HF 缓存中找原始版本（tokenizer.json / vocab / merges 足够推理使用）
-    tcfg = output_path / "tokenizer_config.json"
-    if tcfg.exists():
-        tcfg.unlink()
-        logger.info("  Removed tokenizer_config.json (avoiding duplicate template error)")
+    # 不保存 tokenizer 文件 —— Qwen3 的 save_pretrained 会产生重复 chat_template
+    # 条目导致 vLLM 启动时 Pydantic 校验失败。vLLM 通过 --tokenizer 指定即可。
+    logger.info("  Skipping tokenizer save (use --tokenizer Qwen/Qwen3-8B in vLLM serve)")
 
     logger.info("=" * 60)
     logger.info("  Merge complete!")
     logger.info(f"  Merged model: {output_path}")
     logger.info("")
     logger.info("  启动 vLLM:")
-    logger.info(f"  vllm serve {output_path} --host 0.0.0.0 --port 8000")
+    logger.info(f"  vllm serve {output_path} --tokenizer Qwen/Qwen3-8B --host 0.0.0.0 --port 8000")
     logger.info("=" * 60)
 
     return 0

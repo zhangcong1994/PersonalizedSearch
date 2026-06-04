@@ -1,7 +1,14 @@
 """
-Exp-012: DPO 模型评估 —— vLLM 推理 + Judge 评分。
+Exp-012: DPO 模型评估 —— vLLM (LoRA adapter 模式) 推理 + Judge 评分。
 
 prompt 格式与训练时完全一致（[{rank}] 来源: {pid}），确保干净对比。
+
+前置条件：
+  vllm serve Qwen/Qwen3-8B \\
+      --enable-lora \\
+      --lora-modules dpo-pilot=/root/autodl-tmp/models/exp012-dpo-pilot \\
+      --max-lora-rank 16 \\
+      --host 0.0.0.0 --port 8000
 
 用法:
   # 一条龙：生成 + Judge
@@ -41,7 +48,9 @@ INPUT_QUERIES = DATA_ROOT / "results" / "exp012" / "eval_queries.jsonl"  # 148 �
 # ── 配置 ────────────────────────────────────────────────────
 
 MODEL_ID = "qwen3-8b-dpo-v1"
-MERGED_MODEL_PATH = DATA_ROOT / "models" / "exp012-dpo-pilot-merged"
+# LoRA adapter 模式：vLLM serve Qwen/Qwen3-8B --enable-lora --lora-modules dpo-pilot=/path/to/adapter
+# API 调用时的 model 名 = lora module 名
+VLLM_MODEL_NAME = "dpo-pilot"
 
 # 推理参数
 TEMPERATURE = 0.3
@@ -96,7 +105,7 @@ def generate_vllm(
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(
-        model=str(MERGED_MODEL_PATH),
+        model=VLLM_MODEL_NAME,
         api_key="not-needed",
         base_url=vllm_url,
         max_tokens=MAX_TOKENS,
@@ -168,7 +177,7 @@ def run_judge(generations_file: Path):
 def main():
     parser = argparse.ArgumentParser(description="Exp-012: DPO Model Evaluation")
     parser.add_argument("--vllm-url", type=str, default="http://localhost:8000/v1",
-                        help="vLLM server URL")
+                        help="vLLM server URL (需先启动 vLLM + LoRA adapter)")
     parser.add_argument("--generate-only", action="store_true",
                         help="仅生成，不跑 Judge")
     parser.add_argument("--judge-only", action="store_true",
@@ -176,20 +185,10 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="强制重新生成")
     parser.add_argument(
-        "--model-path", type=str, default=str(MERGED_MODEL_PATH),
-        help="合并后模型路径",
-    )
-    parser.add_argument(
         "--input", type=str, default=str(INPUT_QUERIES),
         help="输入 query JSONL 路径（默认：148 条 eval set，已排除训练 query）",
     )
     args = parser.parse_args()
-
-    merged_path = Path(args.model_path)
-    if not merged_path.exists() and not args.judge_only:
-        logger.error(f"Merged model not found: {merged_path}")
-        logger.error("Run scripts/exp012/merge_adapter.py first")
-        return 1
 
     input_queries = Path(args.input)
     if not input_queries.exists():
@@ -208,7 +207,7 @@ def main():
         else:
             logger.info("=" * 60)
             logger.info(f"  Generating answers: {MODEL_ID}")
-            logger.info(f"  Prompt: v1-full, T={TEMPERATURE}, vLLM={args.vllm_url}")
+            logger.info(f"  vLLM model: {VLLM_MODEL_NAME}, Prompt: v1-full, T={TEMPERATURE}")
             logger.info(f"  Queries: {len(query_data)}")
             logger.info("=" * 60)
             generate_vllm(query_data, prompt_manager, output_file, args.vllm_url)

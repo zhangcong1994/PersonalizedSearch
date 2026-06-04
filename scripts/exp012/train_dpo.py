@@ -190,6 +190,8 @@ def main():
                         help="Warmup 比例")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子")
+    parser.add_argument("--no-merge", action="store_true",
+                        help="跳过 LoRA 合并（只保存 adapter）")
     args = parser.parse_args()
 
     # ── 路径验证 ──
@@ -348,14 +350,31 @@ def main():
     logger.info("=" * 60)
     dpo_trainer.train()
 
-    # ── 保存 ──
+    # ── 保存 Adapter ──
     logger.info("Saving adapter...")
     dpo_trainer.save_model(str(args.output_dir))
     tokenizer.save_pretrained(str(args.output_dir))
 
+    # ── 合并 LoRA（默认开启）──
+    if not args.no_merge:
+        logger.info("Merging adapter into base model...")
+        merged_path = os.path.join(str(args.output_dir), "merged")
+
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_path, safe_serialization=True)
+        tokenizer.save_pretrained(merged_path)
+
+        # Qwen3 的 save_pretrained 可能产生重复 chat_template，vLLM 会报错
+        tcfg = Path(merged_path) / "tokenizer_config.json"
+        if tcfg.exists():
+            tcfg.unlink()
+            logger.info("  Removed tokenizer_config.json (avoiding vLLM duplicate template error)")
+
+        logger.info(f"  Merged model -> {merged_path}")
+
     # ── 打印最终指标 ──
     try:
-        final_logs = dpo_trainer.state.log_history[-2:]  # 最后两个 log entry（含 eval）
+        final_logs = dpo_trainer.state.log_history[-2:]
         logger.info("Final training metrics:")
         for entry in final_logs:
             relevant = {k: v for k, v in entry.items() if "loss" in k.lower() or "reward" in k.lower() or "margin" in k.lower()}
@@ -366,13 +385,9 @@ def main():
 
     logger.info("=" * 60)
     logger.info("  Training complete!")
-    logger.info(f"  Adapter saved to: {args.output_dir}")
-    logger.info("")
-    logger.info("  评估方法:")
-    logger.info(f"    用 vLLM 加载 LoRA adapter:")
-    logger.info(f"    vllm serve Qwen/Qwen3-8B \\")
-    logger.info(f"      --enable-lora \\")
-    logger.info(f"      --lora-modules dpo-pilot={args.output_dir}")
+    logger.info(f"  Adapter: {args.output_dir}")
+    if not args.no_merge:
+        logger.info(f"  Merged:  {args.output_dir}/merged")
     logger.info("=" * 60)
 
     return 0

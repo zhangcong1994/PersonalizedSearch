@@ -73,6 +73,40 @@ def resolve_base_model(base_model_id: str, cache_dir: Path) -> str:
 
 # ── Prompt 构造（与训练时一致）─────────────────────────────
 
+def clean_answer(text: str) -> str:
+    """移除答案中回显的 prompt 模板片段。
+
+    基座模型有时会把 prompt 结构吐回到答案开头：
+      【参考资料】
+      [1] 来源: 123  ...
+      【用户问题】
+      原始问题
+      【回答】
+      <实际答案内容>
+
+    清洗规则：【参考资料】 开头 → 找后面第一个 【回答】/【核心结论】/【核心答案】切断。
+    """
+    text = text.strip()
+    if not text:
+        return text
+
+    stripped = text.lstrip()
+    if stripped.startswith("【参考资料】"):
+        for marker in ["\n【回答】", "【回答】"]:
+            idx = stripped.find(marker)
+            if idx >= 0:
+                after = stripped[idx + len(marker):].strip().lstrip("\n").lstrip()
+                if after:
+                    return after
+        for marker in ["\n【核心结论】", "【核心结论】", "\n【核心答案】", "【核心答案】"]:
+            idx = stripped.find(marker)
+            if idx > 10:
+                after = stripped[idx:].strip()
+                if after:
+                    return after
+    return text
+
+
 def build_prompt(
     query_text: str,
     passages: list[dict],
@@ -189,6 +223,7 @@ def generate_transformers(
                 # 只取生成部分
                 generated = outputs[0][inputs["input_ids"].shape[1]:]
                 answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+                answer = clean_answer(answer)  # 去掉可能的 prompt 回显
             except Exception as e:
                 logger.warning(f"  Error on qid={qid}: {e}")
                 answer = f"[ERROR: {e}]"

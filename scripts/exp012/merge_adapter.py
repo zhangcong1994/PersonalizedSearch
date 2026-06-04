@@ -114,6 +114,14 @@ def main():
     )
     tokenizer.save_pretrained(str(output_path))
 
+    # Qwen3 tokenizer 在 save_pretrained 后会产生重复 chat_template 条目，
+    # 导致 vLLM 启动时 Pydantic 校验失败。删除 tokenizer_config.json，让 vLLM
+    # 从 HF 缓存中找原始版本（tokenizer.json / vocab / merges 足够推理使用）
+    tcfg = output_path / "tokenizer_config.json"
+    if tcfg.exists():
+        tcfg.unlink()
+        logger.info("  Removed tokenizer_config.json (avoiding duplicate template error)")
+
     logger.info("=" * 60)
     logger.info("  Merge complete!")
     logger.info(f"  Merged model: {output_path}")

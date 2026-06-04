@@ -128,6 +128,51 @@ def extract_original_qid(composite_qid: str) -> str:
     return composite_qid
 
 
+def clean_answer(text: str) -> str:
+    """移除答案中回显的 prompt 模板片段。
+
+    exp-011 部分生成会把输入 prompt 结构吐回到答案开头：
+      【参考资料】
+      [1] 来源: 123  ...
+      【用户问题】
+      原始问题
+      【回答】
+      <实际答案内容>
+
+    清洗规则：
+    1. 【参考资料】 开头 → 找后面第一个 【回答】 或 【核心结论】/【核心答案】，前面砍掉
+    2. 【核心结论】/【核心答案】 → 保留，这是 v1-full prompt 指示的正当答案格式
+    """
+    text = text.strip()
+    if not text:
+        return text
+
+    # 匹配 "【参考资料】" 开头（含全角半角空格）
+    stripped = text.lstrip()
+    if stripped.startswith("【参考资料】"):
+        # 在文本中寻找切分标记，优先级：【回答】 > 【核心结论】 > 【核心答案】
+        for marker in ["\n【回答】", "【回答】"]:
+            idx = stripped.find(marker)
+            if idx >= 0:
+                after = stripped[idx + len(marker):].strip().lstrip("\n").lstrip()
+                if after:
+                    return after
+
+        # 没有 【回答】 标记，尝试找 【核心结论】 或 【核心答案】
+        for marker in ["\n【核心结论】", "【核心结论】", "\n【核心答案】", "【核心答案】"]:
+            idx = stripped.find(marker)
+            if idx > 10:  # 确保不是刚开头的个别字符
+                after = stripped[idx:].strip()
+                if after:
+                    return after
+
+        # 兜底：如果实在找不到切分标记，返回原文本
+        # （避免误删没有格式标签的正常答案）
+        return text
+
+    return text
+
+
 def build_full_prompt(system_prompt: str, passages: list[dict], query_text: str) -> str:
     """重建喂给 LLM 的完整 prompt 文本。
 
@@ -214,8 +259,10 @@ def construct_pairs(
             _, rejected_score, rejected_rec = rejected_entry
 
         # 文本相同检查（尽管分数不同，Judge 噪声）
-        chosen_text = chosen_rec.get("answer", "").strip()
-        rejected_text = rejected_rec.get("answer", "").strip()
+        chosen_text = clean_answer(chosen_rec.get("answer", ""))
+        rejected_text = clean_answer(rejected_rec.get("answer", ""))
+        if not chosen_text or not rejected_text:
+            continue
         if chosen_text == rejected_text:
             skipped_same_text += 1
             continue

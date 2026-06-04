@@ -218,18 +218,18 @@ def generate_transformers(
 
 # ── Judge ────────────────────────────────────────────────
 
-def run_judge(generations_file: Path):
-    """复用 exp-005 的 Judge pipeline（deepseek-chat, 6 维两批）。"""
+def run_judge(generations_file: Path, judge_model: str = "deepseek-reasoner"):
+    """复用 exp-005 的 Judge pipeline（deepseek-reasoner, 6 维两批）。"""
     from scripts.exp005.run_judge_exp005 import run_judge as judge_main
 
     os.makedirs(JUDGE_DIR, exist_ok=True)
     output_file = JUDGE_DIR / f"{generations_file.stem}_judged.jsonl"
 
-    logger.info(f"Running Judge on {generations_file.name}...")
+    logger.info(f"Running Judge on {generations_file.name} (model={judge_model})...")
     judge_main(
         generations_file=generations_file,
         output_file=output_file,
-        judge_model="deepseek-chat",
+        judge_model=judge_model,
         concurrency=3,
         stagger_delay=0.5,
     )

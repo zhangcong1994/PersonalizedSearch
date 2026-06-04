@@ -48,14 +48,19 @@ DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot"
 
 # ── 工具 ────────────────────────────────────────────────────
 
-def load_dpo_dataset(filepath: Path) -> Dataset:
+def load_dpo_dataset(filepath: Path, min_chosen_score: float = 0.0) -> Dataset:
     """加载 DPO JSONL 并转为 HuggingFace Dataset。
 
     DPOTrainer 可以直接接受含 prompt/chosen/rejected 字符串字段的数据集，
     内部会自动 tokenize。
+
+    Args:
+        filepath: JSONL 文件路径
+        min_chosen_score: 最低 chosen 分数阈值，低于此分数的训练对将被过滤
     """
     records = []
     skipped = 0
+    filtered = 0
 
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -72,12 +77,17 @@ def load_dpo_dataset(filepath: Path) -> Dataset:
                 skipped += 1
                 continue
 
+            chosen_score = entry.get("chosen_score", 0)
+            if min_chosen_score > 0 and chosen_score < min_chosen_score:
+                filtered += 1
+                continue
+
             records.append({
                 "prompt": prompt,
                 "chosen": chosen,
                 "rejected": rejected,
                 "query_id": entry.get("query_id", ""),
-                "chosen_score": entry.get("chosen_score", 0),
+                "chosen_score": chosen_score,
                 "rejected_score": entry.get("rejected_score", 0),
                 "gap": entry.get("gap", 0),
             })
@@ -85,6 +95,10 @@ def load_dpo_dataset(filepath: Path) -> Dataset:
     ds = Dataset.from_list(records)
 
     # 统计
+    if filtered > 0:
+        logger.info(f"  Filtered out {filtered} pairs (chosen_score < {min_chosen_score})")
+    if skipped > 0:
+        logger.info(f"  Skipped {skipped} empty entries")
     if len(records) > 0:
         gaps = [r["gap"] for r in records]
         chosen_lens = [len(r["chosen"]) for r in records]
@@ -159,12 +173,14 @@ def main():
     parser.add_argument("--max-length", type=int, default=7168,
                         help="最大序列长度（chosen/rejected 总 token 数）")
     parser.add_argument("--max-prompt-length", type=int, default=6144,
-                        help="prompt 最大 token 数")
-    parser.add_argument("--lora-r", type=int, default=16,
-                        help="LoRA rank")
-    parser.add_argument("--lora-alpha", type=int, default=32,
-                        help="LoRA alpha")
-    parser.add_argument("--lora-dropout", type=float, default=0.05,
+                        help="prompt 最大 token 数（仅日志参考，训练不截断）")
+    parser.add_argument("--min-chosen-score", type=float, default=70.0,
+                        help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（默认 70）")
+    parser.add_argument("--lora-r", type=int, default=8,
+                        help="LoRA rank（30+对数据时建议 4-8）")
+    parser.add_argument("--lora-alpha", type=int, default=16,
+                        help="LoRA alpha（建议 alpha=2*r）")
+    parser.add_argument("--lora-dropout", type=float, default=0.1,
                         help="LoRA dropout")
     parser.add_argument("--logging-steps", type=int, default=5,
                         help="每 N 步打印日志")
@@ -196,6 +212,7 @@ def main():
     logger.info(f"  Batch size:    {args.batch_size} x {args.grad_accum} = {args.batch_size * args.grad_accum}")
     logger.info(f"  LR:            {args.lr}")
     logger.info(f"  DPO beta:      {args.beta}")
+    logger.info(f"  Min chosen:    {args.min_chosen_score}")
     logger.info(f"  Max length:    {args.max_length}")
     logger.info(f"  LoRA:          r={args.lora_r} alpha={args.lora_alpha} dropout={args.lora_dropout}")
     logger.info(f"  Seed:          {args.seed}")
@@ -218,7 +235,7 @@ def main():
 
     # ── 加载数据 ──
     logger.info("Loading DPO dataset...")
-    train_dataset = load_dpo_dataset(Path(args.data))
+    train_dataset = load_dpo_dataset(Path(args.data), min_chosen_score=args.min_chosen_score)
 
     import math
     total_batch = args.batch_size * args.grad_accum

@@ -139,9 +139,9 @@ model_selection:
       - QLoRA 仅训练 ~1.2% 参数，参考模型（冻结）和策略模型共享 base weights，VRAM ~12-16GB
     quantization: "4-bit NF4（bitsandbytes）"
     lora_config:
-      r: 16
-      alpha: 32
-      dropout: 0.05
+      r: 8           # 655K 可训练参数，适配 ~30 对数据
+      alpha: 16      # alpha = 2*r
+      dropout: 0.1   # 额外正则化，防止小数据过拟合
       target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     dpo_config:
       beta: 0.1
@@ -355,7 +355,7 @@ execution_plan:
       beta: 0.1
       epochs: 1
       lr: 5e-5
-      lora_r: 16
+      lora_r: 8
       max_seq_length: 4096
       per_device_batch_size: 2
       grad_accum: 4

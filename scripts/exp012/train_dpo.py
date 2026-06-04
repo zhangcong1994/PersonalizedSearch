@@ -170,9 +170,9 @@ def main():
                         help="学习率")
     parser.add_argument("--beta", type=float, default=0.1,
                         help="DPO beta（KL 散度约束系数，越大越远离 ref model）")
-    parser.add_argument("--max-length", type=int, default=7168,
-                        help="最大序列长度（chosen/rejected 总 token 数）")
-    parser.add_argument("--max-prompt-length", type=int, default=6144,
+    parser.add_argument("--max-length", type=int, default=5120,
+                        help="最大序列长度（chosen/rejected 总 token 数，47G GPU 建议 5120）")
+    parser.add_argument("--max-prompt-length", type=int, default=4300,
                         help="prompt 最大 token 数（仅日志参考，训练不截断）")
     parser.add_argument("--min-chosen-score", type=float, default=70.0,
                         help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（默认 70）")
@@ -192,6 +192,8 @@ def main():
                         help="随机种子")
     parser.add_argument("--no-merge", action="store_true",
                         help="跳过 LoRA 合并（只保存 adapter）")
+    parser.add_argument("--no-grad-ckpt", action="store_true",
+                        help="禁用 gradient checkpointing（95G GPU 可关掉加速）")
     args = parser.parse_args()
 
     # ── 路径验证 ──
@@ -308,6 +310,11 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    # gradient checkpointing: 不缓存中间激活，显著节省显存（47G GPU 必需）
+    if not args.no_grad_ckpt:
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
+
     # ── DPO Config（含 precompute_ref_log_probs）──
     # ref model 的 log prob 预计算后释放，训练时只保留 policy model，节省显存
     dpo_config = DPOConfig(
@@ -323,7 +330,7 @@ def main():
         save_total_limit=2,
         bf16=True,
         optim="adamw_8bit",
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_grad_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         seed=args.seed,

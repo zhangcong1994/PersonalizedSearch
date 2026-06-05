@@ -24,10 +24,13 @@ import json
 import shutil
 import argparse
 import logging
+import math
 from pathlib import Path
+from typing import Optional
 
 import torch
 from datasets import Dataset
+from transformers import TrainerCallback
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.utils.config import DATA_ROOT, MODEL_CACHE_DIR
@@ -48,16 +51,10 @@ DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot"
 
 # ── 工具 ────────────────────────────────────────────────────
 
-def load_dpo_dataset(filepath: Path, min_chosen_score: float = 0.0) -> Dataset:
-    """加载 DPO JSONL 并转为 HuggingFace Dataset。
-
-    DPOTrainer 可以直接接受含 prompt/chosen/rejected 字符串字段的数据集，
-    内部会自动 tokenize。
-
-    Args:
-        filepath: JSONL 文件路径
-        min_chosen_score: 最低 chosen 分数阈值，低于此分数的训练对将被过滤
-    """
+def load_dpo_dataset(
+    filepath: Path, min_chosen_score: float = 0.0
+) -> tuple[list[dict], dict]:
+    """加载 DPO JSONL 并返回 records 列表和统计信息。"""
     records = []
     skipped = 0
     filtered = 0
@@ -92,9 +89,7 @@ def load_dpo_dataset(filepath: Path, min_chosen_score: float = 0.0) -> Dataset:
                 "gap": entry.get("gap", 0),
             })
 
-    ds = Dataset.from_list(records)
-
-    # 统计
+    stats = {"total": len(records), "skipped": skipped, "filtered": filtered}
     if filtered > 0:
         logger.info(f"  Filtered out {filtered} pairs (chosen_score < {min_chosen_score})")
     if skipped > 0:
@@ -104,14 +99,35 @@ def load_dpo_dataset(filepath: Path, min_chosen_score: float = 0.0) -> Dataset:
         chosen_lens = [len(r["chosen"]) for r in records]
         rejected_lens = [len(r["rejected"]) for r in records]
         prompt_lens = [len(r["prompt"]) for r in records]
-
+        stats.update({
+            "gap_mean": sum(gaps) / len(gaps),
+            "gap_min": min(gaps),
+            "gap_max": max(gaps),
+            "chosen_len_mean": sum(chosen_lens) / len(chosen_lens),
+            "rejected_len_mean": sum(rejected_lens) / len(rejected_lens),
+            "prompt_len_mean": sum(prompt_lens) / len(prompt_lens),
+            "len_ratio": (sum(chosen_lens) / len(chosen_lens)) / max(1, sum(rejected_lens) / len(rejected_lens)),
+        })
         logger.info(f"  Loaded {len(records)} pairs (skipped {skipped})")
-        logger.info(f"  Gap:       mean={sum(gaps)/len(gaps):.1f}  min={min(gaps):.1f}  max={max(gaps):.1f}")
-        logger.info(f"  Chosen len:   mean={sum(chosen_lens)/len(chosen_lens):.0f}  min={min(chosen_lens)}  max={max(chosen_lens)}")
-        logger.info(f"  Rejected len: mean={sum(rejected_lens)/len(rejected_lens):.0f}  min={min(rejected_lens)}  max={max(rejected_lens)}")
-        logger.info(f"  Prompt len:   mean={sum(prompt_lens)/len(prompt_lens):.0f}  min={min(prompt_lens)}  max={max(prompt_lens)}")
+        logger.info(f"  Gap:       mean={stats['gap_mean']:.1f}  min={stats['gap_min']:.1f}  max={stats['gap_max']:.1f}")
+        logger.info(f"  Chosen len:   mean={stats['chosen_len_mean']:.0f}  "
+                     f"min={min(chosen_lens)}  max={max(chosen_lens)}")
+        logger.info(f"  Rejected len: mean={stats['rejected_len_mean']:.0f}  "
+                     f"min={min(rejected_lens)}  max={max(rejected_lens)}")
+        logger.info(f"  Prompt len:   mean={stats['prompt_len_mean']:.0f}  "
+                     f"min={min(prompt_lens)}  max={max(prompt_lens)}")
+        logger.info(f"  Length ratio (chosen/rejected): {stats['len_ratio']:.2f}")
+        if stats['len_ratio'] > 1.5:
+            logger.warning(
+                f"  ⚠️  Chosen responses are {stats['len_ratio']:.1f}x longer than rejected! "
+                f"DPO may learn to exploit length. Consider length normalization."
+            )
 
-    return ds
+    return records, stats
+
+
+def build_dataset_from_records(records: list[dict]) -> Dataset:
+    return Dataset.from_list(records)
 
 
 def resolve_model_path(model_id: str, cache_dir: Path) -> str:
@@ -150,6 +166,131 @@ def resolve_model_path(model_id: str, cache_dir: Path) -> str:
     return model_id
 
 
+class DPOMonitorCallback(TrainerCallback):
+    """DPO 训练专属监控回调。
+
+    追踪 DPO 关键指标并在异常时发出 WARNING：
+      - rewards/chosen: 对 chosen 回答的隐式 reward，应小幅上升或稳定
+      - rewards/rejected: 对 rejected 回答的隐式 reward，应下降
+      - rewards/margins: chosen - rejected 的差距，持续暴涨 >10 是过拟合信号
+      - rewards/accuracies: chosen > rejected 的比例，接近 1.0 是过拟合信号
+      - kl: 与 ref model 的 KL 散度，应缓慢增长，暴涨是 diverging 信号
+      - logps/chosen: 若持续下降，说明模型在"遗忘"好的行为
+    """
+
+    WARNING_THRESHOLDS = {
+        "rewards/margins": {"high": 10.0, "desc": "reward margin > 10 → 过拟合风险"},
+        "rewards/accuracies": {"high": 0.98, "desc": "accuracy > 0.98 → 可能死记"},
+    }
+
+    def __init__(self, log_file: Optional[Path] = None):
+        self.metrics_history: list[dict] = []
+        self.log_file = log_file
+        self._margin_rising_count = 0
+        self._chosen_logp_dropping_count = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+
+        step_metrics = {"step": state.global_step, "epoch": round(state.epoch, 2) if state.epoch else 0}
+        dpo_keys = [
+            "loss",
+            "rewards/chosen",
+            "rewards/rejected",
+            "rewards/margins",
+            "rewards/accuracies",
+            "kl",
+            "logps/chosen",
+            "logps/rejected",
+        ]
+        for key in dpo_keys:
+            if key in logs:
+                val = float(logs[key])
+                step_metrics[key] = val
+
+        if len(step_metrics) > 2:
+            self.metrics_history.append(step_metrics)
+
+        # ── 实时告警 ──
+        margin = step_metrics.get("rewards/margins")
+        accuracy = step_metrics.get("rewards/accuracies")
+        kl = step_metrics.get("kl")
+        chosen_logp = step_metrics.get("logps/chosen")
+
+        if margin is not None and margin > self.WARNING_THRESHOLDS["rewards/margins"]["high"]:
+            self._margin_rising_count += 1
+            if self._margin_rising_count >= 2:
+                logger.warning(
+                    f"  ⚠️  Step {state.global_step}: DPO reward margin={margin:.2f} "
+                    f"持续偏高 — 模型可能过拟合到偏好信号！考虑增大 beta 或减少训练"
+                )
+        else:
+            self._margin_rising_count = 0
+
+        if accuracy is not None and accuracy > self.WARNING_THRESHOLDS["rewards/accuracies"]["high"]:
+            logger.warning(
+                f"  ⚠️  Step {state.global_step}: DPO accuracy={accuracy:.3f} — "
+                f"几乎所有 pair 的 chosen > rejected，可能死记硬背"
+            )
+
+        if kl is not None and kl > 5.0:
+            logger.warning(
+                f"  ⚠️  Step {state.global_step}: KL={kl:.2f} 偏高 — "
+                f"模型正在偏离 ref model，建议增大 beta"
+            )
+
+        # 追踪 chosen logp 趋势（需要至少 3 个数据点）
+        if chosen_logp is not None and len(self.metrics_history) >= 4:
+            recent = [m.get("logps/chosen") for m in self.metrics_history[-4:]
+                      if m.get("logps/chosen") is not None]
+            if len(recent) >= 3 and all(
+                recent[i] > recent[i + 1] for i in range(len(recent) - 1)
+            ):
+                self._chosen_logp_dropping_count += 1
+                if self._chosen_logp_dropping_count >= 2:
+                    logger.warning(
+                        f"  ⚠️  Step {state.global_step}: chosen logp 持续下降 "
+                        f"({recent[0]:.1f} → {recent[-1]:.1f}) — 模型可能遗忘好的行为"
+                    )
+            else:
+                self._chosen_logp_dropping_count = 0
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.log_file and self.metrics_history:
+            os.makedirs(self.log_file.parent, exist_ok=True)
+            with open(self.log_file, "w", encoding="utf-8") as f:
+                json.dump(self.metrics_history, f, ensure_ascii=False, indent=2)
+            logger.info(f"DPO metrics history saved to {self.log_file}")
+            self._print_summary()
+
+    def _print_summary(self):
+        if not self.metrics_history:
+            return
+        logger.info("\n" + "=" * 60)
+        logger.info("  DPO 训练指标终态")
+        logger.info("=" * 60)
+        first = self.metrics_history[0]
+        last = self.metrics_history[-1]
+        for key in ["rewards/margins", "rewards/accuracies", "kl",
+                     "logps/chosen", "logps/rejected", "loss"]:
+            if key in first and key in last:
+                delta = last[key] - first[key]
+                direction = "↑" if delta > 0 else "↓"
+                logger.info(f"  {key:25s}: {first[key]:8.3f} → {last[key]:8.3f}  ({direction}{abs(delta):.3f})")
+
+        margins = [m["rewards/margins"] for m in self.metrics_history if "rewards/margins" in m]
+        if len(margins) >= 2:
+            trend = margins[-1] - margins[0]
+            if trend > 5:
+                logger.warning(f"  ⚠️  Margin trend: +{trend:.1f} (从 {margins[0]:.2f} 到 {margins[-1]:.2f}) — 过拟合风险")
+            elif trend < -5:
+                logger.warning(f"  ⚠️  Margin trend: {trend:.1f} (从 {margins[0]:.2f} 到 {margins[-1]:.2f}) — 训练崩溃")
+            else:
+                logger.info(f"  ✓  Margin trend: {trend:+.1f} — 合理范围")
+        logger.info("=" * 60 + "\n")
+
+
 # ── 主逻辑 ──────────────────────────────────────────────────
 
 def main():
@@ -174,8 +315,8 @@ def main():
                         help="最大序列长度（chosen/rejected 总 token 数，47G GPU 建议 5120）")
     parser.add_argument("--max-prompt-length", type=int, default=4300,
                         help="prompt 最大 token 数（仅日志参考，训练不截断）")
-    parser.add_argument("--min-chosen-score", type=float, default=70.0,
-                        help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（默认 70）")
+    parser.add_argument("--min-chosen-score", type=float, default=0.0,
+                        help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（数据已预过滤时默认 0）")
     parser.add_argument("--lora-r", type=int, default=8,
                         help="LoRA rank（30+对数据时建议 4-8）")
     parser.add_argument("--lora-alpha", type=int, default=16,
@@ -194,6 +335,10 @@ def main():
                         help="跳过 LoRA 合并（只保存 adapter）")
     parser.add_argument("--no-grad-ckpt", action="store_true",
                         help="禁用 gradient checkpointing（95G GPU 可关掉加速）")
+    parser.add_argument("--val-split", type=float, default=0.0,
+                        help="验证集比例（0=不划分验证集，建议 0.1~0.15）")
+    parser.add_argument("--eval-steps", type=int, default=0,
+                        help="每 N 步在验证集上评估（0=不评估，需要 --val-split > 0）")
     args = parser.parse_args()
 
     # ── 路径验证 ──
@@ -239,9 +384,24 @@ def main():
 
     # ── 加载数据 ──
     logger.info("Loading DPO dataset...")
-    train_dataset = load_dpo_dataset(Path(args.data), min_chosen_score=args.min_chosen_score)
+    records, data_stats = load_dpo_dataset(Path(args.data), min_chosen_score=args.min_chosen_score)
+    full_dataset = build_dataset_from_records(records)
 
-    import math
+    eval_dataset = None
+    if args.val_split > 0 and args.val_split < 1:
+        split = full_dataset.train_test_split(test_size=args.val_split, seed=args.seed)
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+        logger.info(f"  Train: {len(train_dataset)}, Val: {len(eval_dataset)} "
+                     f"(split={args.val_split})")
+        if args.eval_steps > 0:
+            logger.info(f"  Eval every {args.eval_steps} steps")
+    else:
+        train_dataset = full_dataset
+        if args.eval_steps > 0:
+            logger.warning("  --eval-steps set but --val-split=0, disabling evaluation")
+            args.eval_steps = 0
+
     total_batch = args.batch_size * args.grad_accum
     steps_per_epoch = math.ceil(len(train_dataset) / total_batch)
     total_steps = steps_per_epoch * args.epochs
@@ -317,6 +477,7 @@ def main():
 
     # ── DPO Config（含 precompute_ref_log_probs）──
     # ref model 的 log prob 预计算后释放，训练时只保留 policy model，节省显存
+    eval_enabled = eval_dataset is not None and args.eval_steps > 0
     dpo_config = DPOConfig(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
@@ -341,6 +502,10 @@ def main():
         max_length=args.max_length,
         loss_type="sigmoid",
         precompute_ref_log_probs=True,
+        # 验证集评估（仅在 val_split > 0 且 eval_steps > 0 时启用）
+        eval_strategy="steps" if eval_enabled else "no",
+        eval_steps=args.eval_steps if eval_enabled else None,
+        per_device_eval_batch_size=args.batch_size if eval_enabled else None,
     )
 
     # ── DPO Trainer ──
@@ -349,8 +514,14 @@ def main():
         model=model,
         args=dpo_config,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
+
+    # ── 注册监控回调 ──
+    metrics_log_path = Path(args.output_dir) / "dpo_metrics.json"
+    monitor_callback = DPOMonitorCallback(log_file=metrics_log_path)
+    dpo_trainer.add_callback(monitor_callback)
 
     # ── 训练 ──
     logger.info("Starting DPO training...")
@@ -379,22 +550,30 @@ def main():
 
         logger.info(f"  Merged model -> {merged_path}")
 
-    # ── 打印最终指标 ──
-    try:
-        final_logs = dpo_trainer.state.log_history[-2:]
-        logger.info("Final training metrics:")
-        for entry in final_logs:
-            relevant = {k: v for k, v in entry.items() if "loss" in k.lower() or "reward" in k.lower() or "margin" in k.lower()}
-            if relevant:
-                logger.info(f"  {relevant}")
-    except Exception:
-        pass
+    # ── 保存数据统计 ──
+    stats_path = Path(args.output_dir) / "data_stats.json"
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(data_stats, f, ensure_ascii=False, indent=2)
+    logger.info(f"Data stats saved to {stats_path}")
+
+    # ── 验证集最终评估 ──
+    if eval_dataset is not None:
+        logger.info("Running final evaluation on validation set...")
+        eval_results = dpo_trainer.evaluate()
+        eval_path = Path(args.output_dir) / "eval_results.json"
+        with open(eval_path, "w", encoding="utf-8") as f:
+            json.dump(eval_results, f, ensure_ascii=False, indent=2)
+        logger.info(f"Eval results saved to {eval_path}")
+        logger.info(f"  Val metrics: {json.dumps(eval_results, indent=2)}")
 
     logger.info("=" * 60)
     logger.info("  Training complete!")
-    logger.info(f"  Adapter: {args.output_dir}")
+    logger.info(f"  Adapter:    {args.output_dir}")
+    logger.info(f"  Metrics:    {args.output_dir}/dpo_metrics.json")
     if not args.no_merge:
-        logger.info(f"  Merged:  {args.output_dir}/merged")
+        logger.info(f"  Merged:     {args.output_dir}/merged")
+    if eval_dataset is not None:
+        logger.info(f"  Eval:       {args.output_dir}/eval_results.json")
     logger.info("=" * 60)
 
     return 0

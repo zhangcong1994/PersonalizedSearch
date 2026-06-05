@@ -201,6 +201,7 @@ def construct_pairs(
     judge_scores: dict[str, float],
     strategy_name: str,
     min_gap: float,
+    min_chosen_score: float = 0.0,
 ) -> list[dict]:
     """构造 DPO 训练对。
 
@@ -227,6 +228,7 @@ def construct_pairs(
     skipped_same_text = 0
     skipped_one_sample = 0
     skipped_no_gen = 0
+    skipped_low_chosen = 0
 
     for orig_qid, samples in sorted(groups.items()):
         if len(samples) < 2:
@@ -257,6 +259,11 @@ def construct_pairs(
             rejected_entry = rejected_selector(samples)
             _, chosen_score, chosen_rec = chosen_entry
             _, rejected_score, rejected_rec = rejected_entry
+
+        # chosen 质量过滤
+        if min_chosen_score > 0 and chosen_score < min_chosen_score:
+            skipped_low_chosen += 1
+            continue
 
         # 文本相同检查（尽管分数不同，Judge 噪声）
         chosen_text = clean_answer(chosen_rec.get("answer", ""))
@@ -295,11 +302,44 @@ def construct_pairs(
         f"produced {len(pairs)} pairs"
         f" (skipped: {skipped_gap} gap < {min_gap}, "
         f"{skipped_same_text} same-text, "
+        f"{skipped_low_chosen} low-chosen < {min_chosen_score}, "
         f"{skipped_one_sample} single-sample, "
         f"{skipped_no_gen} no-gen)"
     )
 
     return pairs
+
+
+def save_quality_report(all_pairs: dict[str, list[dict]], output_dir: Path) -> None:
+    """保存质量报告 JSON 供下游（train_dpo.py）监控参考。"""
+    report = {}
+    for label, pairs in all_pairs.items():
+        if not pairs:
+            report[label] = {"count": 0}
+            continue
+        gaps = [p["gap"] for p in pairs]
+        chosen_scores = [p["chosen_score"] for p in pairs]
+        rejected_scores = [p["rejected_score"] for p in pairs]
+        chosen_lens = [len(p["chosen"]) for p in pairs]
+        rejected_lens = [len(p["rejected"]) for p in pairs]
+        prompt_lens = [len(p["prompt"]) for p in pairs]
+
+        report[label] = {
+            "count": len(pairs),
+            "gap": {"mean": sum(gaps)/len(gaps), "min": min(gaps), "max": max(gaps)},
+            "chosen_score": {"mean": sum(chosen_scores)/len(chosen_scores), "min": min(chosen_scores), "max": max(chosen_scores)},
+            "rejected_score": {"mean": sum(rejected_scores)/len(rejected_scores), "min": min(rejected_scores), "max": max(rejected_scores)},
+            "chosen_len": {"mean": sum(chosen_lens)/len(chosen_lens), "min": min(chosen_lens), "max": max(chosen_lens)},
+            "rejected_len": {"mean": sum(rejected_lens)/len(rejected_lens), "min": min(rejected_lens), "max": max(rejected_lens)},
+            "prompt_len": {"mean": sum(prompt_lens)/len(prompt_lens), "min": min(prompt_lens), "max": max(prompt_lens)},
+            "len_ratio": (sum(chosen_lens)/len(chosen_lens)) / max(1, sum(rejected_lens)/len(rejected_lens)),
+        }
+
+    os.makedirs(str(output_dir), exist_ok=True)
+    out_path = output_dir / "dpo_pairs_report.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info(f"Quality report saved to {out_path}")
 
 
 def print_quality_report(all_pairs: dict[str, list[dict]]) -> None:
@@ -333,6 +373,28 @@ def print_quality_report(all_pairs: dict[str, list[dict]]) -> None:
               f"min={min(rejected_lens)}, max={max(rejected_lens)}")
         print(f"  len ratio (chosen/rejected): {sum(chosen_lens)/len(chosen_lens)/max(1,sum(rejected_lens)/len(rejected_lens)):.2f}")
 
+    # ── DPO 过拟合风险预警 ──
+    for label, pairs in all_pairs.items():
+        if not pairs:
+            continue
+        chosen_lens = [len(p["chosen"]) for p in pairs]
+        rejected_lens = [len(p["rejected"]) for p in pairs]
+        gaps = [p["gap"] for p in pairs]
+
+        len_ratio = (sum(chosen_lens)/len(chosen_lens)) / max(1, sum(rejected_lens)/len(rejected_lens))
+        gap_mean = sum(gaps) / len(gaps)
+
+        if len_ratio > 1.5:
+            print(f"  ⚠️  [{label}] 长度比={len_ratio:.2f} (>1.5) — DPO 可能学到长度 exploitation！")
+            print(f"         建议：训练时用长度惩罚（如 SimPO）或均衡 chosen/rejected 长度分布")
+        if len_ratio < 0.7:
+            print(f"  ⚠️  [{label}] 长度比={len_ratio:.2f} (<0.7) — rejected 比 chosen 长，信号可能反向")
+        if gap_mean > 30:
+            print(f"  ⚠️  [{label}] 平均 gap={gap_mean:.1f} (>30) — 偏好信号过强，DPO 易过拟合")
+            print(f"         建议：增大 beta 或使用更保守的配对策略（如 best_vs_median）")
+        if gap_mean < 5:
+            print(f"  ⚠️  [{label}] 平均 gap={gap_mean:.1f} (<5) — 偏好信号太弱，DPO 可能学不到东西")
+
     # 共享 query 统计（所有策略共用同一批 query，只是配对方式不同）
     first_label = list(all_pairs.keys())[0]
     first_pairs = all_pairs[first_label]
@@ -356,7 +418,11 @@ def print_quality_report(all_pairs: dict[str, list[dict]]) -> None:
             print(f"    chosen:   {chosen_preview}...")
             print(f"    rejected: {rejected_preview}...")
 
-    print("\n" + "=" * 70)
+    print(f"\n--- 关键指标说明 ---")
+    print(f"  gap:          chosen - rejected judge 分差（5~30 为理想范围）")
+    print(f"  len_ratio:    chosen/rejected 长度比（0.8~1.3 为理想范围）")
+    print(f"  评估: gap < 5 信号弱；gap > 30 易过拟合；len_ratio > 1.5 有长度 exploitation 风险")
+    print("=" * 70)
     print(f"  总计: {sum(len(v) for v in all_pairs.values())} pairs 来自 {len(all_pairs)} 个策略配置")
     print("=" * 70 + "\n")
 
@@ -395,6 +461,10 @@ def main():
     parser.add_argument(
         "--min-gaps", type=str, default="5,10",
         help="对比度阈值列表，逗号分隔。如 '5,10'",
+    )
+    parser.add_argument(
+        "--min-chosen-score", type=float, default=0.0,
+        help="最低 chosen 分数阈值，低于此值的训练对将被过滤（默认 0 = 不过滤）",
     )
     parser.add_argument(
         "--no-report", action="store_true",
@@ -442,12 +512,16 @@ def main():
     for strategy_name in strategy_names:
         for min_gap in min_gaps:
             label = f"{strategy_name}_gap{int(min_gap)}"
-            pairs = construct_pairs(gen_index, judge_scores, strategy_name, min_gap)
+            pairs = construct_pairs(gen_index, judge_scores, strategy_name, min_gap,
+                                     min_chosen_score=args.min_chosen_score)
             all_pairs[label] = pairs
 
             # 保存
             output_file = args.output_dir / f"exp012_dpo_{label}.jsonl"
             save_pairs(pairs, output_file)
+
+    # 保存质量报告 JSON（供 downstream 使用）
+    save_quality_report(all_pairs, args.output_dir)
 
     # 打印质量报告
     if not args.no_report:

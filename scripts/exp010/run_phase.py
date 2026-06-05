@@ -156,6 +156,7 @@ def run_judge(
         "--input", str(gen_file),
         "--output", str(output_file),
         "--judge-model", judge_model,
+        "--concurrency", "10",
     ]
 
     logger.info(f"[JUDGE] Running: {' '.join(cmd)}")

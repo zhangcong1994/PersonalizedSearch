@@ -10,8 +10,13 @@ Exp-010 Phase Runner —— 一键运行单 Phase 的完整评估流程。
 
 用法:
   # 完整流程（生成 + Judge + 对比）
-  python scripts/exp010/run_phase.py --model qwen3-4b-nothink \\
+  python scripts/exp010/run_phase.py --model qwen3-4b-nonthink \\
       --prompt-version v1-full --input data/exp005_queries.jsonl
+
+  # 用 reasoner 做 Judge
+  python scripts/exp010/run_phase.py --model qwen3-4b-nonthink \\
+      --prompt-version v1-full --input data/exp005_queries.jsonl \\
+      --judge-model deepseek-reasoner
 
   # 只做生成
   python scripts/exp010/run_phase.py --model qwen3-4b-nothink \\
@@ -133,6 +138,7 @@ def run_judge(
     model: str,
     prompt_version: str,
     force: bool = False,
+    judge_model: str = "deepseek-chat",
 ) -> Path:
     """
     调用 run_judge_exp005.py 进行两批 Judge 评分。
@@ -149,7 +155,7 @@ def run_judge(
         sys.executable, str(JUDGE_SCRIPT),
         "--input", str(gen_file),
         "--output", str(output_file),
-        "--judge-model", "deepseek-chat",
+        "--judge-model", judge_model,
     ]
 
     logger.info(f"[JUDGE] Running: {' '.join(cmd)}")
@@ -289,6 +295,7 @@ def run_phase(
     judge_only: bool = False,
     compare_only: bool = False,
     vllm_url: str = "http://localhost:8000/v1",
+    judge_model: str = "deepseek-chat",
 ):
     """运行单 Phase 完整流程。"""
     ensure_dir(GEN_DIR)
@@ -333,6 +340,7 @@ def run_phase(
         model=model,
         prompt_version=prompt_version,
         force=force,
+        judge_model=judge_model,
     )
 
     # ── 对比 ──
@@ -369,6 +377,9 @@ if __name__ == "__main__":
     parser.add_argument("--vllm-url", type=str,
                         default="http://localhost:8000/v1",
                         help="vLLM server URL")
+    parser.add_argument("--judge-model", type=str,
+                        default="deepseek-chat",
+                        help="Judge LLM model (deepseek-chat / deepseek-reasoner)")
 
     args = parser.parse_args()
 
@@ -387,4 +398,5 @@ if __name__ == "__main__":
         judge_only=args.judge_only,
         compare_only=args.compare_only,
         vllm_url=args.vllm_url,
+        judge_model=args.judge_model,
     )

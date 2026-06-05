@@ -264,7 +264,7 @@ def main():
     )
     parser.add_argument(
         "--sample-size", type=int, default=50,
-        help="Number of queries to sample from dev set (default: 50; use 0 for all 198)",
+        help="Number of queries to sample from input (default: 50; use 0 to use all)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -279,20 +279,46 @@ def main():
         choices=list_versions(),
         help="Prompt version to use (from prompts_v2.py). Default: v0 (exp-005 baseline)",
     )
+    parser.add_argument(
+        "--input-file", type=str, default=None,
+        help="Path to input JSONL (default: exp005 dev set). Use with exp012 sampled queries.",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Output directory for generation results (default: exp011/generation/)",
+    )
     args = parser.parse_args()
 
     # -- 路径与采样 --
     sample_size = args.sample_size if args.sample_size > 0 else None
-    if not INPUT_QUERIES.exists():
-        logger.error(f"Input queries not found: {INPUT_QUERIES}")
-        logger.error("Run prepare_exp005_data.py first.")
+
+    # 确定输入文件
+    if args.input_file:
+        input_path = Path(args.input_file)
+        if not input_path.is_absolute():
+            input_path = Path.cwd() / input_path
+    else:
+        input_path = INPUT_QUERIES
+
+    if not input_path.exists():
+        logger.error(f"Input queries not found: {input_path}")
+        if not args.input_file:
+            logger.error("Run prepare_exp005_data.py first.")
         return 1
 
-    query_data = load_input_queries(INPUT_QUERIES, sample_size, args.seed)
+    query_data = load_input_queries(input_path, sample_size, args.seed)
     model_config = MODEL_CONFIGS[args.model]
 
+    # 确定输出目录和文件
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        if not out_dir.is_absolute():
+            out_dir = Path.cwd() / out_dir
+    else:
+        out_dir = GENERATIONS_DIR
+
     output_file = (
-        GENERATIONS_DIR /
+        out_dir /
         f"{args.model}_{args.prompt_version}_t{args.temperature}_n{args.num_samples}_s{args.seed}.jsonl"
     )
 

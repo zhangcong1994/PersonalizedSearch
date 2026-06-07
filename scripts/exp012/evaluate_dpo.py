@@ -1,18 +1,34 @@
 """
-Exp-012: DPO 模型评估 —— QLoRA 基座 + LoRA adapter 直接推理 + Judge 评分。
+Exp-012: DPO 模型评估 —— 生成 + Judge 评分。
 
-不需要 vLLM（绕开 Qwen3 tokenizer 兼容性问题）。
-直接加载 4-bit 基座 + LoRA adapter，用 model.generate() 逐条推理。
+支持两种推理后端：
+  - Transformers 4-bit（默认，无外部依赖）
+  - vLLM HTTP API（需先启动 vLLM 服务，与 generate_multi_sample.py 一致）
 
 用法:
-  # 一条龙：生成 + Judge
+  # 一条龙：生成 + Judge（Transformers 逐条推理）
   python scripts/exp012/evaluate_dpo.py
+
+  # 基线（纯基座，不用 DPO adapter）
+  python scripts/exp012/evaluate_dpo.py --baseline
 
   # 仅生成
   python scripts/exp012/evaluate_dpo.py --generate-only
 
   # 仅跑 Judge（已有生成结果）
   python scripts/exp012/evaluate_dpo.py --judge-only
+
+  # ── vLLM 模式（推荐，快 10-20x）──
+  # 0) 先启动 vLLM 服务（另一个终端）：
+  #    vllm serve <model_path> --port 8000
+  #    # 基线：model_path = Qwen/Qwen3-8B 本地路径
+  #    # DPO：  model_path = models/exp012-dpo-pilot/merged
+  #
+  # 1) 基线
+  python scripts/exp012/evaluate_dpo.py --baseline --use-vllm
+  #
+  # 2) DPO（跑完自动打印配对对比报告）
+  python scripts/exp012/evaluate_dpo.py --use-vllm
 """
 
 import os
@@ -48,7 +64,6 @@ INPUT_QUERIES = DATA_ROOT / "data" / "processed" / "exp012_validation_queries.js
 MODEL_ID = "qwen3-8b-dpo-v1"
 BASE_MODEL = "Qwen/Qwen3-8B"
 ADAPTER_PATH = DATA_ROOT / "models" / "exp012-dpo-pilot"
-DPO_MERGED_PATH = DATA_ROOT / "models" / "exp012-dpo-pilot" / "merged"  # vLLM 用合并模型
 
 TEMPERATURE = 0.3
 MAX_TOKENS = 1024
@@ -268,76 +283,58 @@ def generate_transformers(
     logger.info(f"Saved {total} generations to {output_file.name} ({errors} errors)")
 
 
-# ── vLLM 批量推理 ────────────────────────────────────────
+# ── vLLM 批量推理（HTTP API，与 generate_multi_sample.py 一致）──
 
 def generate_vllm(
     query_data: list[dict],
     prompt_manager: PromptV2Manager,
     output_file: Path,
-    model_path: str,
     model_id: str,
+    vllm_url: str,
 ):
-    """用 vLLM offline batch inference 批量生成答案（比 transformers 逐条快 5-10x）。"""
-    from vllm import LLM, SamplingParams
+    """通过 vLLM HTTP API 批量生成答案（需先启动 vLLM 服务）。
+
+    prompt 构造与 generate_multi_sample.py 完全一致：
+    system + user 拼接为一条 user message，vLLM server 负责 apply chat template。
+    """
+    from openai import OpenAI
 
     os.makedirs(output_file.parent, exist_ok=True)
 
-    # --- 构造所有 prompt（system + user 两段式）---
-    logger.info(f"Building {len(query_data)} prompts...")
+    client = OpenAI(
+        api_key="not-needed",
+        base_url=vllm_url,
+    )
+
     system_prompt = prompt_manager.get_system_prompt()
-    all_messages = []
-    for item in query_data:
-        query_text = item.get("query_text", item.get("query", ""))
-        passages = item.get("passages", [])
-        user_prompt = _build_user_content(query_text, passages)
-        all_messages.append([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ])
 
-    # --- 加载 vLLM 模型 ---
-    logger.info(f"Loading vLLM model from {model_path} ...")
-    llm = LLM(
-        model=model_path,
-        trust_remote_code=True,
-        gpu_memory_utilization=0.80,
-        max_model_len=8192,
-        max_num_seqs=16,
-        enforce_eager=True,
-    )
-
-    sampling_params = SamplingParams(
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-    )
-
-    # --- 批量推理 ---
-    logger.info(f"Generating {len(query_data)} answers via vLLM...")
+    logger.info(f"Generating {len(query_data)} answers via vLLM HTTP API ({vllm_url})...")
     t_start = time.time()
 
-    outputs = llm.chat(
-        messages=all_messages,
-        sampling_params=sampling_params,
-        chat_template_kwargs={"enable_thinking": False},
-        use_tqdm=True,
-    )
-
-    elapsed_s = time.time() - t_start
-    logger.info(f"vLLM generation done in {elapsed_s:.0f}s ({len(query_data)/elapsed_s:.1f} q/s)")
-
-    # --- 写入输出 ---
     errors = 0
     with open(output_file, "w", encoding="utf-8") as out_f:
-        for i, (item, output) in enumerate(zip(query_data, outputs)):
+        for i, item in enumerate(query_data):
             qid = item.get("query_id", f"q-{i}")
             query_text = item.get("query_text", item.get("query", ""))
             passages = item.get("passages", [])
 
-            if output.outputs:
-                answer = output.outputs[0].text.strip()
+            user_content = _build_user_content(query_text, passages)
+            full_prompt = f"{system_prompt}\n\n{user_content}"
+
+            messages = [{"role": "user", "content": full_prompt}]
+
+            try:
+                response = client.chat.completions.create(
+                    model="default",  # vLLM HTTP API 忽略此参数
+                    messages=messages,
+                    max_tokens=MAX_TOKENS,
+                    temperature=TEMPERATURE,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
+                answer = response.choices[0].message.content.strip() if response.choices else ""
                 answer = clean_answer(answer)
-            else:
-                logger.warning(f"  Empty output for qid={qid}")
+            except Exception as e:
+                logger.warning(f"  Error on qid={qid}: {e}")
                 answer = ""
                 errors += 1
 
@@ -347,13 +344,24 @@ def generate_vllm(
                 "model_id": model_id,
                 "answer": answer,
                 "passages": passages,
-                "system_prompt": prompt_manager.get_system_prompt(),
+                "system_prompt": system_prompt,
                 "temperature": TEMPERATURE,
-                "generation_time_ms": 0,  # batch 模式无法分条计时
+                "generation_time_ms": 0,
             }
             out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
+            out_f.flush()
 
-    logger.info(f"Saved {len(query_data)} generations to {output_file.name} ({errors} errors)")
+            if (i + 1) % 50 == 0:
+                elapsed = time.time() - t_start
+                qps = (i + 1) / elapsed if elapsed > 0 else 0
+                logger.info(f"  [{i+1:3d}/{len(query_data)}] {qps:.1f} q/s, {errors} errors")
+
+    elapsed_s = time.time() - t_start
+    logger.info(
+        f"vLLM generation done in {elapsed_s:.0f}s "
+        f"({len(query_data)/elapsed_s:.1f} q/s), {errors} errors"
+    )
+    logger.info(f"Saved to {output_file.name}")
 
 
 # ── Judge ────────────────────────────────────────────────
@@ -491,10 +499,12 @@ def main():
     parser.add_argument("--baseline", action="store_true",
                         help="仅用基座模型推理（不加载 LoRA adapter）")
     parser.add_argument("--use-vllm", action="store_true",
-                        help="使用 vLLM 批量推理（比 transformers 逐条快 5-10x）")
+                        help="通过 vLLM HTTP API 推理（需先启动 vLLM 服务，见下方说明）")
+    parser.add_argument("--vllm-url", type=str, default="http://localhost:8000/v1",
+                        help="vLLM OpenAI-compatible API URL (默认: http://localhost:8000/v1)")
     parser.add_argument(
         "--input", type=str, default=str(INPUT_QUERIES),
-        help="输入 query JSONL 路径（默认：148 条 eval set）",
+        help="输入 query JSONL 路径（默认：300 条验证集）",
     )
     parser.add_argument(
         "--base-model", type=str, default=BASE_MODEL,
@@ -503,10 +513,6 @@ def main():
     parser.add_argument(
         "--adapter", type=str, default=str(ADAPTER_PATH),
         help="LoRA adapter 目录（--baseline 或 --use-vllm 时忽略）",
-    )
-    parser.add_argument(
-        "--dpo-merged", type=str, default=str(DPO_MERGED_PATH),
-        help="DPO 合并模型路径（--use-vllm 非 baseline 模式使用）",
     )
     args = parser.parse_args()
 
@@ -540,24 +546,14 @@ def main():
         if output_file.exists() and not args.force:
             logger.info(f"Skipping generation (cached at {output_file})")
         elif args.use_vllm:
-            # ── vLLM 路径 ──
-            if args.baseline:
-                vllm_model_path = base_model_path  # 基座 HF 路径
-            else:
-                vllm_model_path = args.dpo_merged
-                if not Path(vllm_model_path).exists():
-                    logger.error(
-                        f"DPO merged model not found: {vllm_model_path}\n"
-                        f"  Run merge_adapter.py first, or train_dpo.py without --no-merge"
-                    )
-                    return 1
+            # ── vLLM HTTP API 路径（与 generate_multi_sample.py 一致）──
             logger.info("=" * 60)
-            logger.info(f"  Generating via vLLM: {model_id}")
-            logger.info(f"  Model:  {vllm_model_path}")
+            logger.info(f"  Generating via vLLM HTTP API: {model_id}")
+            logger.info(f"  API:   {args.vllm_url}")
             logger.info(f"  Prompt: v1-full, T={TEMPERATURE}")
             logger.info(f"  Queries: {len(query_data)}")
             logger.info("=" * 60)
-            generate_vllm(query_data, prompt_manager, output_file, vllm_model_path, model_id)
+            generate_vllm(query_data, prompt_manager, output_file, model_id, args.vllm_url)
         else:
             # ── Transformers 路径 ──
             logger.info("=" * 60)

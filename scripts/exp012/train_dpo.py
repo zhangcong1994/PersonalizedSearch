@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import shutil
+import hashlib
 import argparse
 import logging
 import math
@@ -48,8 +49,15 @@ DEFAULT_DATA = (
     / "exp012_dpo_first_below_mean_gap10.jsonl"
 )
 DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot"
+REF_LOGPS_CACHE_DIR = DATA_ROOT / "data" / "processed" / "exp012" / "_ref_logps_cache"
 
 # ── 工具 ────────────────────────────────────────────────────
+
+def get_ref_cache_path(data_file: Path, base_model: str, seed: int, val_split: float) -> Path:
+    """根据数据文件 + 基座模型 + seed + val_split 生成缓存路径。"""
+    key = f"{data_file.resolve()}:{base_model}:{seed}:{val_split}"
+    file_hash = hashlib.md5(key.encode()).hexdigest()[:16]
+    return REF_LOGPS_CACHE_DIR / f"ref_{file_hash}.pt"
 
 def load_dpo_dataset(
     filepath: Path, min_chosen_score: float = 0.0
@@ -311,9 +319,9 @@ def main():
                         help="学习率")
     parser.add_argument("--beta", type=float, default=0.3,
                         help="DPO beta（KL 散度约束系数，越大越保守，对于小数据量防止过拟合）")
-    parser.add_argument("--max-length", type=int, default=7168,
-                        help="最大序列长度（chosen/rejected 总 token 数，大 VRAM GPU 建议 7168）")
-    parser.add_argument("--max-prompt-length", type=int, default=6144,
+    parser.add_argument("--max-length", type=int, default=6144,
+                        help="最大序列长度（chosen/rejected 总 token 数）")
+    parser.add_argument("--max-prompt-length", type=int, default=5120,
                         help="prompt 最大 token 数（仅日志参考，训练不截断）")
     parser.add_argument("--min-chosen-score", type=float, default=0.0,
                         help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（数据已预过滤时默认 0）")
@@ -339,6 +347,8 @@ def main():
                         help="验证集比例（0=不划分验证集，建议 0.1）")
     parser.add_argument("--eval-steps", type=int, default=30,
                         help="每 N 步在验证集上评估（0=不评估，需要 --val-split > 0）")
+    parser.add_argument("--no-ref-cache", action="store_true",
+                        help="不使用 ref log probs 缓存，强制重新预计算")
     args = parser.parse_args()
 
     # ── 路径验证 ──
@@ -408,6 +418,37 @@ def main():
     logger.info(f"  Steps per epoch: ~{steps_per_epoch}, total: ~{total_steps}")
     logger.info("=" * 60)
 
+    # ── Ref Log Probs 缓存加载 ──
+    ref_cache_path = get_ref_cache_path(Path(args.data), args.base_model, args.seed, args.val_split)
+    precompute_ref = True  # 默认需要预计算
+
+    if ref_cache_path.exists() and not args.no_ref_cache:
+        logger.info(f"Loading cached ref log probs from {ref_cache_path.name}...")
+        cache = torch.load(ref_cache_path, map_location="cpu")
+        expected_len = len(full_dataset)
+        if len(cache.get("chosen", [])) == expected_len:
+            n_train = len(train_dataset)
+            train_dataset = train_dataset.add_column(
+                "ref_chosen_logps", cache["chosen"][:n_train]
+            )
+            train_dataset = train_dataset.add_column(
+                "ref_rejected_logps", cache["rejected"][:n_train]
+            )
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.add_column(
+                    "ref_chosen_logps", cache["chosen"][n_train:]
+                )
+                eval_dataset = eval_dataset.add_column(
+                    "ref_rejected_logps", cache["rejected"][n_train:]
+                )
+            precompute_ref = False
+            logger.info("  Cached ref log probs loaded, skipping precomputation (~1h saved)")
+        else:
+            logger.warning(
+                f"  Cache length mismatch (cached={len(cache['chosen'])}, expected={expected_len}), "
+                f"will recompute"
+            )
+
     # ── 加载 tokenizer ──
     logger.info("Loading tokenizer...")
     from transformers import AutoTokenizer
@@ -417,6 +458,8 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     # Qwen3 的 tokenizer 默认 left-padding 可能导致 DPO trainer 问题，用 right
     tokenizer.padding_side = "right"
+    # 避免 DPOTrainer 内部 tokenize prompt 和 prompt+chosen 时 BOS token 对齐报 WARNING
+    tokenizer.add_bos_token = False
 
     # ── Flash Attention 检测 ──
     try:
@@ -501,11 +544,13 @@ def main():
         beta=args.beta,
         max_length=args.max_length,
         loss_type="sigmoid",
-        precompute_ref_log_probs=True,
+        precompute_ref_log_probs=precompute_ref,
         # 验证集评估（仅在 val_split > 0 且 eval_steps > 0 时启用）
         eval_strategy="steps" if eval_enabled else "no",
         eval_steps=args.eval_steps if eval_enabled else None,
-        per_device_eval_batch_size=args.batch_size if eval_enabled else None,
+        # 预计算 ref log probs 和验证集评估共用一个 batch size。
+        # 预计算阶段 6144 tokens 无 grad checkpoint 时激活值很大，batch=1 保 OOM 安全。
+        per_device_eval_batch_size=1 if eval_enabled else None,
     )
 
     # ── DPO Trainer ──
@@ -522,6 +567,22 @@ def main():
     metrics_log_path = Path(args.output_dir) / "dpo_metrics.json"
     monitor_callback = DPOMonitorCallback(log_file=metrics_log_path)
     dpo_trainer.add_callback(monitor_callback)
+
+    # ── 保存 Ref Log Probs 缓存（首次预计算后）──
+    if precompute_ref and not ref_cache_path.exists():
+        ref_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        chosen_train = dpo_trainer.train_dataset["ref_chosen_logps"]
+        rejected_train = dpo_trainer.train_dataset["ref_rejected_logps"]
+        if eval_dataset is not None and dpo_trainer.eval_dataset is not None:
+            chosen_eval = dpo_trainer.eval_dataset["ref_chosen_logps"]
+            rejected_eval = dpo_trainer.eval_dataset["ref_rejected_logps"]
+            chosen_all = list(chosen_train) + list(chosen_eval)
+            rejected_all = list(rejected_train) + list(rejected_eval)
+        else:
+            chosen_all = list(chosen_train)
+            rejected_all = list(rejected_train)
+        torch.save({"chosen": chosen_all, "rejected": rejected_all}, ref_cache_path)
+        logger.info(f"  Ref log probs cached to {ref_cache_path.name} for future runs")
 
     # ── 训练 ──
     logger.info("Starting DPO training...")

@@ -500,7 +500,6 @@ def main():
         # DPO 专属参数
         beta=args.beta,
         max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
         loss_type="sigmoid",
         precompute_ref_log_probs=True,
         # 验证集评估（仅在 val_split > 0 且 eval_steps > 0 时启用）

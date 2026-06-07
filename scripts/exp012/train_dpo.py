@@ -319,7 +319,7 @@ def main():
                         help="学习率")
     parser.add_argument("--beta", type=float, default=0.3,
                         help="DPO beta（KL 散度约束系数，越大越保守，对于小数据量防止过拟合）")
-    parser.add_argument("--max-length", type=int, default=6144,
+    parser.add_argument("--max-length", type=int, default=5120,
                         help="最大序列长度（chosen/rejected 总 token 数）")
     parser.add_argument("--max-prompt-length", type=int, default=5120,
                         help="prompt 最大 token 数（仅日志参考，训练不截断）")
@@ -350,6 +350,9 @@ def main():
     parser.add_argument("--no-ref-cache", action="store_true",
                         help="不使用 ref log probs 缓存，强制重新预计算")
     args = parser.parse_args()
+
+    # 防 4-bit 模型预计算 ref log probs 时 CUDA 显存碎片化 OOM
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # ── 路径验证 ──
     if not Path(args.data).exists():

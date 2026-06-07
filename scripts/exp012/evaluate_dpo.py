@@ -291,6 +291,7 @@ def generate_vllm(
     output_file: Path,
     model_id: str,
     vllm_url: str,
+    vllm_model: str,
 ):
     """通过 vLLM HTTP API 批量生成答案（需先启动 vLLM 服务）。
 
@@ -325,7 +326,7 @@ def generate_vllm(
 
             try:
                 response = client.chat.completions.create(
-                    model="default",  # vLLM HTTP API 忽略此参数
+                    model=vllm_model,
                     messages=messages,
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -502,6 +503,8 @@ def main():
                         help="通过 vLLM HTTP API 推理（需先启动 vLLM 服务，见下方说明）")
     parser.add_argument("--vllm-url", type=str, default="http://localhost:8000/v1",
                         help="vLLM OpenAI-compatible API URL (默认: http://localhost:8000/v1)")
+    parser.add_argument("--vllm-model", type=str, default=None,
+                        help="vLLM 服务里注册的模型名（默认: base-model 的 basename）")
     parser.add_argument(
         "--input", type=str, default=str(INPUT_QUERIES),
         help="输入 query JSONL 路径（默认：300 条验证集）",
@@ -535,6 +538,9 @@ def main():
     base_model_path = resolve_base_model(args.base_model, MODEL_CACHE_DIR)
     logger.info(f"Base model: {base_model_path}")
 
+    # vLLM 模型名：未指定时用 base-model 的 HF ID
+    vllm_model = args.vllm_model or args.base_model
+
     query_data = load_input_queries(input_queries)
     prompt_manager = PromptV2Manager(PROMPT_VERSION)
 
@@ -549,11 +555,11 @@ def main():
             # ── vLLM HTTP API 路径（与 generate_multi_sample.py 一致）──
             logger.info("=" * 60)
             logger.info(f"  Generating via vLLM HTTP API: {model_id}")
-            logger.info(f"  API:   {args.vllm_url}")
+            logger.info(f"  API:   {args.vllm_url}  model={vllm_model}")
             logger.info(f"  Prompt: v1-full, T={TEMPERATURE}")
             logger.info(f"  Queries: {len(query_data)}")
             logger.info("=" * 60)
-            generate_vllm(query_data, prompt_manager, output_file, model_id, args.vllm_url)
+            generate_vllm(query_data, prompt_manager, output_file, model_id, args.vllm_url, vllm_model)
         else:
             # ── Transformers 路径 ──
             logger.info("=" * 60)

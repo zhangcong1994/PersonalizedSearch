@@ -115,9 +115,18 @@ def build_prompt(
     passages: list[dict],
     prompt_manager: PromptV2Manager,
 ) -> str:
-    """[{rank}] 来源: {pid} 格式，与训练时完全一致。"""
+    """[{rank}] 来源: {pid} 格式，与训练时完全一致。
+    transformers 路径用此函数（system prompt 拼进 user message）。
+    """
     system_prompt = prompt_manager.get_system_prompt()
+    user_prompt = _build_user_content(query_text, passages)
+    return f"{system_prompt}\n\n{user_prompt}"
 
+
+def _build_user_content(query_text: str, passages: list[dict]) -> str:
+    """构造纯 user 消息内容（不含 system prompt）。
+    vLLM 路径使用此函数，system prompt 放在独立 role=system 消息中。
+    """
     context_parts = []
     for p in passages:
         pid = p.get("pid", "unknown")
@@ -126,13 +135,11 @@ def build_prompt(
         context_parts.append(f"[{rank}] 来源: {pid}\n{text[:800]}")
 
     context = "\n\n".join(context_parts)
-    user_prompt = (
+    return (
         f"参考资料:\n{context}\n\n"
         f"用户问题: {query_text}\n\n"
         f"请根据以上参考资料回答问题："
     )
-
-    return f"{system_prompt}\n\n{user_prompt}"
 
 
 # ── 加载数据 ──────────────────────────────────────────────
@@ -275,14 +282,18 @@ def generate_vllm(
 
     os.makedirs(output_file.parent, exist_ok=True)
 
-    # --- 构造所有 prompt ---
+    # --- 构造所有 prompt（system + user 两段式）---
     logger.info(f"Building {len(query_data)} prompts...")
-    prompt_texts = []
+    system_prompt = prompt_manager.get_system_prompt()
+    all_messages = []
     for item in query_data:
         query_text = item.get("query_text", item.get("query", ""))
         passages = item.get("passages", [])
-        full_prompt = build_prompt(query_text, passages, prompt_manager)
-        prompt_texts.append(full_prompt)
+        user_prompt = _build_user_content(query_text, passages)
+        all_messages.append([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
 
     # --- 加载 vLLM 模型 ---
     logger.info(f"Loading vLLM model from {model_path} ...")
@@ -304,11 +315,10 @@ def generate_vllm(
     logger.info(f"Generating {len(query_data)} answers via vLLM...")
     t_start = time.time()
 
-    # vLLM 的 chat 接口更自然，传 messages 列表
-    all_messages = [[{"role": "user", "content": pt}] for pt in prompt_texts]
     outputs = llm.chat(
         messages=all_messages,
         sampling_params=sampling_params,
+        chat_template_kwargs={"enable_thinking": False},
         use_tqdm=True,
     )
 

@@ -46,6 +46,7 @@ INPUT_QUERIES = DATA_ROOT / "results" / "exp012" / "eval_queries.jsonl"  # 148 �
 MODEL_ID = "qwen3-8b-dpo-v1"
 BASE_MODEL = "Qwen/Qwen3-8B"
 ADAPTER_PATH = DATA_ROOT / "models" / "exp012-dpo-pilot"
+DPO_MERGED_PATH = DATA_ROOT / "models" / "exp012-dpo-pilot" / "merged"  # vLLM 用合并模型
 
 TEMPERATURE = 0.3
 MAX_TOKENS = 1024
@@ -258,6 +259,89 @@ def generate_transformers(
     logger.info(f"Saved {total} generations to {output_file.name} ({errors} errors)")
 
 
+# ── vLLM 批量推理 ────────────────────────────────────────
+
+def generate_vllm(
+    query_data: list[dict],
+    prompt_manager: PromptV2Manager,
+    output_file: Path,
+    model_path: str,
+    model_id: str,
+):
+    """用 vLLM offline batch inference 批量生成答案（比 transformers 逐条快 5-10x）。"""
+    from vllm import LLM, SamplingParams
+
+    os.makedirs(output_file.parent, exist_ok=True)
+
+    # --- 构造所有 prompt ---
+    logger.info(f"Building {len(query_data)} prompts...")
+    prompt_texts = []
+    for item in query_data:
+        query_text = item.get("query_text", item.get("query", ""))
+        passages = item.get("passages", [])
+        full_prompt = build_prompt(query_text, passages, prompt_manager)
+        prompt_texts.append(full_prompt)
+
+    # --- 加载 vLLM 模型 ---
+    logger.info(f"Loading vLLM model from {model_path} ...")
+    llm = LLM(
+        model=model_path,
+        trust_remote_code=True,
+        gpu_memory_utilization=0.90,
+        max_model_len=6144,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+    )
+
+    # --- 批量推理 ---
+    logger.info(f"Generating {len(query_data)} answers via vLLM...")
+    t_start = time.time()
+
+    # vLLM 的 chat 接口更自然，传 messages 列表
+    all_messages = [[{"role": "user", "content": pt}] for pt in prompt_texts]
+    outputs = llm.chat(
+        messages=all_messages,
+        sampling_params=sampling_params,
+        use_tqdm=True,
+    )
+
+    elapsed_s = time.time() - t_start
+    logger.info(f"vLLM generation done in {elapsed_s:.0f}s ({len(query_data)/elapsed_s:.1f} q/s)")
+
+    # --- 写入输出 ---
+    errors = 0
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        for i, (item, output) in enumerate(zip(query_data, outputs)):
+            qid = item.get("query_id", f"q-{i}")
+            query_text = item.get("query_text", item.get("query", ""))
+            passages = item.get("passages", [])
+
+            if output.outputs:
+                answer = output.outputs[0].text.strip()
+                answer = clean_answer(answer)
+            else:
+                logger.warning(f"  Empty output for qid={qid}")
+                answer = ""
+                errors += 1
+
+            result = {
+                "query_id": qid,
+                "query_text": query_text,
+                "model_id": model_id,
+                "answer": answer,
+                "passages": passages,
+                "system_prompt": prompt_manager.get_system_prompt(),
+                "temperature": TEMPERATURE,
+                "generation_time_ms": 0,  # batch 模式无法分条计时
+            }
+            out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    logger.info(f"Saved {len(query_data)} generations to {output_file.name} ({errors} errors)")
+
+
 # ── Judge ────────────────────────────────────────────────
 
 def run_judge(generations_file: Path, judge_model: str = "deepseek-reasoner"):
@@ -387,12 +471,14 @@ def _print_comparison(dpo_judge_file: Path, baseline_judge_file: Path | None = N
 # ── main ────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Exp-012: DPO Model Evaluation (transformers direct)")
+    parser = argparse.ArgumentParser(description="Exp-012: DPO Model Evaluation")
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--judge-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--baseline", action="store_true",
                         help="仅用基座模型推理（不加载 LoRA adapter）")
+    parser.add_argument("--use-vllm", action="store_true",
+                        help="使用 vLLM 批量推理（比 transformers 逐条快 5-10x）")
     parser.add_argument(
         "--input", type=str, default=str(INPUT_QUERIES),
         help="输入 query JSONL 路径（默认：148 条 eval set）",
@@ -403,7 +489,11 @@ def main():
     )
     parser.add_argument(
         "--adapter", type=str, default=str(ADAPTER_PATH),
-        help="LoRA adapter 目录（--baseline 模式下忽略）",
+        help="LoRA adapter 目录（--baseline 或 --use-vllm 时忽略）",
+    )
+    parser.add_argument(
+        "--dpo-merged", type=str, default=str(DPO_MERGED_PATH),
+        help="DPO 合并模型路径（--use-vllm 非 baseline 模式使用）",
     )
     args = parser.parse_args()
 
@@ -419,7 +509,7 @@ def main():
     else:
         model_id = MODEL_ID
         adapter_path = Path(args.adapter)
-        if not adapter_path.exists() and not args.judge_only:
+        if not adapter_path.exists() and not args.judge_only and not args.use_vllm:
             logger.error(f"Adapter not found: {adapter_path}")
             return 1
 
@@ -436,9 +526,29 @@ def main():
     if not args.judge_only:
         if output_file.exists() and not args.force:
             logger.info(f"Skipping generation (cached at {output_file})")
-        else:
+        elif args.use_vllm:
+            # ── vLLM 路径 ──
+            if args.baseline:
+                vllm_model_path = base_model_path  # 基座 HF 路径
+            else:
+                vllm_model_path = args.dpo_merged
+                if not Path(vllm_model_path).exists():
+                    logger.error(
+                        f"DPO merged model not found: {vllm_model_path}\n"
+                        f"  Run merge_adapter.py first, or train_dpo.py without --no-merge"
+                    )
+                    return 1
             logger.info("=" * 60)
-            logger.info(f"  Generating: {model_id}")
+            logger.info(f"  Generating via vLLM: {model_id}")
+            logger.info(f"  Model:  {vllm_model_path}")
+            logger.info(f"  Prompt: v1-full, T={TEMPERATURE}")
+            logger.info(f"  Queries: {len(query_data)}")
+            logger.info("=" * 60)
+            generate_vllm(query_data, prompt_manager, output_file, vllm_model_path, model_id)
+        else:
+            # ── Transformers 路径 ──
+            logger.info("=" * 60)
+            logger.info(f"  Generating via Transformers: {model_id}")
             logger.info(f"  Base: {base_model_path}")
             logger.info(f"  Adapter: {adapter_path if adapter_path else 'NONE (baseline)'}")
             logger.info(f"  Prompt: v1-full, T={TEMPERATURE}")

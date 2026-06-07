@@ -289,11 +289,9 @@ def generate_vllm(
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.60,
-        max_model_len=6144,
-        # 离线批量推理不需要大 KV cache：每条 query 跑完就释放
+        gpu_memory_utilization=0.80,
+        max_model_len=8192,
         max_num_seqs=16,
-        # 禁用 CUDA graph，省 2-4 GB 显存（离线推理不在乎那点延迟）
         enforce_eager=True,
     )
 

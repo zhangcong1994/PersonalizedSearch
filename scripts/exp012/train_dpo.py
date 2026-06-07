@@ -602,15 +602,21 @@ def main():
         logger.info("Merging adapter into base model...")
         merged_path = os.path.join(str(args.output_dir), "merged")
 
-        merged_model = model.merge_and_unload()
+        # 必须用 bf16 全精度重新加载再 merge，4-bit 下 merge 产出的 tensor vLLM 无法解析
+        del model
+        torch.cuda.empty_cache()
+        logger.info("Reloading base model in bf16 for merge...")
+        merge_base = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            cache_dir=str(MODEL_CACHE_DIR),
+        )
+        merge_model = PeftModel.from_pretrained(merge_base, args.output_dir)
+        merged_model = merge_model.merge_and_unload()
         merged_model.save_pretrained(merged_path, safe_serialization=True)
-        tokenizer.save_pretrained(merged_path)
-
-        # Qwen3 的 save_pretrained 可能产生重复 chat_template，vLLM 会报错
-        tcfg = Path(merged_path) / "tokenizer_config.json"
-        if tcfg.exists():
-            tcfg.unlink()
-            logger.info("  Removed tokenizer_config.json (avoiding vLLM duplicate template error)")
+        merged_model.config.save_pretrained(merged_path)
 
         logger.info(f"  Merged model -> {merged_path}")
 

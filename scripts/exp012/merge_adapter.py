@@ -67,7 +67,7 @@ def main():
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
     logger.info(f"  GPU: {gpu_name} ({gpu_mem:.0f} GB)")
 
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM
     from peft import PeftModel
 
     # Step 1: 找本地已下载的模型
@@ -83,17 +83,11 @@ def main():
             base_path = str(local_path)
             logger.info(f"Using local model: {base_path}")
 
-    logger.info("Loading base model (4-bit)...")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-    )
-
+    # 关键：必须用 bf16 全精度加载，不能用 4-bit。
+    # 4-bit 下 merge_and_unload() 产出的是 4-bit 量化 tensor，保存后 vLLM 无法正确解析。
+    logger.info("Loading base model (bf16 full precision, ~16 GB)...")
     base_model = AutoModelForCausalLM.from_pretrained(
         base_path,
-        quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
@@ -108,6 +102,7 @@ def main():
 
     logger.info(f"Saving merged model to {output_path}...")
     merged.save_pretrained(str(output_path), safe_serialization=True)
+    merged.config.save_pretrained(str(output_path))
 
     # 不保存 tokenizer 文件 —— Qwen3 的 save_pretrained 会产生重复 chat_template
     # 条目导致 vLLM 启动时 Pydantic 校验失败。vLLM 通过 --tokenizer 指定即可。

@@ -21,7 +21,9 @@ import json
 import time
 import argparse
 import logging
+import statistics
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -419,7 +421,6 @@ def _print_comparison(dpo_judge_file: Path, baseline_judge_file: Path | None = N
             win = sum(1 for d in deltas if d > 0)
             tie = sum(1 for d in deltas if d == 0)
             lose = sum(1 for d in deltas if d < 0)
-            import statistics
             delta_mean = statistics.mean(deltas)
             delta_stderr = statistics.stdev(deltas) / (len(deltas) ** 0.5) if len(deltas) > 1 else 0
 

@@ -7,12 +7,12 @@ Exp-012: 自对比式 QLoRA DPO 训练 Qwen3-8B。
   {"prompt": "...", "chosen": "...", "rejected": "...", "chosen_score": ..., "rejected_score": ..., "gap": ...}
 
 用法:
-  # 默认：best_vs_first_below_gap20
+  # 默认：first_below_mean_gap10
   python scripts/exp012/train_dpo.py
 
   # 指定数据文件
   python scripts/exp012/train_dpo.py \
-      --data data/processed/exp012/exp012_dpo_best_vs_first_below_gap20.jsonl
+      --data data/processed/exp012/exp012_dpo_first_below_mean_gap10.jsonl
 
   # 调整超参
   python scripts/exp012/train_dpo.py --beta 0.5 --lr 1e-5 --epochs 2
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DATA = (
     DATA_ROOT / "data" / "processed" / "exp012"
-    / "exp012_dpo_best_vs_first_below_gap20.jsonl"
+    / "exp012_dpo_first_below_mean_gap10.jsonl"
 )
 DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot"
 
@@ -307,37 +307,37 @@ def main():
                         help="每 GPU 的 batch size")
     parser.add_argument("--grad-accum", type=int, default=2,
                         help="梯度累积步数")
-    parser.add_argument("--lr", type=float, default=5e-5,
+    parser.add_argument("--lr", type=float, default=2e-5,
                         help="学习率")
-    parser.add_argument("--beta", type=float, default=0.1,
-                        help="DPO beta（KL 散度约束系数，越大越远离 ref model）")
-    parser.add_argument("--max-length", type=int, default=5120,
-                        help="最大序列长度（chosen/rejected 总 token 数，47G GPU 建议 5120）")
-    parser.add_argument("--max-prompt-length", type=int, default=4300,
+    parser.add_argument("--beta", type=float, default=0.3,
+                        help="DPO beta（KL 散度约束系数，越大越保守，对于小数据量防止过拟合）")
+    parser.add_argument("--max-length", type=int, default=7168,
+                        help="最大序列长度（chosen/rejected 总 token 数，大 VRAM GPU 建议 7168）")
+    parser.add_argument("--max-prompt-length", type=int, default=6144,
                         help="prompt 最大 token 数（仅日志参考，训练不截断）")
     parser.add_argument("--min-chosen-score", type=float, default=0.0,
                         help="最低 chosen 分数阈值，低于此分数的训练对将被过滤（数据已预过滤时默认 0）")
-    parser.add_argument("--lora-r", type=int, default=8,
-                        help="LoRA rank（30+对数据时建议 4-8）")
-    parser.add_argument("--lora-alpha", type=int, default=16,
+    parser.add_argument("--lora-r", type=int, default=4,
+                        help="LoRA rank（小数据量建议 4）")
+    parser.add_argument("--lora-alpha", type=int, default=8,
                         help="LoRA alpha（建议 alpha=2*r）")
-    parser.add_argument("--lora-dropout", type=float, default=0.1,
+    parser.add_argument("--lora-dropout", type=float, default=0.15,
                         help="LoRA dropout")
     parser.add_argument("--logging-steps", type=int, default=5,
                         help="每 N 步打印日志")
     parser.add_argument("--save-steps", type=int, default=50,
                         help="每 N 步保存 checkpoint")
-    parser.add_argument("--warmup-ratio", type=float, default=0.1,
+    parser.add_argument("--warmup-ratio", type=float, default=0.15,
                         help="Warmup 比例")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子")
     parser.add_argument("--no-merge", action="store_true",
                         help="跳过 LoRA 合并（只保存 adapter）")
     parser.add_argument("--no-grad-ckpt", action="store_true",
-                        help="禁用 gradient checkpointing（95G GPU 可关掉加速）")
-    parser.add_argument("--val-split", type=float, default=0.0,
-                        help="验证集比例（0=不划分验证集，建议 0.1~0.15）")
-    parser.add_argument("--eval-steps", type=int, default=0,
+                        help="禁用 gradient checkpointing（大 VRAM GPU 可关掉加速）")
+    parser.add_argument("--val-split", type=float, default=0.1,
+                        help="验证集比例（0=不划分验证集，建议 0.1）")
+    parser.add_argument("--eval-steps", type=int, default=30,
                         help="每 N 步在验证集上评估（0=不评估，需要 --val-split > 0）")
     args = parser.parse_args()
 
@@ -470,7 +470,7 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # gradient checkpointing: 不缓存中间激活，显著节省显存（47G GPU 必需）
+    # gradient checkpointing: 不缓存中间激活，节省显存。大 VRAM GPU 可 --no-grad-ckpt 加速
     if not args.no_grad_ckpt:
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled")
@@ -488,7 +488,7 @@ def main():
         lr_scheduler_type="cosine",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        save_total_limit=2,
+        save_total_limit=5,
         bf16=True,
         optim="adamw_8bit",
         gradient_checkpointing=not args.no_grad_ckpt,
@@ -500,6 +500,7 @@ def main():
         # DPO 专属参数
         beta=args.beta,
         max_length=args.max_length,
+        max_prompt_length=args.max_prompt_length,
         loss_type="sigmoid",
         precompute_ref_log_probs=True,
         # 验证集评估（仅在 val_split > 0 且 eval_steps > 0 时启用）

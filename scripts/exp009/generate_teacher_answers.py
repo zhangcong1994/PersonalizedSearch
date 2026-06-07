@@ -29,7 +29,8 @@ load_dotenv()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.config import DATA_ROOT
-from src.generation.prompts import SYSTEM_PROMPT, FEW_SHOT, CONTEXT_TEMPLATE, QUESTION_TEMPLATE
+from src.generation.prompts import SYSTEM_PROMPT as PROMPT_V0_SYSTEM, FEW_SHOT as FEW_SHOT_V0, CONTEXT_TEMPLATE, QUESTION_TEMPLATE
+from src.generation.prompts_v2 import PromptV2Manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,7 +55,7 @@ TEST_MODEL_ID = "batch-test-model"
 TEST_ENDPOINT = "/v1/chat/ds-test"
 TEST_STATE_FILE = DATA_ROOT / "data" / "processed" / "exp009_batch_test_state.json"
 
-SYSTEM_TEXT = SYSTEM_PROMPT + FEW_SHOT
+SYSTEM_TEXT = PROMPT_V0_SYSTEM + FEW_SHOT_V0
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -65,13 +66,39 @@ def _resolve(path_str: str) -> Path:
 
 
 def load_reranked(path: Path) -> list[dict]:
+    """加载检索结果，自动适配 exp-009 和 exp-012 两种格式。
+
+    exp-009 格式: {"qid": ..., "query": ..., "results": [{pid, rank, score, text}]}
+    exp-012 格式: {"query_id": ..., "query_text": ..., "passages": [{pid, rank, text}]}
+    统一输出: {"qid": ..., "query": ..., "results": [{pid, rank, text}]}
+    """
     data = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            data.append(json.loads(line))
+            record = json.loads(line)
+
+            # 检测格式：exp-012 用 query_id / exp-009 用 qid
+            if "query_id" in record and "qid" not in record:
+                # exp-012 格式
+                normalized = {
+                    "qid": record["query_id"],
+                    "query": record.get("query_text", record.get("query", "")),
+                    "results": []
+                }
+                for p in record.get("passages", []):
+                    normalized["results"].append({
+                        "pid": p["pid"],
+                        "rank": p.get("rank", 0),
+                        "text": p["text"],
+                    })
+                data.append(normalized)
+            else:
+                # exp-009 格式（或已规范化）
+                data.append(record)
+
     logger.info(f"Loaded {len(data):,} entries from {path.name}")
     return data
 
@@ -86,21 +113,32 @@ def build_user_message(query: str, passages: list[dict]) -> str:
     return CONTEXT_TEMPLATE.format(context=context) + "\n\n" + QUESTION_TEMPLATE.format(question=query)
 
 
-def build_messages(query: str, passages: list[dict]) -> list[dict]:
+def build_system_text(prompt_version: str = "v0") -> str:
+    """根据 prompt 版本构建 system 消息文本。"""
+    if prompt_version == "v0":
+        return PROMPT_V0_SYSTEM + FEW_SHOT_V0
+    else:
+        mgr = PromptV2Manager(prompt_version)
+        return mgr.get_system_prompt()
+
+
+def build_messages(query: str, passages: list[dict], prompt_version: str = "v0") -> list[dict]:
     return [
-        {"role": "system", "content": SYSTEM_TEXT},
+        {"role": "system", "content": build_system_text(prompt_version)},
         {"role": "user", "content": build_user_message(query, passages)},
     ]
 
 
-def build_batch_line(qid: str, query: str, passages: list[dict]) -> dict:
+def build_batch_line(qid: str, query: str, passages: list[dict],
+                     model_id: str = None, prompt_version: str = "v0") -> dict:
+    model = model_id or MODEL_ID
     return {
         "custom_id": qid,
         "method": "POST",
         "url": BATCH_ENDPOINT,
         "body": {
-            "model": MODEL_ID,
-            "messages": build_messages(query, passages),
+            "model": model,
+            "messages": build_messages(query, passages, prompt_version),
             "temperature": 0.3,
             "max_tokens": 1024,
             "enable_thinking": False,
@@ -113,12 +151,15 @@ def build_batch_line(qid: str, query: str, passages: list[dict]) -> dict:
 def cmd_prepare(args):
     inp = _resolve(args.input)
     outp = _resolve(args.batch_input)
+    model = args.model or MODEL_ID
+    prompt_version = args.prompt_version
 
     logger.info("=" * 60)
     logger.info("  Step 3a: Prepare batch input JSONL")
     logger.info(f"  Input:  {inp}")
     logger.info(f"  Output: {outp}")
-    logger.info(f"  Model:  {MODEL_ID}")
+    logger.info(f"  Model:  {model}")
+    logger.info(f"  Prompt: {prompt_version}")
     logger.info("=" * 60)
 
     entries = load_reranked(inp)
@@ -129,12 +170,13 @@ def cmd_prepare(args):
     outp.parent.mkdir(parents=True, exist_ok=True)
     with open(outp, "w", encoding="utf-8") as f:
         for entry in entries:
-            batch_line = build_batch_line(entry["qid"], entry["query"], entry["results"])
+            batch_line = build_batch_line(entry["qid"], entry["query"], entry["results"],
+                                          model_id=model, prompt_version=prompt_version)
             f.write(json.dumps(batch_line, ensure_ascii=False) + "\n")
 
     file_size_mb = outp.stat().st_size / 1024 / 1024
     logger.info(f"Wrote {len(entries):,} batch requests → {outp} ({file_size_mb:.1f} MB)")
-    logger.info(f"Estimated cost: {len(entries):,} × ~2000 tokens × ¥0.003/K × 50% ≈ ¥{len(entries)*2000/1000*0.003*0.5:.0f}")
+    logger.info(f"Estimated cost: {len(entries):,} × ~2000 tokens × rate × 50% batch discount")
     logger.info("=" * 60)
     logger.info("  Next: python scripts/exp009/generate_teacher_answers.py submit")
     logger.info("=" * 60)
@@ -287,12 +329,14 @@ def cmd_align(args):
     inp = _resolve(args.input)
     batch_result_path = _resolve(args.batch_result)
     outp = _resolve(args.output)
+    model = args.model or MODEL_ID
 
     logger.info("=" * 60)
     logger.info("  Step 3c: Align batch results")
     logger.info(f"  Reference: {inp}")
     logger.info(f"  Batch out: {batch_result_path}")
     logger.info(f"  Final:     {outp}")
+    logger.info(f"  Model:     {model}")
     logger.info("=" * 60)
 
     if not batch_result_path.exists():
@@ -341,7 +385,7 @@ def cmd_align(args):
                 "query": entry["query"],
                 "passages": entry["results"],
                 "teacher_answer": answer,
-                "model": MODEL_ID,
+                "model": model,
                 "temperature": 0.3,
             }
             if answer:
@@ -487,6 +531,11 @@ def main():
                            help=f"Reranked top-10 JSONL (default: {DEFAULT_INPUT})")
     p_prepare.add_argument("--batch-input", default=str(DEFAULT_BATCH_INPUT),
                            help=f"Output batch input JSONL (default: {DEFAULT_BATCH_INPUT})")
+    p_prepare.add_argument("--model", default=None,
+                           help=f"Model ID (default: {MODEL_ID}). e.g. qwen3.6-plus")
+    p_prepare.add_argument("--prompt-version", default="v0",
+                           choices=["v0", "v1-full", "v2", "v3"],
+                           help="Prompt version from prompts_v2 (default: v0)")
 
     p_submit = sub.add_parser("submit", help="上传文件 + 创建 batch 任务 + 轮询")
     p_submit.add_argument("--batch-input", default=str(DEFAULT_BATCH_INPUT),
@@ -499,6 +548,8 @@ def main():
                          help=f"Batch result JSONL path (default: {DEFAULT_BATCH_RESULT})")
     p_align.add_argument("--output", default=str(DEFAULT_OUTPUT),
                          help=f"Final teacher answers JSONL (default: {DEFAULT_OUTPUT})")
+    p_align.add_argument("--model", default=None,
+                         help=f"Model ID for output metadata (default: {MODEL_ID})")
 
     args = parser.parse_args()
 

@@ -1,5 +1,5 @@
 """
-Exp-012 Phase 0: 从 exp-011 多样本 + Judge 评分数据构造自对比式 DPO 训练对。
+Exp-012 Phase 3: 从学生多样本 + 教师答案的 Judge 评分数据构造 DPO 训练对。
 
 数据流：
   generation JSONL (含 answer/passages/system_prompt)  ←→  Judge JSONL (含 scores)
@@ -18,11 +18,11 @@ Exp-012 Phase 0: 从 exp-011 多样本 + Judge 评分数据构造自对比式 DP
 
 用法:
   python scripts/exp012/construct_dpo_pairs.py \
-      --generation results/exp011/generation/qwen3-8b-nothink_v1-full_t0.8_n5_s42.jsonl \
-      --judge results/exp011/judge_scores/qwen3-8b-nothink_v1-full_t0.8_n5_s42_judged.jsonl \
+      --generation results/exp012/generation/qwen3-8b-plus-teacher_v1-full_t0.8_n5+1_s42.jsonl \
+      --judge results/exp012/judge_scores/qwen3-8b-plus-teacher_v1-full_t0.8_n5+1_s42_judged.jsonl \
       --output-dir data/processed/exp012/
 
-  或使用默认路径:
+  或使用默认路径（直接运行即可）:
   python scripts/exp012/construct_dpo_pairs.py
 """
 
@@ -48,12 +48,12 @@ logger = logging.getLogger(__name__)
 # ── 默认路径 ────────────────────────────────────────────────
 
 DEFAULT_GENERATION = (
-    DATA_ROOT / "results" / "exp011" / "generation"
-    / "qwen3-8b-nothink_v1-full_t0.8_n5_s42.jsonl"
+    DATA_ROOT / "results" / "exp012" / "generation"
+    / "qwen3-8b-plus-teacher_v1-full_t0.8_n5+1_s42.jsonl"
 )
 DEFAULT_JUDGE = (
-    DATA_ROOT / "results" / "exp011" / "judge_scores"
-    / "qwen3-8b-nothink_v1-full_t0.8_n5_s42_judged.jsonl"
+    DATA_ROOT / "results" / "exp012" / "judge_scores"
+    / "qwen3-8b-plus-teacher_v1-full_t0.8_n5+1_s42_judged.jsonl"
 )
 DEFAULT_OUTPUT_DIR = DATA_ROOT / "data" / "processed" / "exp012"
 
@@ -72,6 +72,11 @@ PAIRING_STRATEGIES = {
     },
     "best_vs_first_below": {
         "description": "最高分 chosen vs 第一个低够 min_gap 的 rejected（需 min_gap 参数）",
+        "chosen_selector": lambda scores: max(scores, key=lambda x: x[1]),
+        "rejected_selector": None,  # 特殊处理：在 construct_pairs() 中实现
+    },
+    "first_below_mean": {
+        "description": "最高分 chosen vs 第一个低于该 query 均分的 rejected",
         "chosen_selector": lambda scores: max(scores, key=lambda x: x[1]),
         "rejected_selector": None,  # 特殊处理：在 construct_pairs() 中实现
     },
@@ -253,6 +258,28 @@ def construct_pairs(
                 continue
 
             rejected_score, rejected_rec = rejected_entry
+
+        # ── first_below_mean: 特殊逻辑 ──
+        elif strategy_name == "first_below_mean":
+            sorted_samples = sorted(samples, key=lambda x: x[1], reverse=True)
+            chosen_score, chosen_rec = sorted_samples[0][1], sorted_samples[0][2]
+
+            # 计算该 query 下所有样本的均分
+            all_scores = [s for _, s, _ in samples]
+            mean_score = sum(all_scores) / len(all_scores)
+
+            # 从第二名往下找，第一个低于均分的
+            rejected_entry = None
+            for _, score, rec in sorted_samples[1:]:
+                if score < mean_score:
+                    rejected_entry = (score, rec)
+                    break
+
+            if rejected_entry is None:
+                skipped_gap += 1
+                continue
+
+            rejected_score, rejected_rec = rejected_entry
         else:
             # ── 普通策略: lambda selector ──
             chosen_entry = chosen_selector(samples)
@@ -385,15 +412,15 @@ def print_quality_report(all_pairs: dict[str, list[dict]]) -> None:
         gap_mean = sum(gaps) / len(gaps)
 
         if len_ratio > 1.5:
-            print(f"  ⚠️  [{label}] 长度比={len_ratio:.2f} (>1.5) — DPO 可能学到长度 exploitation！")
+            print(f"  [WARN] [{label}] 长度比={len_ratio:.2f} (>1.5) — DPO 可能学到长度 exploitation！")
             print(f"         建议：训练时用长度惩罚（如 SimPO）或均衡 chosen/rejected 长度分布")
         if len_ratio < 0.7:
-            print(f"  ⚠️  [{label}] 长度比={len_ratio:.2f} (<0.7) — rejected 比 chosen 长，信号可能反向")
+            print(f"  [WARN] [{label}] 长度比={len_ratio:.2f} (<0.7) — rejected 比 chosen 长，信号可能反向")
         if gap_mean > 30:
-            print(f"  ⚠️  [{label}] 平均 gap={gap_mean:.1f} (>30) — 偏好信号过强，DPO 易过拟合")
-            print(f"         建议：增大 beta 或使用更保守的配对策略（如 best_vs_median）")
+            print(f"  [WARN] [{label}] 平均 gap={gap_mean:.1f} (>30) — 偏好信号过强，DPO 易过拟合")
+            print(f"         建议：增大 beta 或使用更保守的配对策略（如 first_below_mean）")
         if gap_mean < 5:
-            print(f"  ⚠️  [{label}] 平均 gap={gap_mean:.1f} (<5) — 偏好信号太弱，DPO 可能学不到东西")
+            print(f"  [WARN] [{label}] 平均 gap={gap_mean:.1f} (<5) — 偏好信号太弱，DPO 可能学不到东西")
 
     # 共享 query 统计（所有策略共用同一批 query，只是配对方式不同）
     first_label = list(all_pairs.keys())[0]
@@ -455,16 +482,16 @@ def main():
         help="输出目录",
     )
     parser.add_argument(
-        "--strategies", type=str, default="best_vs_worst,best_vs_median",
-        help="配对策略，逗号分隔。可选: best_vs_worst, best_vs_median",
+        "--strategies", type=str, default="best_vs_worst,best_vs_first_below,first_below_mean",
+        help="配对策略，逗号分隔。可选: best_vs_worst, best_vs_median, best_vs_first_below, first_below_mean",
     )
     parser.add_argument(
-        "--min-gaps", type=str, default="5,10",
-        help="对比度阈值列表，逗号分隔。如 '5,10'",
+        "--min-gaps", type=str, default="10,15",
+        help="对比度阈值列表，逗号分隔。如 '10,15'。first_below_mean 策略也受此阈值约束",
     )
     parser.add_argument(
-        "--min-chosen-score", type=float, default=0.0,
-        help="最低 chosen 分数阈值，低于此值的训练对将被过滤（默认 0 = 不过滤）",
+        "--min-chosen-score", type=float, default=70,
+        help="最低 chosen 分数阈值，低于此值的训练对将被过滤（默认 70）",
     )
     parser.add_argument(
         "--no-report", action="store_true",

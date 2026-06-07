@@ -6,7 +6,7 @@ Exp-012: 将 DPO LoRA adapter 合并到基座模型，产出可直接 vLLM 加�
 
   python scripts/exp012/merge_adapter.py \
       --adapter /root/autodl-tmp/models/exp012-dpo-pilot \
-      --output /root/autodl-tmp/models/exp012-dpo-pilot-merged
+      --output /root/autodl-tmp/models/exp012-dpo-pilot/merged
 """
 
 import os
@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTER = DATA_ROOT / "models" / "exp012-dpo-pilot"
-DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot-merged"
+DEFAULT_OUTPUT = DATA_ROOT / "models" / "exp012-dpo-pilot" / "merged"
 
 
 def main():
@@ -104,16 +104,17 @@ def main():
     merged.save_pretrained(str(output_path), safe_serialization=True)
     merged.config.save_pretrained(str(output_path))
 
-    # 不保存 tokenizer 文件 —— Qwen3 的 save_pretrained 会产生重复 chat_template
-    # 条目导致 vLLM 启动时 Pydantic 校验失败。vLLM 通过 --tokenizer 指定即可。
-    logger.info("  Skipping tokenizer save (use --tokenizer Qwen/Qwen3-8B in vLLM serve)")
+    # 保存 tokenizer 文件
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_path, trust_remote_code=True)
+    tokenizer.save_pretrained(str(output_path))
 
     logger.info("=" * 60)
     logger.info("  Merge complete!")
     logger.info(f"  Merged model: {output_path}")
     logger.info("")
     logger.info("  启动 vLLM:")
-    logger.info(f"  vllm serve {output_path} --tokenizer Qwen/Qwen3-8B --host 0.0.0.0 --port 8000")
+    logger.info(f"  vllm serve {output_path} --host 0.0.0.0 --port 8000 --served-model-name qwen3-8b")
     logger.info("=" * 60)
 
     return 0

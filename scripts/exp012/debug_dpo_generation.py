@@ -61,11 +61,19 @@ def main():
     prompt_mgr = PromptV2Manager("v1-full")
     system_prompt = prompt_mgr.get_system_prompt()
 
-    # 找本地 base model
+    # 找本地 base model（优先 HF 缓存，回退到 MODEL_CACHE_DIR/Qwen3-8B）
     cache = MODEL_CACHE_DIR
     name = f"models--{BASE_MODEL.replace('/', '--')}"
-    snap = sorted((cache / name / "snapshots").iterdir())[-1]
-    base_path = str(snap)
+    hf_snap = cache / name / "snapshots"
+    if hf_snap.exists():
+        snap = sorted(hf_snap.iterdir())[-1]
+        base_path = str(snap)
+    else:
+        local = cache / BASE_MODEL.split("/")[-1]
+        if (local / "config.json").exists():
+            base_path = str(local)
+        else:
+            raise FileNotFoundError(f"Model not found at {hf_snap} or {local}")
 
     # ── 加载 ──
     print(f"Loading tokenizer from {base_path} ...")

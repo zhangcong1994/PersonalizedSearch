@@ -153,9 +153,12 @@ def generate_transformers(
     prompt_manager: PromptV2Manager,
     output_file: Path,
     base_model_path: str,
-    adapter_path: Path,
+    adapter_path: Optional[Path] = None,
 ):
-    """加载 QLoRA 基座 + LoRA adapter，逐条推理生成答案。"""
+    """加载 4-bit 基座（可选 + LoRA adapter），逐条推理生成答案。
+
+    adapter_path=None 时仅用基座模型（baseline 模式）。
+    """
     from transformers import (
         AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
     )
@@ -186,9 +189,13 @@ def generate_transformers(
         cache_dir=str(MODEL_CACHE_DIR),
     )
 
-    # --- 加载 LoRA adapter ---
-    logger.info(f"Loading LoRA adapter from {adapter_path} ...")
-    model = PeftModel.from_pretrained(base_model, str(adapter_path))
+    # --- 可选：加载 LoRA adapter ---
+    if adapter_path is not None:
+        logger.info(f"Loading LoRA adapter from {adapter_path} ...")
+        model = PeftModel.from_pretrained(base_model, str(adapter_path))
+    else:
+        logger.info("No adapter — using base model (baseline mode)")
+        model = base_model
     model.eval()
 
     # --- 逐条推理 ---
@@ -273,16 +280,17 @@ def run_judge(generations_file: Path, judge_model: str = "deepseek-reasoner"):
 
 # ── 对比 ────────────────────────────────────────────────
 
-def _print_comparison(eval_queries_file: Path, dpo_judge_file: Path):
-    """在 DPO 结果和基线间做同 query 子集对比。"""
-    baseline_files = [
-        DATA_ROOT / "results" / "exp010" / "judge_scores" / "qwen3-8b-nothink-v1-full_judged.jsonl",
-        DATA_ROOT / "results" / "exp010" / "judge_scores" / "qwen3-8b-nothink-v0_judged.jsonl",
-    ]
+def _print_comparison(dpo_judge_file: Path, baseline_judge_file: Path | None = None):
+    """打印 DPO vs 基线的配对对比报告。
 
+    优先使用同 query 集的 baseline judge 文件（paired comparison）；
+    若未提供，回退到 exp-010 历史基线（不同 query 集，仅供参考）。
+    """
     if not dpo_judge_file.exists():
+        logger.warning(f"DPO judge file not found: {dpo_judge_file}")
         return
 
+    # 加载 DPO scores
     dpo_scores = {}
     with open(dpo_judge_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -295,56 +303,85 @@ def _print_comparison(eval_queries_file: Path, dpo_judge_file: Path):
             if score is not None:
                 dpo_scores[qid] = score
 
-    eval_qids = set()
-    with open(eval_queries_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            eval_qids.add(json.loads(line)["query_id"])
-
     dpo_mean = sum(dpo_scores.values()) / max(len(dpo_scores), 1)
     dpo_pass = sum(1 for s in dpo_scores.values() if s >= 60) / max(len(dpo_scores), 1) * 100
 
-    print(f"\n  {'='*50}")
-    print(f"  DPO 模型 ({len(dpo_scores)} 条):")
-    print(f"    均分: {dpo_mean:.1f}")
-    print(f"    Pass%: {dpo_pass:.1f}%")
+    print(f"\n  {'='*60}")
+    print(f"  DPO 模型 ({len(dpo_scores)} 条):  均分={dpo_mean:.1f}  Pass%={dpo_pass:.1f}%")
 
-    for bf in baseline_files:
-        if not bf.exists():
-            continue
+    # ── 配对对比（同 query 集）──
+    if baseline_judge_file and baseline_judge_file.exists():
         baseline_scores = {}
-        with open(bf, "r", encoding="utf-8") as f:
+        with open(baseline_judge_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 r = json.loads(line)
                 qid = r["query_id"]
-                if qid not in eval_qids:
-                    continue
                 score = r.get("aggregation", {}).get("total_score")
                 if score is not None:
                     baseline_scores[qid] = score
 
-        if not baseline_scores:
-            continue
-
         common = set(dpo_scores.keys()) & set(baseline_scores.keys())
+        if len(common) >= 10:
+            common_dpo = sum(dpo_scores[q] for q in common) / len(common)
+            common_bl = sum(baseline_scores[q] for q in common) / len(common)
+            delta = common_dpo - common_bl
+            bl_pass = sum(1 for q in common if baseline_scores[q] >= 60) / len(common) * 100
+
+            # per-query delta 统计
+            deltas = [dpo_scores[q] - baseline_scores[q] for q in common]
+            win = sum(1 for d in deltas if d > 0)
+            tie = sum(1 for d in deltas if d == 0)
+            lose = sum(1 for d in deltas if d < 0)
+            import statistics
+            delta_mean = statistics.mean(deltas)
+            delta_stderr = statistics.stdev(deltas) / (len(deltas) ** 0.5) if len(deltas) > 1 else 0
+
+            print(f"\n  Baseline (基座, {len(common)} common queries):")
+            print(f"    均分: {common_bl:.1f}  Pass%: {bl_pass:.1f}%")
+            print(f"\n  ── 配对对比 (n={len(common)}) ──")
+            print(f"    Δ 均值 (DPO − Baseline):  {delta:+.1f}")
+            print(f"    Δ 均值 ± 1.96*SE:         {delta_mean:+.1f} ± {1.96*delta_stderr:.1f}")
+            print(f"    Win / Tie / Lose:          {win} / {tie} / {lose}")
+            print(f"    Win rate:                  {win/len(common)*100:.1f}%")
+            print(f"    Regression rate:           {lose/len(common)*100:.1f}%")
+        else:
+            print(f"  [WARN] Too few common queries ({len(common)}) for paired comparison")
+
+    else:
+        print(f"  [NOTE] 无同 query 集基线文件，无法做配对对比")
+
+    # ── 回退：exp-010 历史基线（仅参考）──
+    history_files = [
+        DATA_ROOT / "results" / "exp010" / "judge_scores" / "qwen3-8b-nothink-v1-full_judged.jsonl",
+    ]
+    for hf in history_files:
+        if not hf.exists():
+            continue
+        hist_scores = {}
+        with open(hf, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                qid = r["query_id"]
+                score = r.get("aggregation", {}).get("total_score")
+                if score is not None:
+                    hist_scores[qid] = score
+        common = set(dpo_scores.keys()) & set(hist_scores.keys())
         if len(common) < 10:
             continue
-
         common_dpo = sum(dpo_scores[q] for q in common) / len(common)
-        common_bl = sum(baseline_scores[q] for q in common) / len(common)
-        delta = common_dpo - common_bl
-
-        label = bf.stem
-        print(f"\n  基线 {label}:")
+        common_hist = sum(hist_scores[q] for q in common) / len(common)
+        delta = common_dpo - common_hist
+        print(f"\n  历史基线 {hf.stem}:")
         print(f"    ({len(common)} common queries)")
-        print(f"    基线均分: {common_bl:.1f}  ->  DPO: {common_dpo:.1f}  (Delta = {delta:+.1f})")
+        print(f"    历史均分: {common_hist:.1f}  →  DPO: {common_dpo:.1f}  (Δ={delta:+.1f})")
 
-    print(f"  {'='*50}\n")
+    print(f"  {'='*60}\n")
 
 
 # ── main ────────────────────────────────────────────────
@@ -354,6 +391,8 @@ def main():
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--judge-only", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--baseline", action="store_true",
+                        help="仅用基座模型推理（不加载 LoRA adapter）")
     parser.add_argument(
         "--input", type=str, default=str(INPUT_QUERIES),
         help="输入 query JSONL 路径（默认：148 条 eval set）",
@@ -364,7 +403,7 @@ def main():
     )
     parser.add_argument(
         "--adapter", type=str, default=str(ADAPTER_PATH),
-        help="LoRA adapter 目录",
+        help="LoRA adapter 目录（--baseline 模式下忽略）",
     )
     args = parser.parse_args()
 
@@ -373,10 +412,16 @@ def main():
         logger.error(f"Input queries not found: {input_queries}")
         return 1
 
-    adapter_path = Path(args.adapter)
-    if not adapter_path.exists() and not args.judge_only:
-        logger.error(f"Adapter not found: {adapter_path}")
-        return 1
+    # baseline 模式：不用 adapter
+    if args.baseline:
+        model_id = "qwen3-8b-baseline"
+        adapter_path = None
+    else:
+        model_id = MODEL_ID
+        adapter_path = Path(args.adapter)
+        if not adapter_path.exists() and not args.judge_only:
+            logger.error(f"Adapter not found: {adapter_path}")
+            return 1
 
     base_model_path = resolve_base_model(args.base_model, MODEL_CACHE_DIR)
     logger.info(f"Base model: {base_model_path}")
@@ -384,16 +429,18 @@ def main():
     query_data = load_input_queries(input_queries)
     prompt_manager = PromptV2Manager(PROMPT_VERSION)
 
-    output_file = GENERATIONS_DIR / f"{MODEL_ID}.jsonl"
+    # 输出文件名包含输入文件名前缀 + model_id
+    input_stem = input_queries.stem
+    output_file = GENERATIONS_DIR / f"{input_stem}_{model_id}.jsonl"
 
     if not args.judge_only:
         if output_file.exists() and not args.force:
             logger.info(f"Skipping generation (cached at {output_file})")
         else:
             logger.info("=" * 60)
-            logger.info(f"  Generating: {MODEL_ID}")
+            logger.info(f"  Generating: {model_id}")
             logger.info(f"  Base: {base_model_path}")
-            logger.info(f"  Adapter: {adapter_path}")
+            logger.info(f"  Adapter: {adapter_path if adapter_path else 'NONE (baseline)'}")
             logger.info(f"  Prompt: v1-full, T={TEMPERATURE}")
             logger.info(f"  Queries: {len(query_data)}")
             logger.info("=" * 60)
@@ -415,7 +462,14 @@ def main():
     logger.info(f"  Scores: {JUDGE_DIR}")
     logger.info("=" * 60)
 
-    _print_comparison(input_queries, JUDGE_DIR / f"{output_file.stem}_judged.jsonl")
+    # 找同 query 集的 baseline judge 文件做配对对比
+    baseline_judge_file = JUDGE_DIR / f"{input_stem}_qwen3-8b-baseline_judged.jsonl"
+    dpo_judge_file = JUDGE_DIR / f"{output_file.stem}_judged.jsonl"
+    if args.baseline:
+        # baseline 模式不打印对比（等 DPO 也跑完再比）
+        pass
+    else:
+        _print_comparison(dpo_judge_file, baseline_judge_file if baseline_judge_file.exists() else None)
     return 0
 
 

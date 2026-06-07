@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 RESULTS_DIR = DATA_ROOT / "results" / "exp012"
 GENERATIONS_DIR = RESULTS_DIR / "generations"
 JUDGE_DIR = RESULTS_DIR / "judge_scores"
-INPUT_QUERIES = DATA_ROOT / "results" / "exp012" / "eval_queries.jsonl"  # 148 条
+INPUT_QUERIES = DATA_ROOT / "data" / "processed" / "exp012_validation_queries.jsonl"  # 300 条
 
 # ── 配置 ────────────────────────────────────────────────────
 
@@ -360,7 +360,7 @@ def run_judge(generations_file: Path, judge_model: str = "deepseek-reasoner"):
         generations_file=generations_file,
         output_file=output_file,
         judge_model=judge_model,
-        concurrency=3,
+        concurrency=12,
         stagger_delay=0.5,
     )
     logger.info(f"Scores saved to {output_file.name}")

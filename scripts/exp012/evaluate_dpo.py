@@ -289,7 +289,7 @@ def generate_vllm(
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.60,
         max_model_len=6144,
     )
 

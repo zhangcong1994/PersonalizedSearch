@@ -178,6 +178,55 @@ def generate(
     )
     logger.info(f"Saved to {output_file.name}")
 
+    # --num 模式自动检查异常重复
+    _check_repetition(output_file)
+
+
+def _check_repetition(output_file: Path):
+    """扫描生成结果的异常重复比例，警告用户。"""
+    import re
+    total = 0
+    repeat_count = 0
+    max_len = 0
+
+    with open(output_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            r = json.loads(line)
+            answer = r.get("answer", "")
+            if len(answer) > max_len:
+                max_len = len(answer)
+
+            # 检测同一字符连续重复 >= 10 次（如 "我我我..." 或 "从上到下..."）
+            # "从上到下" 重复检测：连续重复 3 段以上
+            if re.search(r'(.)\1{9,}', answer):
+                repeat_count += 1
+                continue
+            # "从上到下" 这类短语重复（3+ 次）
+            phrase_matches = re.findall(r'(.{2,20}?)\1{2,}', answer)
+            if phrase_matches:
+                repeat_count += 1
+
+    if total == 0:
+        return
+
+    ratio = repeat_count / total
+    if ratio > 0.3:
+        logger.warning(
+            f"  *** ABNORMAL REPETITION: {repeat_count}/{total} answers ({ratio*100:.0f}%) "
+            f"show repeating patterns! max answer length = {max_len}"
+        )
+        logger.warning(
+            f"  *** Likely merge issue. Check merged model and re-run merge_adapter.py"
+        )
+    else:
+        logger.info(
+            f"  Repetition check: {repeat_count}/{total} answers flagged ({ratio*100:.0f}%) — OK"
+        )
+
 
 # ── Judge ────────────────────────────────────────────────
 
@@ -292,6 +341,10 @@ def main():
         "--input", type=str, default=str(INPUT_QUERIES),
         help="输入 query JSONL 路径",
     )
+    parser.add_argument(
+        "--num", type=int, default=0,
+        help="只跑前 N 条 query（0=全量）。测试用，快速发现问题",
+    )
     args = parser.parse_args()
 
     input_queries = Path(args.input)
@@ -303,8 +356,15 @@ def main():
     query_data = load_input_queries(input_queries)
     prompt_manager = PromptV2Manager(PROMPT_VERSION)
 
+    # --num 只取前 N 条
+    if args.num > 0 and args.num < len(query_data):
+        query_data = query_data[:args.num]
+
     input_stem = input_queries.stem
-    output_file = GENERATIONS_DIR / f"{input_stem}_{model_id}.jsonl"
+    if args.num > 0:
+        output_file = GENERATIONS_DIR / f"{input_stem}_{model_id}_test{args.num}.jsonl"
+    else:
+        output_file = GENERATIONS_DIR / f"{input_stem}_{model_id}.jsonl"
 
     if not args.judge_only:
         if output_file.exists() and not args.force:
